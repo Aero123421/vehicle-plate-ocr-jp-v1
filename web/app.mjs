@@ -32,12 +32,14 @@ if (
     .catch(() => {});
 }
 
-// Live browser defaults collect enough clean frames (~0.9s) before auto-sealing.
+// Live browser defaults wait for either all-4-field clarity or exit so approaching cars aren't cut off early.
 const options = {
   autoSealFrames: 12,
   autoSealMinSec: 0.9,
   autoSealMinPrecision: 0.7,
   autoExitSec: 0.55,
+  requireFullFieldsForEarlySeal: true,
+  discardShortUnreadable: true,
 };
 const canTransferBitmap =
   typeof OffscreenCanvas === 'function' && typeof createImageBitmap === 'function';
@@ -299,7 +301,7 @@ function capture(timestamp, epoch = captureEpoch) {
   lastCapturedTime = timestamp;
   const clip = clipEpoch;
   framePending = (async () => {
-    const scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
+    const scale = Math.min(1, 1920 / Math.max(video.videoWidth, video.videoHeight));
     const wOrig = Math.max(1, Math.round(video.videoWidth * scale));
     const hOrig = Math.max(1, Math.round(video.videoHeight * scale));
     let payload;
@@ -723,6 +725,13 @@ function prependCard(result) {
   const header = element('div', 'card-top');
   header.append(element('span', 'accepted', result.status), element('span', 'tier', result.confidence_tier));
   card.append(header, element('p', 'plate-text', result.text ?? 'UNREADABLE'));
+  if (
+    result.status === 'ACCEPTED' &&
+    result.best_guess_text &&
+    result.best_guess_text !== result.text
+  ) {
+    card.append(element('p', 'abstained', `全項目候補 (参考): ${result.best_guess_text}`));
+  }
 
   const evidence = element('div', 'evidence-row');
   if (result.thumbnail?.length === 51200) {

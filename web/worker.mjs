@@ -12,6 +12,8 @@ export async function createPipeline({
   autoSealMinSec = 0,
   autoSealMinPrecision = 0.35,
   autoExitSec = 0.55,
+  requireFullFieldsForEarlySeal = false,
+  discardShortUnreadable = false,
 } = {}) {
   const json = readJSON ?? (async path => {
     const response = await fetch(new URL(path, import.meta.url));
@@ -69,7 +71,7 @@ export async function createPipeline({
   const maxHeartbeat = policy?.pipeline?.max_heartbeat_interval ?? 12;
   const plateThresh = 0.22;
   const weakPlateThresh = 0.08;
-  const vehThresh = 0.28;
+  const vehThresh = 0.54;
   const minIsPlateProb = 0.34;
   const plateLogitMin = Math.log(plateThresh / (1 - plateThresh));
   const weakPlateLogitMin = Math.log(weakPlateThresh / (1 - weakPlateThresh));
@@ -114,6 +116,26 @@ export async function createPipeline({
     if (options.autoSealMinSec !== undefined) autoSealMinSec = options.autoSealMinSec;
     if (options.autoSealMinPrecision !== undefined) autoSealMinPrecision = options.autoSealMinPrecision;
     if (options.autoExitSec !== undefined) autoExitSec = options.autoExitSec;
+    if (options.requireFullFieldsForEarlySeal !== undefined) {
+      requireFullFieldsForEarlySeal = Boolean(options.requireFullFieldsForEarlySeal);
+    }
+    if (options.discardShortUnreadable !== undefined) {
+      discardShortUnreadable = Boolean(options.discardShortUnreadable);
+    }
+  }
+
+  function minFieldPrecision(memPData) {
+    const slotMean = s => {
+      let sum = 0;
+      const base = s * 112;
+      for (let i = 0; i < 112; i++) sum += Math.max(0, memPData[base + i]);
+      return sum / 112;
+    };
+    const pReg = (slotMean(0) + slotMean(1) + slotMean(2) + slotMean(3)) / 4;
+    const pCls = (slotMean(4) + slotMean(5) + slotMean(6)) / 3;
+    const pKana = slotMean(7);
+    const pSer = (slotMean(8) + slotMean(9) + slotMean(10) + slotMean(11)) / 4;
+    return Math.min(pReg, pCls, pKana, pSer);
   }
 
   function reset(options = {}) {
@@ -507,6 +529,26 @@ export async function createPipeline({
     ], [1, 10]);
   }
 
+  function isRedLampCrop(crop) {
+    // Reject pure red brake-light / reflector false positives (valid JP plates are white, yellow, green, or black).
+    const stride = 12800;
+    let sumR = 0, sumG = 0, sumB = 0, redPixels = 0, count = 0;
+    for (let y = 16; y < 64; y += 2) {
+      const row = y * 160;
+      for (let x = 24; x < 136; x += 2) {
+        const i = row + x;
+        const r = crop.data[i], g = crop.data[stride + i], b = crop.data[2 * stride + i];
+        sumR += r;
+        sumG += g;
+        sumB += b;
+        if (r > 0.30 && r - Math.max(g, b) > 0.17) redPixels++;
+        count++;
+      }
+    }
+    const meanR = sumR / count, meanG = sumG / count, meanB = sumB / count;
+    return meanR > 0.30 && meanR - Math.max(meanG, meanB) > 0.16 && redPixels > 0.42 * count;
+  }
+
   function thumbnail(crop) {
     const rgba = new Uint8ClampedArray(160 * 80 * 4);
     for (let i = 0; i < 12800; i++) {
@@ -589,6 +631,7 @@ export async function createPipeline({
     }
     let idx = 0;
     let totalLuma = 0;
+    let allDiff = 0;
     let unmonDiff = 0, unmonCnt = 0, hotCells = 0;
     let borderDiff = 0, borderCnt = 0;
     for (let gy = 0; gy < SCOUT_H; gy++) {
@@ -603,6 +646,7 @@ export async function createPipeline({
         totalLuma += val;
         if (hasScoutPrev) {
           const d = Math.abs(val - scoutPrev[idx]);
+          allDiff += d;
           if (isBorderY || gx <= 3 || gx >= SCOUT_W - 4) {
             borderDiff += d;
             borderCnt++;
@@ -617,18 +661,21 @@ export async function createPipeline({
       }
     }
     scoutPrev.set(scoutCur);
-    const lumaMean = totalLuma / (SCOUT_W * SCOUT_H);
+    const cellTotal = SCOUT_W * SCOUT_H;
+    const lumaMean = totalLuma / cellTotal;
     const blackout = prevLumaMean !== null && prevLumaMean >= 0.095 && lumaMean < 0.25 * prevLumaMean;
     prevLumaMean = lumaMean;
     if (!hasScoutPrev) {
       hasScoutPrev = true;
-      return { triggered: true, blackout };
+      return { emptyTriggered: true, busyTriggered: false, sceneCut: false, blackout };
     }
+    const allMean = allDiff / cellTotal;
     const unmonMean = unmonCnt > 0 ? unmonDiff / unmonCnt : 0;
     const borderMean = borderCnt > 0 ? borderDiff / borderCnt : 0;
+    const sceneCut = allMean > 0.165 && borderMean > 0.14;
     const emptyTriggered = unmonMean > 0.04 || hotCells >= 14 || borderMean > 0.06;
     const busyTriggered = unmonMean > 0.06 || hotCells >= 26 || borderMean > 0.085;
-    return { emptyTriggered, busyTriggered, blackout };
+    return { emptyTriggered, busyTriggered, sceneCut, blackout };
   }
 
   function predictedBox(track, time) {
@@ -721,8 +768,11 @@ export async function createPipeline({
         clamp(vt.cx + 0.5 * vt.w, 0, wOrig),
         clamp(vt.cy + 0.5 * vt.h, 0, hOrig),
       ];
-      vt.score = d.score;
+      vt.score = 0.65 * vt.score + 0.35 * d.score;
+      vt.maxScore = Math.max(vt.maxScore ?? vt.score, d.score);
+      vt.maxDisp = Math.max(vt.maxDisp ?? 0, Math.hypot(vt.cx - vt.firstCx, vt.cy - vt.firstCy));
       vt.mask = d.mask ?? vt.mask;
+      vt.maxMountProb = Math.max(vt.maxMountProb ?? 0, d.mountProb ?? 0);
       if (d.mountBox && d.mountProb >= 0.25) {
         vt.mountRel = [
           (d.mountBox[0] - d.box[0]) / nw,
@@ -759,9 +809,11 @@ export async function createPipeline({
       vtracks.push({
         id: nextVehicleId++,
         cx, cy, w, h,
+        firstCx: cx, firstCy: cy, maxDisp: 0,
         vx: 0, vy: 0, vw: 0, vh: 0,
         box: d.box,
         score: d.score,
+        maxScore: d.score,
         mask: d.mask ?? null,
         emb: d.emb ?? null,
         mountRel: d.mountBox && d.mountProb >= 0.25 ? [
@@ -771,6 +823,7 @@ export async function createPipeline({
           (d.mountBox[3] - d.box[1]) / h,
         ] : null,
         mountProb: d.mountProb ?? 0,
+        maxMountProb: d.mountProb ?? 0,
         last: time,
         lastFrame: frameIndex,
         hits: 1,
@@ -1025,13 +1078,28 @@ export async function createPipeline({
       ...vtracks.map(vt => predictedVehicleBox(vt, time)),
     ];
     const scout = updateMotionScout(monitoredBoxes);
+    const preSealedOnCut = [];
+    if (scout.sceneCut) {
+      if (autoSealFrames > 0) {
+        for (const t of tracks) {
+          if (t.state !== 'COLLECTING') continue;
+          if (discardShortUnreadable && t.frames <= 2) t.state = 'DISCARDED';
+          else preSealedOnCut.push(await sealTrack(t));
+        }
+        tracks = [];
+      }
+      vtracks = [];
+      h3 = zero([1, 36, 56, 96]);
+      h4 = zero([1, 36, 28, 48]);
+    }
     const effHeartbeat = active.length >= 4 ? maxHeartbeat : baseHeartbeat;
-    const activeConfirmed = active.some(t => t.frames >= 2) || finalizedActive.length > 0;
-    const missingConfirmed = active.some(t => t.frames >= 2 && t.missed > 0);
+    const activeConfirmed = !scout.sceneCut && (active.some(t => t.frames >= 2) || finalizedActive.length > 0);
+    const missingConfirmed = !scout.sceneCut && active.some(t => t.frames >= 2 && t.missed > 0);
     const framesSinceFull = frameIndex - lastFull;
 
     const full =
       frameIndex === 0 ||
+      scout.sceneCut ||
       framesSinceFull >= effHeartbeat ||
       (!activeConfirmed && ((scout.emptyTriggered && framesSinceFull >= 2) || framesSinceFull >= 3)) ||
       (scout.busyTriggered && framesSinceFull >= 4) ||
@@ -1070,13 +1138,19 @@ export async function createPipeline({
 
       // 1. Decode D-FINE vehicle queries using calibrated `cls_logits` + `pred_boxes` (not `raw_q_boxes_px`).
       const rawVehCandidates = [];
+      const frameArea = wOrig * hOrig;
       for (let q = 0; q < numQ; q++) {
         const idx = aPyr + q;
         const vLogit = cls[idx * 3 + 1];
         const sLogit = cls[idx * 3 + 2];
         if (vLogit < vehLogitMin || vLogit <= sLogit) continue;
         const box = nativeBox(output.pred_boxes.data, idx * 4);
-        if (box[2] - box[0] < 10 || box[3] - box[1] < 10) continue;
+        const bw = box[2] - box[0], bh = box[3] - box[1];
+        if (bw < 14 || bh < 14) continue;
+        const aspect = bw / bh;
+        if (aspect < 0.36 || aspect > 3.5) continue;
+        const score = sigmoid(vLogit);
+        if (bw * bh > 0.28 * frameArea && score < 0.78) continue;
         const mountBox = output.pred_q_mount_boxes
           ? nativeBox(output.pred_q_mount_boxes.data, q * 4)
           : null;
@@ -1094,14 +1168,58 @@ export async function createPipeline({
             clamp(box[2] * scale + ox, 0, LB_W),
             clamp(box[3] * scale + oy, 0, LB_H),
           ],
-          score: sigmoid(vLogit),
+          score,
           q,
           emb,
           mountBox,
           mountProb,
         });
       }
-      const keptVehs = nms(rawVehCandidates, 12, 0.52);
+      const nmsVehs = nms(rawVehCandidates, 12, 0.52);
+      // Step 1: Drop giant scene-spanning multi-object wrapper hallucinations before sub-part pruning.
+      const nonWrapperVehs = nmsVehs.filter((a, i) => {
+        const bwA = a.box[2] - a.box[0], bhA = a.box[3] - a.box[1];
+        const areaA = Math.max(1, bwA * bhA);
+        let enclosedStrong = 0;
+        for (let j = 0; j < nmsVehs.length; j++) {
+          if (i === j) continue;
+          const b = nmsVehs[j];
+          const ix = Math.max(0, Math.min(a.box[2], b.box[2]) - Math.max(a.box[0], b.box[0]));
+          const iy = Math.max(0, Math.min(a.box[3], b.box[3]) - Math.max(a.box[1], b.box[1]));
+          const inter = ix * iy;
+          if (inter <= 0) continue;
+          const areaB = Math.max(1, (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]));
+          if (b.score >= 0.62 && inter / areaB >= 0.72 && areaA >= 2.0 * areaB) enclosedStrong++;
+          if (a.score < 0.85 && b.score >= a.score && inter / areaB >= 0.70 && areaA >= 2.2 * areaB) return false;
+          if (
+            areaA > 0.22 * frameArea &&
+            bwA > 0.44 * wOrig &&
+            b.score >= 0.76 &&
+            inter / areaB >= 0.76 &&
+            areaA >= 2.5 * areaB
+          ) {
+            return false;
+          }
+        }
+        if (enclosedStrong >= 2) return false;
+        return true;
+      });
+      // Step 2: Drop interior window/cab/door sub-part duplicates inside a stronger real vehicle.
+      const keptVehs = nonWrapperVehs.filter((a, i) => {
+        const areaA = Math.max(1, (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]));
+        for (let j = 0; j < nonWrapperVehs.length; j++) {
+          if (i === j) continue;
+          const b = nonWrapperVehs[j];
+          if (b.score < a.score) continue;
+          const ix = Math.max(0, Math.min(a.box[2], b.box[2]) - Math.max(a.box[0], b.box[0]));
+          const iy = Math.max(0, Math.min(a.box[3], b.box[3]) - Math.max(a.box[1], b.box[1]));
+          const inter = ix * iy;
+          if (inter <= 0) continue;
+          const areaB = Math.max(1, (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]));
+          if (b.score >= 0.72 && inter / areaA >= 0.72 && areaA <= 0.55 * areaB) return false;
+        }
+        return true;
+      });
       if (keptVehs.length) {
         const cutout = await sessions.vehicle_cutout_nano.run({
           p2_feat: output.p2_feat,
@@ -1173,37 +1291,62 @@ export async function createPipeline({
       fastFrames++;
     }
 
-    const predictedVehicles = vtracks.map(vt => {
-      const box = predictedVehicleBox(vt, time);
-      const vw = box[2] - box[0], vh = box[3] - box[1];
-      const mountBox = vt.mountRel
-        ? [
-            clamp(box[0] + vt.mountRel[0] * vw, 0, wOrig),
-            clamp(box[1] + vt.mountRel[1] * vh, 0, hOrig),
-            clamp(box[0] + vt.mountRel[2] * vw, 0, wOrig),
-            clamp(box[1] + vt.mountRel[3] * vh, 0, hOrig),
-          ]
-        : null;
-      return {
-        id: vt.id,
-        box,
-        velocity: [vt.vx, vt.vy, vt.vw, vt.vh],
-        mask: vt.mask,
-        score: vt.score,
-        mountBox,
-        mountProb: vt.mountProb,
-      };
-    });
+    const strongPlatedVehicleIds = new Set(
+      tracks
+        .filter(t =>
+          (t.state === 'COLLECTING' && t.frames >= 4 && sigmoid(t.odds) >= 0.65) ||
+          (t.state === 'FINALIZED' && t.result?.status === 'ACCEPTED')
+        )
+        .map(t => t.vehicleId)
+        .filter(v => v !== null && v !== undefined)
+    );
+    const predictedVehicles = vtracks
+      .filter(vt => {
+        // Require 2+ hits before displaying low/medium-confidence candidates (prevents single-frame storefront flashes).
+        if (vt.hits < 2 && vt.maxScore < 0.82) return false;
+        // Suppress motionless background storefronts/kiosks/props lacking strong vehicle confidence and verified plates.
+        if (
+          vt.hits >= 2 &&
+          vt.maxDisp < Math.max(10, 0.018 * wOrig) &&
+          vt.maxScore < 0.88 &&
+          !strongPlatedVehicleIds.has(vt.id)
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .map(vt => {
+        const box = predictedVehicleBox(vt, time);
+        const vw = box[2] - box[0], vh = box[3] - box[1];
+        const mountBox = vt.mountRel
+          ? [
+              clamp(box[0] + vt.mountRel[0] * vw, 0, wOrig),
+              clamp(box[1] + vt.mountRel[1] * vh, 0, hOrig),
+              clamp(box[0] + vt.mountRel[2] * vw, 0, wOrig),
+              clamp(box[1] + vt.mountRel[3] * vh, 0, hOrig),
+            ]
+          : null;
+        return {
+          id: vt.id,
+          box,
+          velocity: [vt.vx, vt.vy, vt.vw, vt.vh],
+          mask: vt.mask,
+          score: vt.score,
+          mountBox,
+          mountProb: vt.mountProb,
+        };
+      });
 
     const ownerOf = box => {
       const cx = 0.5 * (box[0] + box[2]), cy = 0.5 * (box[1] + box[3]);
       let best = null, bestArea = Infinity;
       for (const v of predictedVehicles) {
         const vw = v.box[2] - v.box[0], vh = v.box[3] - v.box[1];
+        const minY = v.box[1] + (vh > 56 ? 0.14 * vh : -0.02 * vh);
         if (
           cx >= v.box[0] - 0.06 * vw - 6 &&
           cx <= v.box[2] + 0.06 * vw + 6 &&
-          cy >= v.box[1] - 0.02 * vh &&
+          cy >= minY &&
           cy <= v.box[3] + 0.18 * vh + 14
         ) {
           const area = vw * vh;
@@ -1280,13 +1423,12 @@ export async function createPipeline({
     }
 
     // Keep track-backed proposals or proposals with readable size contained within vehicles.
-    const contained = proposals.filter(({ box, track, provenance }) =>
+    // Never let Smart-Zoom (`provenance === 1`) bypass vehicle containment when vehicles exist!
+    const contained = proposals.filter(({ box, score, track, provenance }) =>
       track || (
         (box[2] - box[0] >= 10 && box[3] - box[1] >= 5) && (
-          provenance === 1 ||
           provenance === 2 ||
-          !predictedVehicles.length ||
-          ownerOf(box) !== null
+          (predictedVehicles.length ? ownerOf(box) !== null : score >= 0.52)
         )
       )
     );
@@ -1314,14 +1456,27 @@ export async function createPipeline({
     for (const candidate of nms(contained, 16, 0.45)) {
       const cq = candidate.corners;
       const cBox = validCorners(cq) ? cornersToBox(cq) : candidate.box;
-      const acceptedCover = tracks.find(
-        t => t.state === 'FINALIZED' && t.result.status === 'ACCEPTED' && iou(predictedBox(t, time), cBox) >= 0.18
-      );
+      const acceptedCover = tracks.find(t => {
+        if (t.state !== 'FINALIZED' || t.result.status !== 'ACCEPTED') return false;
+        const pBox = predictedBox(t, time);
+        if (iou(pBox, cBox) < 0.20) return false;
+        const ratio = Math.max(1, cBox[2] - cBox[0]) / Math.max(1, pBox[2] - pBox[0]);
+        return ratio >= 0.45 && ratio <= 2.2;
+      });
       if (acceptedCover) {
         if (!used.has(acceptedCover.id)) {
+          const dt = Math.max(0.03, time - acceptedCover.last);
           const dx = 0.5 * (cBox[0] + cBox[2] - acceptedCover.box[0] - acceptedCover.box[2]);
           const dy = 0.5 * (cBox[1] + cBox[3] - acceptedCover.box[1] - acceptedCover.box[3]);
-          acceptedCover.corners = validCorners(cq) ? cq : acceptedCover.corners.map(([x, y]) => [x + dx, y + dy]);
+          if (validCorners(cq)) {
+            acceptedCover.velocity = [
+              clamp(0.6 * acceptedCover.velocity[0] + 0.4 * (dx / dt), -480, 480),
+              clamp(0.6 * acceptedCover.velocity[1] + 0.4 * (dy / dt), -480, 480),
+            ];
+            acceptedCover.corners = cq;
+          } else {
+            acceptedCover.corners = acceptedCover.corners.map(([x, y]) => [x + dx, y + dy]);
+          }
           acceptedCover.box = cBox;
           acceptedCover.last = time;
           acceptedCover.lastFrame = frameIndex;
@@ -1335,9 +1490,13 @@ export async function createPipeline({
       remaining.push(candidate);
     }
 
-    // Prioritize track-backed proposals, then detector proposals; keep max 1 candidate per plate/vehicle.
+    // Prioritize track-backed proposals, then detector proposals; allow up to 2 candidates per unaccepted vehicle
+    // into Stage-2 so a taillight never blocks the real plate before Stage-2 scores both!
     remaining.sort((a, b) => Number(Boolean(b.track)) - Number(Boolean(a.track)) || b.score - a.score);
-    const claimedVehicleIds = new Set(acceptedOwners);
+    const confirmedPlatedVehicles = new Set(
+      tracks.filter(t => t.state === 'COLLECTING' && t.frames >= 2 && t.vehicleId !== null).map(t => t.vehicleId)
+    );
+    const vehCandCounts = new Map();
     const claimedTrackIds = new Set();
     const selected = [];
     for (const candidate of remaining) {
@@ -1348,8 +1507,13 @@ export async function createPipeline({
       if (selected.some(s => iou(s.box, candidate.box) >= 0.18)) continue;
       const owner = ownerOf(candidate.box);
       const vid = candidate.track?.vehicleId ?? owner?.id;
-      if (vid !== undefined && vid !== null && claimedVehicleIds.has(vid)) continue;
-      if (vid !== undefined && vid !== null) claimedVehicleIds.add(vid);
+      if (vid !== undefined && vid !== null) {
+        if (acceptedOwners.has(vid)) continue;
+        const maxPerVeh = !confirmedPlatedVehicles.has(vid) && candidate.score >= 0.32 ? 2 : 1;
+        const cnt = vehCandCounts.get(vid) ?? 0;
+        if (cnt >= maxPerVeh) continue;
+        vehCandCounts.set(vid, cnt + 1);
+      }
       if (candidate.track) claimedTrackIds.add(candidate.track.id);
       selected.push(candidate);
       if (selected.length >= 6) break;
@@ -1373,7 +1537,13 @@ export async function createPipeline({
       });
     }
 
-    for (let idx = 0; idx < selected.length; idx++) {
+    // Process highest Stage-2 plate support first, keeping at most 1 verified plate per vehicle.
+    const stage2Order = selected
+      .map((_, i) => i)
+      .sort((a, b) => stage2Results[b].support - stage2Results[a].support);
+    const postStage2Owners = new Set(acceptedOwners);
+
+    for (const idx of stage2Order) {
       const candidate = selected[idx];
       const loc = stage2Results[idx];
       const prior = candidate.track;
@@ -1386,6 +1556,8 @@ export async function createPipeline({
       const aspect = boxW / Math.max(1, boxH);
       if (boxW < 11 || boxH < 5.5 || aspect < 0.85 || aspect > 4.6) continue;
       if (tracks.some(t => used.has(t.id) && iou(t.box, box) >= 0.15)) continue;
+      const postOwner = ownerOf(box);
+      if (postOwner && postStage2Owners.has(postOwner.id)) continue;
 
       // Associate with tracked collectors (active OR dormant) using IoU + cosine ReID + distance gate.
       let track = prior;
@@ -1414,7 +1586,12 @@ export async function createPipeline({
         }
       }
       if (track && used.has(track.id)) continue;
-      track ??= newTrack(box, time);
+      const crop = projective(corners);
+      if (!track) {
+        const minBirth = predictedVehicles.length ? 0.48 : 0.68;
+        if (loc.support < minBirth || loc.nc > 3.8 || isRedLampCrop(crop)) continue;
+        track = newTrack(box, time);
+      }
       used.add(track.id);
       track.dormant = false;
       track.dormantSince = Infinity;
@@ -1424,7 +1601,6 @@ export async function createPipeline({
         throw Error('Sealed collector cannot receive evidence');
       }
 
-      const crop = projective(corners);
       const geom = geometry(corners, crop, track.frames ? track.corners : null);
       const encoded = await sessions.frame_encoder.run({
         crops: crop,
@@ -1499,8 +1675,11 @@ export async function createPipeline({
           track.reidEmb = normalizeVec(blended);
         }
       }
-      const owner = ownerOf(box);
-      if (owner) track.vehicleId = owner.id;
+      const owner = postOwner;
+      if (owner) {
+        track.vehicleId = owner.id;
+        postStage2Owners.add(owner.id);
+      }
       if (geom.data[6] > track.sharpness) {
         track.sharpness = geom.data[6];
         track.thumbnail = thumbnail(crop);
@@ -1521,21 +1700,40 @@ export async function createPipeline({
       }
     }
 
-    const newlyFinalized = [];
+    const newlyFinalized = [...preSealedOnCut];
     for (const t of tracks) {
       if (t.state !== 'COLLECTING') continue;
       if (autoSealFrames > 0) {
         const exited = autoExitSec > 0 && time - t.last >= autoExitSec;
-        const readyToSeal =
-          t.frames >= autoSealFrames &&
-          time - t.firstTime >= autoSealMinSec &&
-          mean(t.memory.mem_P.data) >= autoSealMinPrecision;
+        if (exited && discardShortUnreadable && t.frames <= 2) {
+          t.state = 'DISCARDED';
+          continue;
+        }
+        let readyToSeal = false;
+        if (requireFullFieldsForEarlySeal) {
+          const pw = t.box[2] - t.box[0];
+          const growing = (t.sizeVelocity?.[0] ?? 0) > 3.5;
+          const allFieldsCrisp =
+            t.frames >= autoSealFrames &&
+            time - t.firstTime >= autoSealMinSec &&
+            !growing &&
+            pw >= 48 &&
+            minFieldPrecision(t.memory.mem_P.data) >= 1.1;
+          const longDwell =
+            t.frames >= 42 &&
+            time - t.firstTime >= 3.2 &&
+            mean(t.memory.mem_P.data) >= autoSealMinPrecision;
+          readyToSeal = allFieldsCrisp || longDwell;
+        } else {
+          readyToSeal =
+            t.frames >= autoSealFrames &&
+            time - t.firstTime >= autoSealMinSec &&
+            mean(t.memory.mem_P.data) >= autoSealMinPrecision;
+        }
         if (exited || readyToSeal) newlyFinalized.push(await sealTrack(t));
-      } else if (time - t.last >= 1.25 && t.frames >= 2) {
-        // Retire long-dormant tracks in batch only after sustained disappearance (>1.25s).
-        // Keep unretired until finalize if short occlusion.
       }
     }
+    tracks = tracks.filter(t => t.state !== 'DISCARDED');
 
     frameIndex++;
     return {
@@ -1565,7 +1763,12 @@ export async function createPipeline({
       localizedCount: selected.length,
       vehicles: predictedVehicles,
       tracks: tracks
-        .filter(t => t.state === 'COLLECTING' && (used.has(t.id) || t.missed <= 2))
+        .filter(
+          t =>
+            t.state === 'COLLECTING' &&
+            (used.has(t.id) || t.missed <= 2) &&
+            (!discardShortUnreadable || t.frames >= 2)
+        )
         .map(t => ({
           id: t.id,
           box: used.has(t.id) ? t.box : predictedBox(t, time),
@@ -1645,7 +1848,14 @@ export async function createPipeline({
   async function finalize() {
     if (phase !== 'COLLECTING') throw Error('Terminal capability already consumed');
     phase = 'SEALED';
-    for (const t of tracks) if (t.state === 'COLLECTING') await sealTrack(t);
+    for (const t of tracks) {
+      if (t.state !== 'COLLECTING') continue;
+      if (discardShortUnreadable && t.frames <= 2) {
+        t.state = 'DISCARDED';
+        continue;
+      }
+      await sealTrack(t);
+    }
     phase = 'FINALIZED';
     return emittedResults.slice();
   }

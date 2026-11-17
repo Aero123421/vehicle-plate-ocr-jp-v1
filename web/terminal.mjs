@@ -80,7 +80,8 @@ export function terminalDecision(readout, memory, frames, support, table, policy
     confidence_tier:accepted?(full?'FULL_4FIELD':'CORE_VERIFIED'):'NONE',
     verified_fields:accepted?fields:[],
     text:accepted?Object.keys(values).map(f=>full||fields.includes(f)?values[f]:masks[f]).join(' '):null,
-    ...(accepted?{serial}:{}), field_confidences:probabilities,
+    ...(accepted?{serial,candidates:values,best_guess_text:Object.values(values).join(' ')}:{}),
+    field_confidences:probabilities,
     joint_correctness_probability:jointP, readable_probability:event,
   };
 }

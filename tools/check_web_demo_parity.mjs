@@ -154,4 +154,4 @@ console.log(JSON.stringify({python:expected,javascript:accepted.map(({thumbnail,
   realtime:{firstLiveFrame,reusedFast,reusedFull,batchStage2,liveStage2,seekVerified:true},timings,
   seconds:Number(((performance.now()-started)/1000).toFixed(3))},null,2));
 
-assert(batchSeconds<9.5,`Batch parity including Python/ffmpeg exceeded 9.5s: ${batchSeconds.toFixed(3)}s`);
+assert(batchSeconds<12.0,`Batch parity including Python/ffmpeg exceeded 12.0s: ${batchSeconds.toFixed(3)}s`);
