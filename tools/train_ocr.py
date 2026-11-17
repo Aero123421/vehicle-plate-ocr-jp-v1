@@ -786,7 +786,8 @@ def evaluate_synthetic_val(
     status_tot = 0
     rgb_type_ok = 0
     rgb_type_tot = 0
-    err_counts = torch.zeros(vocab.size, dtype=torch.float32, device=device)
+    kl_surprise_sum = torch.zeros(vocab.size, dtype=torch.float32, device=device)
+    tok_occ_counts = torch.zeros(vocab.size, dtype=torch.float32, device=device)
 
     for bi_std in range(num_batches):
         b = _move_batch_v2_to_device(
@@ -818,10 +819,13 @@ def evaluate_synthetic_val(
             slot_ok += int(eq.sum().item())
             slot_tot += int(ts.numel())
 
-            wrong_t = ts[~eq]
-            if wrong_t.numel() > 0:
-                ones = torch.ones_like(wrong_t, dtype=torch.float32)
-                err_counts.scatter_add_(0, wrong_t.clamp(0, vocab.size - 1), ones)
+            # Information-theoretic per-token conditional surprise E[-log p(y | x)] (unbiased by digit frequency!)
+            log_probs_r = F.log_softmax(out.slot_logits[readable].float(), dim=-1)
+            safe_ts = ts.clamp(0, vocab.size - 1)
+            nll_r = (-log_probs_r.gather(-1, safe_ts.unsqueeze(-1)).squeeze(-1)).clamp(0.0, 8.0)
+            flat_tok = safe_ts.reshape(-1)
+            kl_surprise_sum.scatter_add_(0, flat_tok, nll_r.reshape(-1))
+            tok_occ_counts.scatter_add_(0, flat_tok, torch.ones_like(flat_tok, dtype=torch.float32))
 
             rgb_seq = readable & ((b["is_monochrome_ir"] < 0.5).any(dim=1))
             if rgb_seq.any():
@@ -868,6 +872,7 @@ def evaluate_synthetic_val(
             max_conf = out_a.memory.mem_conflict[rd].max(dim=-1).values
             app_clean_conflict += int((max_conf < 0.95).sum().item())
 
+    err_counts = kl_surprise_sum / (tok_occ_counts + 1.5)
     err_counts[0] = 0.0
     if was_training:
         model.train()
@@ -938,6 +943,7 @@ def train_preset_from_scratch(
         cf_conflict=0.60,
         garbage_invariance=0.70,
         stroke_gestalt=0.25,
+        statutory_len=0.65,
         innovation_nll=0.02,
         terminal_risk=0.25,
     )

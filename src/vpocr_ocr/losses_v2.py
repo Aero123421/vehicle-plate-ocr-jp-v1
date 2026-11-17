@@ -21,6 +21,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vpocr_ocr.model_v2 import MFJPPlateOCRV2, SequenceOutputV2
+from vpocr_synth.chaos_info import (
+    coupled_map_lattice_2d,
+    focal_self_information_ce,
+    shannon_slot_capacity_weights,
+)
 
 
 @contextmanager
@@ -104,12 +109,14 @@ def synthesize_gpu_garbage_frames_v2(
     """Synthesize diverse construction & roadside non-plate hard-negative crops + multi-scale geom_meta."""
     h, w = hw
     total = max(1, batch_size * num_garbage)
-    k = max(1, total // 5)
+    k = max(1, total // 7)
     n1 = min(total, k)
     n2 = min(max(0, total - n1), k)
     n3 = min(max(0, total - n1 - n2), k)
     n4 = min(max(0, total - n1 - n2 - n3), k)
-    n5 = max(0, total - n1 - n2 - n3 - n4)
+    n5 = min(max(0, total - n1 - n2 - n3 - n4), k)
+    n6 = min(max(0, total - n1 - n2 - n3 - n4 - n5), k)
+    n7 = max(0, total - n1 - n2 - n3 - n4 - n5 - n6)
 
     parts: list[torch.Tensor] = []
 
@@ -164,6 +171,25 @@ def synthesize_gpu_garbage_frames_v2(
             g5[:, :, y0:y1, bx0:bx1] = on_b * fg_c + (1.0 - on_b) * g5[:, :, y0:y1, bx0:bx1]
         g5 = torch.clamp(g5 + 0.04 * torch.randn_like(g5), 0.0, 1.0)
         parts.append(g5)
+
+    # 6. Kaneko 2D Coupled-Map-Lattice (CML) chaotic dappled urban foliage / shop-window mullion clutter
+    if n6 > 0:
+        cml_low = coupled_map_lattice_2d(n6, max(8, h // 4), max(16, w // 4), steps=6, r=3.97, coupling=0.28, device=device)
+        cml = F.interpolate(cml_low, size=(h, w), mode="bilinear", align_corners=False)
+        tint = 0.75 + 0.45 * torch.rand((n6, 3, 1, 1), device=device)
+        g6 = torch.clamp(cml * tint + 0.04 * torch.randn((n6, 3, h, w), device=device), 0.0, 1.0)
+        parts.append(g6)
+
+    # 7. Glowing red LED brake-light / amber reflector housing false-positive crops
+    if n7 > 0:
+        yy7 = torch.linspace(-1.0, 1.0, h, device=device).view(1, 1, h, 1)
+        xx7 = torch.linspace(-1.0, 1.0, w, device=device).view(1, 1, 1, w)
+        glow = torch.exp(-1.8 * (xx7 * xx7 * 0.65 + yy7 * yy7 * 1.35))
+        red_base = torch.tensor([0.92, 0.10, 0.08], device=device).view(1, 3, 1, 1)
+        core = torch.tensor([1.0, 0.42, 0.25], device=device).view(1, 3, 1, 1)
+        g7 = (0.14 + 0.86 * glow) * red_base + 0.35 * (glow ** 3) * core
+        g7 = torch.clamp(g7 + 0.04 * torch.randn((n7, 3, h, w), device=device), 0.0, 1.0)
+        parts.append(g7)
 
     all_g = torch.cat(parts, dim=0)[:total]
     perm = torch.randperm(total, device=device)
@@ -300,24 +326,20 @@ class OCRLossV2(nn.Module):
         # ------------------------------------------------------------------
         # 1. Final Sequence Slot CE + Per-Frame Auxiliary Slot CE + Status CE
         # ------------------------------------------------------------------
-        # Target-independent field-complexity slot importance weights (proper scoring rule!):
-        # 210-way 40mm upper-row Region Kanji (0..3) receives 2.8x weight across BOTH active Kanji
-        # and <PAD> length-termination slots so 2-char regions (`福岡`, `岐阜`, `熊本`) never suffer
-        # Bayes-suboptimal length-overprediction bias into 3/4-char regions (`なにわ`, `尾張小牧`).
-        slot_base_mult = torch.tensor(
-            [2.85, 2.85, 1.55, 1.15, 1.30, 1.25, 1.15, 1.45, 1.25, 1.25, 1.25, 1.25],
-            device=dev,
-            dtype=torch.float32,
-        )
+        # Shannon prior-entropy / spatial-channel-capacity slot weights + detached self-information focal CE:
+        # Boosts 45-way 32mm Hiragana (slot 7 -> 2.25x) and 138-way 40mm Region Kanji (slots 0..1 -> 3.05x)
+        # while preserving exact Bayes-optimal argmax & probabilistic calibration stationary points.
+        slot_base_mult = shannon_slot_capacity_weights(dev)
         seq_slot_mult = slot_base_mult.unsqueeze(0).expand(bsz, 12)
 
         seq_slot_readable = (seq_max_read >= 0.30) & non_mixed_seq.unsqueeze(1)
-        slot_ce = F.cross_entropy(
-            seq_out.slot_logits.float().reshape(-1, self.vocab_size),
-            target_slots.clamp(0, self.vocab_size - 1).reshape(-1),
-            reduction="none",
+        slot_ce = focal_self_information_ce(
+            seq_out.slot_logits.float(),
+            target_slots,
+            gamma=0.45,
+            floor_mix=0.72,
             label_smoothing=self.label_smoothing,
-        ).reshape(bsz, 12)
+        )
         slot_w = seq_max_read * seq_slot_readable.float() * seq_slot_mult
         if slot_w.sum() > 1e-6:
             loss_seq_slots = (slot_ce * slot_w).sum() / slot_w.sum()
@@ -328,12 +350,13 @@ class OCRLossV2(nn.Module):
         valid_ft = valid_frame_bool.unsqueeze(-1) & (frame_slot_targets >= 0) & (eff_read >= 0.25)
         safe_ft = frame_slot_targets.clamp(0, self.vocab_size - 1)
         aux_slot_mult = slot_base_mult.view(1, 1, 12).expand(bsz, seq_len, 12)
-        aux_ce = F.cross_entropy(
-            aux_logits.float().reshape(-1, self.vocab_size),
-            safe_ft.reshape(-1),
-            reduction="none",
+        aux_ce = focal_self_information_ce(
+            aux_logits.float(),
+            safe_ft,
+            gamma=0.40,
+            floor_mix=0.75,
             label_smoothing=self.label_smoothing,
-        ).reshape(bsz, seq_len, 12)
+        )
         aux_w = eff_read * valid_ft.float() * aux_slot_mult
         if aux_w.sum() > 1e-6:
             loss_aux_frames = (aux_ce * aux_w).sum() / aux_w.sum()

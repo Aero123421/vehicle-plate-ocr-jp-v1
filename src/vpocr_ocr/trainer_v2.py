@@ -117,6 +117,7 @@ DEFAULT_OCR_SYNTH_SOURCE_FILES: tuple[str, ...] = (
     "src/vpocr_synth/plate/stratified_sampler.py",
     "src/vpocr_synth/plate/surface_25d.py",
     "src/vpocr_synth/plate/validator.py",
+    "src/vpocr_synth/chaos_info.py",
     "src/vpocr_synth/gpu/sequence_engine.py",
     "src/vpocr_synth/gpu/homography_fast.py",
     "src/vpocr_synth/gpu/shader_pbr_ir.py",

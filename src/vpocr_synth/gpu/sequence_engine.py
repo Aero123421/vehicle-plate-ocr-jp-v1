@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 
 from vpocr_ocr.vocab import NUM_SLOTS, PlateVocab
+from vpocr_synth.chaos_info import boltzmann_kl_token_weights, chaotic_intermittent_corner_burst
 from vpocr_synth.gpu.homography_fast import (
     REGIME_NAMES,
     REGIME_TO_ID,
@@ -240,14 +241,26 @@ def _livecam_multiscale_tone_impl(
     n_bt, _, h_t, w_t = crops_flat.shape
     dev = crops_flat.device
 
+    c_xfar = F.interpolate(
+        F.interpolate(crops_flat, size=(18, 34), mode="bilinear", align_corners=False),
+        size=(h_t, w_t),
+        mode="bilinear",
+        align_corners=False,
+    )
     c_far = F.interpolate(
-        F.interpolate(crops_flat, size=(19, 38), mode="bilinear", align_corners=False),
+        F.interpolate(crops_flat, size=(22, 42), mode="bilinear", align_corners=False),
         size=(h_t, w_t),
         mode="bilinear",
         align_corners=False,
     )
     c_mid = F.interpolate(
-        F.interpolate(crops_flat, size=(29, 58), mode="bilinear", align_corners=False),
+        F.interpolate(crops_flat, size=(28, 54), mode="bilinear", align_corners=False),
+        size=(h_t, w_t),
+        mode="bilinear",
+        align_corners=False,
+    )
+    c_semi = F.interpolate(
+        F.interpolate(crops_flat, size=(38, 72), mode="bilinear", align_corners=False),
         size=(h_t, w_t),
         mode="bilinear",
         align_corners=False,
@@ -281,19 +294,31 @@ def _livecam_multiscale_tone_impl(
         & not_app_bt
         & not_ovh_bt
     )
-    use_far_bt = not_app_bt & (u_seq < 0.14) & (t_idx < half_t)
-    use_mid_bt = not_app_bt & (((u_seq < 0.14) & (t_idx >= half_t)) | ((u_seq >= 0.14) & (u_seq < 0.30)))
+    use_xfar_bt = not_app_bt & (u_seq < 0.08) & (t_idx < half_t)
+    use_far_bt = not_app_bt & (((u_seq < 0.08) & (t_idx >= half_t)) | ((u_seq >= 0.08) & (u_seq < 0.19) & (t_idx < half_t)))
+    use_mid_bt = not_app_bt & (((u_seq >= 0.08) & (u_seq < 0.19) & (t_idx >= half_t)) | ((u_seq >= 0.19) & (u_seq < 0.34)))
+    use_semi_bt = not_app_bt & (u_seq >= 0.34) & (u_seq < 0.48)
     use_crisp_bt = can_crisp_bt & (
         ((u_seq >= 0.74) & (u_seq < 0.86) & (t_idx >= half_t)) | (u_seq >= 0.86)
     )
 
+    use_xfar_flat = use_xfar_bt.reshape(n_bt, 1, 1, 1)
     use_far_flat = use_far_bt.reshape(n_bt, 1, 1, 1)
     use_mid_flat = use_mid_bt.reshape(n_bt, 1, 1, 1)
+    use_semi_flat = use_semi_bt.reshape(n_bt, 1, 1, 1)
     use_crisp_flat = use_crisp_bt.reshape(n_bt, 1, 1, 1)
     crops_lr = torch.where(
         use_crisp_flat,
         c_crisp,
-        torch.where(use_far_flat, c_far, torch.where(use_mid_flat, c_mid, crops_flat)),
+        torch.where(
+            use_xfar_flat,
+            c_xfar,
+            torch.where(
+                use_far_flat,
+                c_far,
+                torch.where(use_mid_flat, c_mid, torch.where(use_semi_flat, c_semi, crops_flat)),
+            ),
+        ),
     )
 
     ones_bt = torch.ones((bsz, t_len), device=dev, dtype=noisy_full_corners.dtype)
@@ -301,21 +326,34 @@ def _livecam_multiscale_tone_impl(
         use_crisp_bt,
         torch.full_like(ones_bt, 2.15),
         torch.where(
-            use_far_bt,
-            torch.full_like(ones_bt, 0.27),
-            torch.where(use_mid_bt, torch.full_like(ones_bt, 0.41), ones_bt),
+            use_xfar_bt,
+            torch.full_like(ones_bt, 0.24),
+            torch.where(
+                use_far_bt,
+                torch.full_like(ones_bt, 0.30),
+                torch.where(
+                    use_mid_bt,
+                    torch.full_like(ones_bt, 0.41),
+                    torch.where(use_semi_bt, torch.full_like(ones_bt, 0.56), ones_bt),
+                ),
+            ),
         ),
     )
     c_center = noisy_full_corners.mean(dim=(1, 2), keepdim=True)
     scaled_corners = c_center + (noisy_full_corners - c_center) * scale_bt[:, :, None, None]
 
     do_tone = tone_rands[:, 0:1] < 0.40
+    do_shadow = (tone_rands[:, 0:1] >= 0.40) & (tone_rands[:, 0:1] < 0.54) & (is_monochrome_ir.reshape(n_bt, 1, 1, 1) < 0.5)
     gamma = 0.78 + 0.46 * tone_rands[:, 1:2]
     gain = 0.78 + 0.38 * tone_rands[:, 2:3]
     pedestal = -0.03 + 0.10 * tone_rands[:, 3:4]
     c_gam = crops_lr.clamp(1e-4, 1.0).pow(gamma)
     toned = (0.5 + gain * (c_gam - 0.5) + pedestal).clamp(0.0, 1.0)
-    crops_out = torch.where(do_tone, toned, crops_lr)
+    # Daytime shadowed rear-door exposure mode (e.g. shadowed microbus/truck plate in bright outdoor scene)
+    sh_gain = 0.26 + 0.26 * tone_rands[:, 2:3]
+    sh_tint = torch.tensor([0.93, 0.98, 1.07], device=dev, dtype=torch.float32).view(1, 3, 1, 1)
+    shadowed = (crops_lr.clamp(1e-4, 1.0).pow(1.12 + 0.28 * tone_rands[:, 1:2]) * sh_gain * sh_tint + 0.015 * tone_rands[:, 3:4]).clamp(0.0, 1.0)
+    crops_out = torch.where(do_tone, toned, torch.where(do_shadow, shadowed, crops_lr))
     return crops_out, scaled_corners
 
 
@@ -521,12 +559,20 @@ class GPUSynthSequenceEngine:
             self._boost_prob = 0.0
             return
 
-        # Keep top-24 hardest tokens weighted proportionally
-        top_items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:24]
+        # Jaynes Maximum-Entropy / Boltzmann active curriculum over top-48 high-surprise tokens
+        raw_vec = np.zeros((self.vocab.size,), dtype=np.float32)
+        for ch, sc in scores.items():
+            raw_vec[self.vocab.token_to_id[ch]] = float(sc)
+        gibbs_w = boltzmann_kl_token_weights(raw_vec, self.vocab.size, beta=1.35, uniform_mix=0.14)
+        ranked = sorted(
+            ((self.vocab.id_to_token[tid], float(gibbs_w[tid])) for tid in range(1, self.vocab.size) if gibbs_w[tid] > 0),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:48]
         pool: list[str] = []
-        max_sc = max(v for _, v in top_items)
-        for ch, sc in top_items:
-            reps = max(1, int(round(6.0 * sc / max(1e-6, max_sc))))
+        max_sc = max(v for _, v in ranked)
+        for ch, sc in ranked:
+            reps = max(1, int(round(8.0 * sc / max(1e-6, max_sc))))
             pool.extend([ch] * reps)
         self._boosted_chars = pool
         self._boost_prob = float(np.clip(boost_prob, 0.0, 0.60))
@@ -945,6 +991,14 @@ class GPUSynthSequenceEngine:
             top_recess_u,
             sigma_mult,
         )
+
+        if t_len >= 2 and stage >= 2:
+            chaos_u = torch.rand((bsz, 8), generator=gen, device=dev)
+            chaos_burst = chaotic_intermittent_corner_burst(chaos_u, bsz, t_len)
+            w_approx = (gt_roi[:, :, 1, 0] - gt_roi[:, :, 0, 0]).abs().clamp(8.0, 140.0)[:, :, None, None]
+            chaos_delta = chaos_burst * (0.0042 * w_approx)
+            noisy_roi = noisy_roi + chaos_delta
+            noisy_full = noisy_roi + traj.roi_origin_xy[:, :, None, :]
 
         if t_len >= 2 and stage >= 3:
             coast = (

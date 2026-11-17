@@ -22,6 +22,10 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--out-dir", type=Path, default=REPO_ROOT / "out/models")
     parser.add_argument("--cal-dir", type=Path, default=REPO_ROOT / "out/calibration")
+    parser.add_argument("--base-steps", type=int, default=3600)
+    parser.add_argument("--nano-steps", type=int, default=4400)
+    parser.add_argument("--quad-steps", type=int, default=11000)
+    parser.add_argument("--batch-size", type=int, default=10)
     return parser.parse_args(argv)
 
 
@@ -213,11 +217,31 @@ def main():
     dry_config = dict(total_steps=2, batch_size=1, clip_frames=2, clip_image_hw=(256, 320),
                       multi_scale_hws=((256, 320),), initial_clips=1, max_pool_clips=2,
                       refresh_clips_every=0, log_every=2) if dry else {}
-    base_cfg = TemporalDetTrainConfig(preset="base", **(dry_config or dict(total_steps=2400, batch_size=8, clip_frames=4)),
-                                     init_seed=20260641, seed=20266441)
-    nano_cfg = TemporalDetTrainConfig(preset="nano", **(dry_config or dict(total_steps=2800, batch_size=8, clip_frames=4)),
-                                     lr=1.9e-3, init_seed=20260642, seed=20266442)
-    report = {"version": "0.6.0", "dry_run": dry, "training_script": TRAINING_SCRIPT,
+    full_det_common = dict(
+        batch_size=args.batch_size,
+        clip_frames=4,
+        clip_image_hw=(448, 768),
+        multi_scale_hws=((384, 640), (416, 736), (448, 768)),
+        initial_clips=128,
+        max_pool_clips=320,
+        refresh_clips_every=6,
+        refresh_clips_count=3,
+    )
+    base_cfg = TemporalDetTrainConfig(
+        preset="base",
+        **(dry_config or dict(total_steps=args.base_steps, **full_det_common)),
+        init_seed=20260641,
+        seed=20266441,
+    )
+    nano_cfg = TemporalDetTrainConfig(
+        preset="nano",
+        **(dry_config or dict(total_steps=args.nano_steps, **full_det_common)),
+        lr=1.9e-3,
+        kd_weight=0.55,
+        init_seed=20260642,
+        seed=20266442,
+    )
+    report = {"version": "0.7.0", "dry_run": dry, "training_script": TRAINING_SCRIPT,
               "training_script_sha256": compute_det_file_sha256(Path(__file__)),
               "source_freeze": frozen, "device": torch.cuda.get_device_name(), "precision": "bf16"}
     base_path = out_dir / "temporal_plate_det_v4_base.pt"
@@ -264,10 +288,10 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
     assert_frozen(frozen)
-    quad_cfg = QuadTrackTrainConfig(total_steps=2 if dry else 8000, batch_size=8 if dry else 112,
-        base_ch=48, surround_ch=32, lr=1.25e-3, weight_decay=3e-4, max_pool_items=256 if dry else 14336,
-        clip_image_hw=(256, 320) if dry else (416, 736), clip_frames=2 if dry else 4,
-        initial_clips=1 if dry else 64, refresh_clips_every=0 if dry else 45, refresh_clips_count=2,
+    quad_cfg = QuadTrackTrainConfig(total_steps=2 if dry else args.quad_steps, batch_size=8 if dry else 144,
+        base_ch=48, surround_ch=32, lr=1.3e-3, weight_decay=3e-4, max_pool_items=256 if dry else 20480,
+        clip_image_hw=(256, 320) if dry else (448, 768), clip_frames=2 if dry else 4,
+        initial_clips=1 if dry else 96, refresh_clips_every=0 if dry else 18, refresh_clips_count=3,
         log_every=2 if dry else 200, init_seed=20260631, seed=20266331)
     quad_path = out_dir / "plate_quad_track_v4.pt"
     print("[Gen6] Training Stage-2 with independent scene-bank detector proposals", flush=True)

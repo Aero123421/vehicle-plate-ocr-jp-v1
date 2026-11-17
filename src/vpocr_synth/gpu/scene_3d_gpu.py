@@ -50,6 +50,7 @@ from vpocr_det.types import (
     SceneObjectGT,
     SynthSceneSample,
 )
+from vpocr_synth.chaos_info import lorenz_rk4_offset
 from vpocr_synth.export.fast_synthesizer import FastPlatePatchRenderer
 from vpocr_synth.plate.models import PlateSize, PlateType
 from vpocr_synth.plate.stratified_sampler import StratifiedPlateSampler
@@ -145,7 +146,13 @@ GRAMMAR_COMBOS_BY_DOMAIN_SPLIT: dict[str, tuple[tuple[str, str, str, str], ...]]
 }
 
 CAMERA_FAMILIES_BY_DOMAIN_SPLIT: dict[str, tuple[str, ...]] = {
-    "train": ("ptz_pan_linear", "zoom_push_linear", "pole_harmonic_sway", "stationary_rig_fixed"),
+    "train": (
+        "ptz_pan_linear",
+        "zoom_push_linear",
+        "pole_harmonic_sway",
+        "stationary_rig_fixed",
+        "lorenz_chaotic_handheld",
+    ),
     "val_holdout": ("ptz_orbit_curved", "zoom_pull_coupled", "pole_bimodal_flutter"),
     "cal_holdout": ("dolly_lateral_track", "zoom_breathing_osc", "pole_damped_tremor"),
 }
@@ -2357,9 +2364,24 @@ class _GPU3DTextureBank:
             pt = replace(pt, serial=int(serial_val))
 
             if bucket_name == "special_8_9":
-                pref = rng.choice(["8", "9", "0"])
-                rest = pt.classification[1:] if len(pt.classification) >= 2 else "00"
-                pt = replace(pt, classification=pref + rest)
+                pref = rng.choices(["8", "9", "0"], weights=[0.62, 0.22, 0.16], k=1)[0]
+                if pref == "0":
+                    if len(pt.classification) == 1:
+                        new_cls = "0"
+                    elif len(pt.classification) == 2:
+                        new_cls = f"0{pt.classification[1] if pt.classification[1].isdigit() else '0'}"
+                    else:
+                        c3 = pt.classification[2]
+                        new_cls = f"0{rng.choice(['0', '9'])}{c3}"
+                else:
+                    if len(pt.classification) == 1:
+                        new_cls = pref
+                    elif len(pt.classification) == 2:
+                        c2 = rng.choice(["8", "0"]) if (pref == "8" and rng.random() < 0.45) else pt.classification[1]
+                        new_cls = f"{pref}{c2}"
+                    else:
+                        new_cls = pref + pt.classification[1:]
+                pt = replace(pt, classification=new_cls)
             elif p_size == PlateSize.LARGE and pt.classification and pt.classification[0] not in ("1", "2", "8", "9", "0"):
                 pref = rng.choices(["1", "2", "8"], weights=[0.62, 0.18, 0.20], k=1)[0]
                 pt = replace(pt, classification=pref + pt.classification[1:])
@@ -2719,6 +2741,14 @@ class _CameraTrajectorySpec:
             damp = math.exp(-1.1 * abs(tf))
             d_tilt += self.vib_amp_rad * (damp * math.sin(w0 * tf + ph) - math.sin(ph))
             d_pan += 0.55 * self.vib_amp_rad * (damp * math.sin(1.42 * w0 * tf + 0.6 * ph) - math.sin(0.6 * ph))
+        elif self.family == "lorenz_chaotic_handheld":
+            lx, ly, lz = lorenz_rk4_offset(tf, ph)
+            dx += 0.095 * lx
+            dz += 0.038 * lz
+            d_pan += 0.028 * lx + 1.8 * self.vib_amp_rad * ly
+            d_tilt += 0.016 * ly + 1.4 * self.vib_amp_rad * lz
+            d_roll += 0.008 * lz
+            z_scale = float(np.clip(z_scale + 0.032 * lz, 0.78, 1.32))
         elif self.vib_amp_rad > 0.0:
             d_tilt += self.vib_amp_rad * (math.sin(w0 * tf + ph) - math.sin(ph))
 
@@ -4812,7 +4842,30 @@ class Scene3DGPUEngine:
     ) -> _VehiclePassSpec:
         names = [a[0] for a in ARCHETYPE_CATALOG]
         subs = [a[1] for a in ARCHETYPE_CATALOG]
-        weights = [a[2] for a in ARCHETYPE_CATALOG]
+        if self.config.domain_split == "train":
+            # Balanced urban road + working-vehicle (`はたらくくるま`) distribution for high general recall
+            train_weight_map = {
+                "dump_10t": 0.09,
+                "deep_dump": 0.04,
+                "concrete_mixer": 0.08,
+                "flatbed_truck": 0.07,
+                "box_wing_truck": 0.11,
+                "semi_container_trailer": 0.04,
+                "skeletal_chassis_trailer": 0.03,
+                "heavy_lowboy_trailer": 0.03,
+                "tractor_head": 0.04,
+                "rough_terrain_crane": 0.03,
+                "cargo_crane_truck": 0.04,
+                "tanker_lorry": 0.04,
+                "kei_truck": 0.08,
+                "hiace_van": 0.10,
+                "sedan": 0.06,
+                "kei_tall_wagon": 0.06,
+                "suv_4wd": 0.06,
+            }
+            weights = [train_weight_map.get(nm, w0) for nm, w0 in zip(names, (a[2] for a in ARCHETYPE_CATALOG))]
+        else:
+            weights = [a[2] for a in ARCHETYPE_CATALOG]
         idx_a = rng.choices(range(len(names)), weights=weights, k=1)[0]
         arch = names[idx_a]
         subtype = subs[idx_a]
@@ -4902,6 +4955,15 @@ class Scene3DGPUEngine:
             (0.82, 0.80, 0.70),
             (0.74, 0.76, 0.80),
         )
+        if self.config.domain_split == "train":
+            palettes = palettes + (
+                (0.76, 0.03, 0.03),  # Fire pump / emergency working-vehicle vivid red (`はたらくくるま`)
+                (0.04, 0.20, 0.70),  # Municipal sanitation / packer royal blue (`清掃車`)
+                (0.78, 0.54, 0.03),  # Road maintenance patrol bright yellow (`道路維持作業車`)
+                (0.84, 0.34, 0.04),  # Municipal / utility high-visibility orange
+            )
+            if arch in ("box_wing_truck", "hiace_van", "flatbed_truck", "dump_10t") and rng.random() < 0.24:
+                p_bucket = "special_8_9"
         paint_lin = rng.choice(palettes)
         if arch in ("box_wing_truck", "concrete_mixer") and rng.random() < 0.52:
             # High-frequency Japanese commercial two-tone: colored cab + bright white/silver box or mixer drum!
@@ -6874,8 +6936,19 @@ class Scene3DGPUEngine:
         has_pillar = (K >= 2) and (rng.random() < self.config.p_gate_pillar_occlusion)
         stationary_all = rng.random() < self.config.p_stationary_clip
 
-        # Camera rig: covers close-up giant gate, top-edge approach, mid-gate, and distant wide pole!
-        cam_mode = rng.choices(["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch"], weights=[0.38, 0.34, 0.16, 0.12], k=1)[0]
+        # Camera rig: covers close-up giant gate, top-edge approach, mid-gate, distant wide pole, and elevated CCTV!
+        if self.config.domain_split == "train":
+            cam_mode = rng.choices(
+                ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch", "cctv_elevated_security"],
+                weights=[0.28, 0.28, 0.14, 0.10, 0.20],
+                k=1,
+            )[0]
+        else:
+            cam_mode = rng.choices(
+                ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch"],
+                weights=[0.38, 0.34, 0.16, 0.12],
+                k=1,
+            )[0]
         if cam_mode == "close_gate":
             cam_x = rng.uniform(-2.9, 2.9)
             cam_z = rng.uniform(1.10, 2.45)
@@ -6888,6 +6961,12 @@ class Scene3DGPUEngine:
             hfov_deg = rng.uniform(46.0, 70.0)
             y_spawn = (7.2, 14.5)
             look_y, look_z = rng.uniform(4.4, 6.6), rng.uniform(0.0, 0.30)
+        elif cam_mode == "cctv_elevated_security":
+            cam_x = rng.uniform(-5.2, 5.2)
+            cam_z = rng.uniform(3.8, 8.4)
+            hfov_deg = rng.uniform(50.0, 88.0)
+            y_spawn = (8.5, 30.5)
+            look_y, look_z = rng.uniform(11.0, 22.5), rng.uniform(0.35, 1.35)
         elif cam_mode == "high_pole_wide":
             cam_x = rng.uniform(-4.0, 4.0)
             cam_z = rng.uniform(3.4, 6.2)
@@ -7078,6 +7157,68 @@ class Scene3DGPUEngine:
                 )
                 sign_ra = hw_a + 0.14
                 static_obs.append((np.array([sx_a, sy_a], dtype=np.float32), sign_ra, sign_ra))
+
+        # v0.7.0 train-only roadside bright storefronts/kiosks & red reflector bollards (teaches negative suppression
+        # against bright white livecam shop facades and glowing red non-plate lamps without touching holdout splits).
+        if self.config.domain_split == "train":
+            rng_ch = random.Random(int(seed) ^ 0x4348414F)
+            if rng_ch.random() < 0.36:
+                n_kiosk = rng_ch.choices([1, 2], weights=[0.65, 0.35], k=1)[0]
+                for ki in range(n_kiosk):
+                    kx = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(6.2, 8.2)
+                    ky = rng_ch.uniform(8.5, 25.0)
+                    khx = rng_ch.uniform(0.95, 1.65)
+                    khy = rng_ch.uniform(1.55, 2.85)
+                    khz = rng_ch.uniform(1.25, 1.95)
+                    bright_wall = rng_ch.choice([
+                        (0.88, 0.90, 0.93),
+                        (0.92, 0.89, 0.82),
+                        (0.82, 0.86, 0.90),
+                    ])
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(kx, ky, khz),
+                            rot_w2l=I3,
+                            half_ext=(khx, khy, khz),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=bright_wall,
+                            roughness=0.28,
+                            rib_freq=rng_ch.choice([4.0, 8.0]),
+                            retro_gain=0.35,
+                        )
+                    )
+                    # Dark shop-window recess band + glowing red roadside bollard reflector next to kiosk
+                    face_s = -1.0 if kx > 0.0 else 1.0
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(kx + face_s * (khx + 0.03), ky, 0.85),
+                            rot_w2l=I3,
+                            half_ext=(0.04, khy * 0.72, 0.52),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_CABIN_GLASS,
+                            albedo_rgb=(0.08, 0.12, 0.16),
+                            roughness=0.08,
+                            clearcoat=0.85,
+                        )
+                    )
+                    if rng_ch.random() < 0.55:
+                        env_prims_base.append(
+                            _Prim3D(
+                                center=(kx + face_s * (khx + 0.28), ky - khy * 0.65, 0.55),
+                                rot_w2l=I3,
+                                half_ext=(0.14, 0.08, 0.07),
+                                shape=_SHAPE_OBB,
+                                veh_idx=0,
+                                role=_ROLE_TAILLIGHT,
+                                albedo_rgb=(0.90, 0.08, 0.06),
+                                roughness=0.18,
+                                retro_gain=1.15,
+                            )
+                        )
+                    static_obs.append((np.array([kx, ky], dtype=np.float32), khx + 0.45, khy + 0.35))
 
         fence_cfg: dict[str, float] | None = None
         if has_fence:

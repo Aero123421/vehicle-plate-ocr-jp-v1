@@ -921,7 +921,7 @@ class MFJPPlateOCRV2(nn.Module):
             )
             nn.init.normal_(self.cls_len_head.weight, std=0.01)
             self.cls_len_head.bias.data.copy_(
-                torch.tensor([-1.8, -0.8, 1.2], dtype=torch.float32)
+                torch.tensor([-1.15, -0.35, 0.65], dtype=torch.float32)
             )
         else:
             self.reg_len_head = None

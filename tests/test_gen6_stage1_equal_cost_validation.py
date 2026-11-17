@@ -8,7 +8,7 @@ import torch
 
 @pytest.mark.parametrize('accepted', [True, False])
 def test_rejected_duplicate_cannot_consume_accepted_detection(monkeypatch, accepted):
-    path = Path(__file__).resolve().parents[1] / 'tools/train_gen6_det_quad.py'
+    path = Path(__file__).resolve().parents[1] / 'tools/train_det_quad.py'
     spec = importlib.util.spec_from_file_location('gen6_training_validation', path)
     training = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(training)

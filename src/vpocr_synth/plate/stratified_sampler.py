@@ -134,10 +134,10 @@ def _occurrence_index(idx: int, pattern: list[str], value: str) -> int:
 
 @dataclass
 class StratifiedSamplerConfig:
-    confusable_focus_prob: float = 0.28
-    p_class_3digit_latin: float = 0.03
-    p_class_2digit: float = 0.08
-    p_class_1digit: float = 0.05
+    confusable_focus_prob: float = 0.30
+    p_class_3digit_latin: float = 0.08
+    p_class_2digit: float = 0.22
+    p_class_1digit: float = 0.08
     p_serial_4digit: float = 0.65
     p_serial_3digit: float = 0.15
     p_serial_2digit: float = 0.12
@@ -410,20 +410,20 @@ class StratifiedPlateSampler:
             # SOFA 'A' / 'B' plates on standard passenger vehicles predominantly use 5-series (500..599)
             return rng.choices(["5", "3", "7", "1", "4", "8"], weights=[0.88, 0.04, 0.03, 0.02, 0.02, 0.01], k=1)[0]
         if plate_size == PlateSize.LARGE and plate_type != PlateType.GRAPHIC:
-            return rng.choices(["1", "2", "8", "0"], weights=[0.52, 0.22, 0.18, 0.08], k=1)[0]
+            return rng.choices(["1", "2", "8", "9", "0"], weights=[0.46, 0.20, 0.20, 0.07, 0.07], k=1)[0]
         if plate_type == PlateType.KEI_PRIVATE:
-            return rng.choices(["5", "7", "4", "8"], weights=[0.76, 0.14, 0.07, 0.03], k=1)[0]
+            return rng.choices(["5", "7", "4", "8"], weights=[0.74, 0.14, 0.07, 0.05], k=1)[0]
         if plate_type == PlateType.KEI_COMMERCIAL:
-            return rng.choices(["4", "6", "8"], weights=[0.87, 0.09, 0.04], k=1)[0]
+            return rng.choices(["4", "6", "8"], weights=[0.85, 0.09, 0.06], k=1)[0]
         if plate_type == PlateType.GRAPHIC:
             if hiragana in PlateValidator.STANDARD_COMMERCIAL_HIRAGANA:
                 return rng.choices(["5", "7", "4"], weights=[0.8, 0.15, 0.05], k=1)[0]
             if hiragana in ("A", "B"):
                 return rng.choices(["5", "3", "7", "1", "4", "8"], weights=[0.88, 0.04, 0.03, 0.02, 0.02, 0.01], k=1)[0]
-            return rng.choices(["3", "5", "7", "1", "2", "4", "8"], weights=[0.42, 0.36, 0.05, 0.05, 0.03, 0.06, 0.03], k=1)[0]
+            return rng.choices(["3", "5", "7", "1", "2", "4", "8"], weights=[0.42, 0.35, 0.05, 0.05, 0.03, 0.06, 0.04], k=1)[0]
         if plate_type == PlateType.STANDARD_COMMERCIAL:
-            return rng.choices(["1", "2", "4", "8", "3", "0"], weights=[0.38, 0.23, 0.18, 0.11, 0.06, 0.04], k=1)[0]
-        return rng.choices(["3", "5", "7", "1", "4", "8", "0"], weights=[0.52, 0.30, 0.05, 0.04, 0.04, 0.03, 0.02], k=1)[0]
+            return rng.choices(["1", "2", "4", "8", "3", "9", "0"], weights=[0.35, 0.21, 0.17, 0.15, 0.05, 0.04, 0.03], k=1)[0]
+        return rng.choices(["3", "5", "7", "1", "4", "8", "9", "0"], weights=[0.46, 0.28, 0.05, 0.05, 0.05, 0.07, 0.02, 0.02], k=1)[0]
 
     def sample(self, seed: int | None = None) -> tuple[PlateText, PlateConfig]:
         if seed is not None:
@@ -499,7 +499,12 @@ class StratifiedPlateSampler:
             else:
                 classification = f"{first}{letter}{letter2}"
         elif style == "2digit":
-            classification = f"{first}{rng.randint(0,9)}"
+            if first == "8" and rng.random() < 0.45:
+                classification = f"8{rng.choice(['8', '0'])}"
+            elif rng.random() < 0.32:
+                classification = f"{first}{rng.choice([first, '0'])}"
+            else:
+                classification = f"{first}{rng.randint(0,9)}"
         else:
             classification = first
 

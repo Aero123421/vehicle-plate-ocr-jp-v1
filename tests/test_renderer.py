@@ -96,4 +96,4 @@ def test_font_selection_only_gothic_by_default():
     default_fonts = PlateDataLoader.get_available_fonts(allow_serif=False)
     for f in default_fonts:
         assert "Serif" not in f, f"Unexpected Serif font in default list: {f}"
-        assert "Sans" in f or "Gothic" in f
+        assert "Sans" in f or "Gothic" in f or "MPLUSRounded" in f

@@ -2360,17 +2360,17 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                         pyr_hardneg_boost[b],
                     )
 
-                rad = 2.5 * st_pyr[None, :]
+                gt_max_dim = torch.maximum(gx1 - gx0, gy1 - gy0)[:, None]
+                rad = torch.where(gt_max_dim < 44.0, 3.0 * st_pyr[None, :], 2.5 * st_pyr[None, :])
                 in_center = (torch.abs(ax[None, :] - gcx[:, None]) <= rad) & (
                     torch.abs(ay[None, :] - gcy[:, None]) <= rad
                 )
-                gt_max_dim = torch.maximum(gx1 - gx0, gy1 - gy0)[:, None]
                 st_row = st_pyr[None, :]
                 is_pl = (ps_labels == CLS_PLATE)[:, None]
                 pl_ok = torch.where(
-                    gt_max_dim < 48.0,
+                    gt_max_dim < 52.0,
                     st_row <= 8.0,
-                    torch.where(gt_max_dim < 112.0, st_row <= 16.0, st_row >= 8.0),
+                    torch.where(gt_max_dim < 116.0, st_row <= 16.0, st_row >= 8.0),
                 )
                 sign_ok = torch.where(gt_max_dim < 56.0, st_row <= 8.0, st_row >= 8.0)
                 stride_ok = torch.where(is_pl, pl_ok, sign_ok)
@@ -2428,8 +2428,8 @@ class TemporalTaskAlignedDetLoss(nn.Module):
 
                 gt_w = (ps_boxes[gt_sel, 2] - ps_boxes[gt_sel, 0]).clamp_min(4.0)
                 small_boost = torch.where(
-                    (cls_sel == CLS_PLATE) & (gt_w < 32.0),
-                    torch.full_like(qual_sel, 1.65),
+                    (cls_sel == CLS_PLATE) & (gt_w < 38.0),
+                    torch.full_like(qual_sel, 2.15),
                     torch.ones_like(qual_sel),
                 )
                 pyr_weights[b, fg_idx] = qual_sel * small_boost
@@ -2725,20 +2725,36 @@ def compute_temporal_det_kd_loss(
     a_pyr_t = max(0, t_cls_all.shape[1] - num_q_t)
     a_pyr = min(a_pyr_s, a_pyr_t)
 
-    # 1. Spatially aligned P2/P3/P4 pyramid anchors: distill `[CLS_PLATE, CLS_SIGNBOARD_HARDNEG]`
+    # 1. Spatially aligned P2/P3/P4 pyramid anchors: distill `[CLS_PLATE, CLS_SIGNBOARD_HARDNEG]` + plate boxes/corners
     pyr_idx = [CLS_PLATE, CLS_SIGNBOARD_HARDNEG]
     s_pyr = s_cls_all[:, :a_pyr, pyr_idx]
     t_pyr = t_cls_all[:, :a_pyr, pyr_idx]
     t_prob_pyr = torch.sigmoid(t_pyr)
-    focus = (t_prob_pyr.amax(dim=-1, keepdim=True).clamp_min(0.02)) ** 0.75
+    s_prob_pyr = torch.sigmoid(s_pyr.detach())
+    # Information-theoretic surprise focus: emphasize anchors where EITHER teacher detects OR student hallucinates!
+    focus = (torch.maximum(t_prob_pyr, 0.65 * s_prob_pyr).amax(dim=-1, keepdim=True).clamp_min(0.02)) ** 0.75
     t_soft = torch.sigmoid(t_pyr / temperature)
     kd_cls = F.binary_cross_entropy_with_logits(s_pyr / temperature, t_soft, reduction="none")
     loss_kd = (kd_cls * focus).sum() / focus.sum().clamp_min(1.0) * (temperature * temperature)
 
-    # 2. Permutation-invariant IoU matching between Teacher & Student `D-FINE` vehicle queries
+    t_plate_mask = t_prob_pyr[:, :, 0] > 0.32
+    if t_plate_mask.any():
+        sp_b = student_out["pred_boxes"][:, :a_pyr][t_plate_mask].float()
+        tp_b = teacher_out["pred_boxes"][:, :a_pyr][t_plate_mask].detach().float()
+        _, p_ciou = compute_box_iou_ciou(sp_b, tp_b)
+        p_nwd = compute_box_nwd(sp_b, tp_b)
+        sp_c = student_out["pred_corners"][:, :a_pyr][t_plate_mask].float()
+        tp_c = teacher_out["pred_corners"][:, :a_pyr][t_plate_mask].detach().float()
+        diag_t = torch.hypot((tp_b[:, 2] - tp_b[:, 0]).clamp_min(6.0), (tp_b[:, 3] - tp_b[:, 1]).clamp_min(4.0)).view(-1, 1, 1)
+        loss_kd = loss_kd + 0.30 * (0.65 * (1.0 - p_ciou) + 0.35 * (1.0 - p_nwd)).mean() + 0.25 * F.smooth_l1_loss(
+            sp_c / diag_t, tp_c / diag_t, beta=0.06
+        )
+
+    # 2. Permutation-invariant IoU matching + unmatched false-positive suppression on `D-FINE` vehicle queries
     if num_q_s > 0 and num_q_t > 0 and s_cls_all.shape[1] > a_pyr_s and t_cls_all.shape[1] > a_pyr_t:
         t_q_prob = torch.sigmoid(t_cls_all[:, a_pyr_t:, CLS_VEHICLE])
-        s_q_boxes = student_out["pred_boxes"][:, a_pyr_s:].detach().float()
+        s_q_boxes_live = student_out["pred_boxes"][:, a_pyr_s:].float()
+        s_q_boxes = s_q_boxes_live.detach()
         t_q_boxes = teacher_out["pred_boxes"][:, a_pyr_t:].detach().float()
         s_q_sub = student_out["pred_subtype_logits"][:, a_pyr_s:].float()
         t_q_sub = teacher_out["pred_subtype_logits"][:, a_pyr_t:].detach().float()
@@ -2749,24 +2765,40 @@ def compute_temporal_det_kd_loss(
         matched_t_sub: list[torch.Tensor] = []
         matched_s_syn: list[torch.Tensor] = []
         matched_t_syn: list[torch.Tensor] = []
+        matched_s_box: list[torch.Tensor] = []
+        matched_t_box: list[torch.Tensor] = []
+        neg_s_syn: list[torch.Tensor] = []
         for b in range(s_cls_all.shape[0]):
-            t_valid = t_q_prob[b] > 0.30
+            t_valid = t_q_prob[b] > 0.28
+            if isinstance(s_synth, torch.Tensor):
+                s_syn_b = s_synth.reshape(s_cls_all.shape[0], -1)[b].float()
+            else:
+                s_syn_b = None
             if not t_valid.any():
+                if s_syn_b is not None:
+                    fp_q = torch.sigmoid(s_syn_b.detach()) > 0.16
+                    if fp_q.any():
+                        neg_s_syn.append(s_syn_b[fp_q])
                 continue
             tb = t_q_boxes[b, t_valid]
             tsub = t_q_sub[b, t_valid]
             ious = pairwise_box_iou(s_q_boxes[b], tb)
             best_iou, best_t = ious.max(dim=1)
-            keep_q = best_iou >= 0.60
+            keep_q = best_iou >= 0.52
+            if s_syn_b is not None:
+                fp_q = (best_iou < 0.22) & (torch.sigmoid(s_syn_b.detach()) > 0.16)
+                if fp_q.any():
+                    neg_s_syn.append(s_syn_b[fp_q])
             if not keep_q.any():
                 continue
             matched_s_sub.append(s_q_sub[b, keep_q])
             matched_t_sub.append(tsub[best_t[keep_q]])
-            if isinstance(s_synth, torch.Tensor) and isinstance(t_synth, torch.Tensor):
-                s_syn_2d = s_synth.reshape(s_cls_all.shape[0], -1)
+            matched_s_box.append(s_q_boxes_live[b, keep_q])
+            matched_t_box.append(tb[best_t[keep_q]])
+            if s_syn_b is not None and isinstance(t_synth, torch.Tensor):
                 t_syn_2d = t_synth.reshape(t_cls_all.shape[0], -1)
                 tsyn_valid = t_syn_2d[b, t_valid].detach().float()
-                matched_s_syn.append(s_syn_2d[b, keep_q].float())
+                matched_s_syn.append(s_syn_b[keep_q])
                 matched_t_syn.append(tsyn_valid[best_t[keep_q]])
 
         if matched_s_sub:
@@ -2775,12 +2807,20 @@ def compute_temporal_det_kd_loss(
             loss_kd = loss_kd + 0.25 * F.kl_div(s_sub_cat, t_sub_cat, reduction="batchmean") * (
                 temperature * temperature
             )
+        if matched_s_box:
+            _, v_ciou = compute_box_iou_ciou(torch.cat(matched_s_box, dim=0), torch.cat(matched_t_box, dim=0))
+            loss_kd = loss_kd + 0.30 * (1.0 - v_ciou).mean()
         if matched_s_syn:
             s_syn_cat = torch.cat(matched_s_syn, dim=0)
             t_syn_soft = torch.sigmoid(torch.cat(matched_t_syn, dim=0) / temperature)
-            loss_kd = loss_kd + 0.15 * F.binary_cross_entropy_with_logits(
+            loss_kd = loss_kd + 0.25 * F.binary_cross_entropy_with_logits(
                 s_syn_cat / temperature, t_syn_soft, reduction="mean"
             ) * (temperature * temperature)
+        if neg_s_syn:
+            s_neg_cat = torch.cat(neg_s_syn, dim=0)
+            loss_kd = loss_kd + 0.22 * F.binary_cross_entropy_with_logits(
+                s_neg_cat, torch.full_like(s_neg_cat, 0.01), reduction="mean"
+            )
 
     return loss_kd
 
@@ -2867,6 +2907,31 @@ def decode_temporal_det_predictions(
     v_indices_cand = np.nonzero(v_mask)[0]
     v_keep_local = nms_numpy(boxes[v_indices_cand], v_scores[v_indices_cand], iou_thresh=0.52)
     v_keep_anchors = v_indices_cand[v_keep_local]
+
+    if len(v_keep_anchors) > 1:
+        # Suppress low-confidence multi-vehicle wrapper boxes & interior cab/bed sub-boxes
+        v_filtered: list[int] = []
+        for ai in v_keep_anchors:
+            ax0, ay0, ax1, ay1 = [float(x) for x in boxes[ai]]
+            a_area = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+            asc = float(v_scores[ai])
+            wrapped_cnt = 0
+            drop_sub = False
+            for bi in v_keep_anchors:
+                if int(ai) == int(bi):
+                    continue
+                bx0, by0, bx1, by1 = [float(x) for x in boxes[bi]]
+                b_area = max(1.0, (bx1 - bx0) * (by1 - by0))
+                bsc = float(v_scores[bi])
+                inter = max(0.0, min(ax1, bx1) - max(ax0, bx0)) * max(0.0, min(ay1, by1) - max(ay0, by0))
+                if a_area > 1.85 * b_area and (inter / b_area) >= 0.78 and bsc >= 0.85 * asc:
+                    wrapped_cnt += 1
+                if b_area > 1.75 * a_area and (inter / a_area) >= 0.86 and bsc >= asc + 0.14:
+                    drop_sub = True
+                    break
+            if not drop_sub and wrapped_cnt < 2:
+                v_filtered.append(int(ai))
+        v_keep_anchors = np.asarray(v_filtered, dtype=v_indices_cand.dtype)
 
     # Compute 64x64 cutouts early when needed so silhouette-aware sub-part vs foreground-car check has exact masks
     need_early_cutouts = compute_vehicle_cutouts

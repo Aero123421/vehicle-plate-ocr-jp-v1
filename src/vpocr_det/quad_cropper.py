@@ -1542,6 +1542,13 @@ def refine_and_crop_detections(
         p_plate = float(posterior[i])
         tight = None if missing else warp_plate_quad(frame_rgb, c_xy, out_hw=(64, 128), margin_ratio=0,
                                                      pixel_center_aligned=pixel_center_aligned)
+        if tight is not None:
+            # Reject pure glowing red brake/tail-lamp false positives (valid JP plates are white/yellow/green/black)
+            mr = float(tight[:, :, 0].mean())
+            mg = float(tight[:, :, 1].mean())
+            mb = float(tight[:, :, 2].mean())
+            if mr > 152.0 and mg < 72.0 and mb < 72.0 and mr > 2.15 * max(mg, mb):
+                continue
         ocr = None if missing else warp_plate_quad(frame_rgb, c_xy, out_hw=ocr_out_hw, margin_ratio=ocr_margin_ratio,
                                                    pixel_center_aligned=pixel_center_aligned)
         lo, hi = np.clip(c_xy.min(0), 0, [width, height]), np.clip(c_xy.max(0), 0, [width, height])

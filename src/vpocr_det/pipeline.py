@@ -24,10 +24,12 @@ from vpocr_det.detector import (
     decode_plate_det_predictions,
     decode_temporal_det_predictions,
 )
+from vpocr_det.optical_tracker import OpticalPlateRef, create_optical_ref, quad_basis, track_plate_optical
 from vpocr_det.quad_cropper import (
     PlateQuadNet,
     PlateQuadTrackNet,
     extract_quad_geometry_meta,
+    is_valid_plate_quad,
     refine_and_crop_detections,
     warp_plate_canonical,
     warp_plate_quad,
@@ -168,23 +170,132 @@ def _relink_sessions(owner: Any, pairs: list[tuple[int, int]]) -> None:
         owner._terminal_decisions.pop(old_id, None)
         if old_id in owner._prev_corners:
             owner._prev_corners[restored_id] = owner._prev_corners.pop(old_id)
+        if hasattr(owner, "_opt_refs") and old_id in owner._opt_refs:
+            owner._opt_refs[restored_id] = owner._opt_refs.pop(old_id)
 
 
-def _search_inputs(requests: list[SearchRequest], frame_key: str) -> list[PlateDetection]:
+def _search_inputs(
+    requests: list[SearchRequest],
+    frame_key: str,
+    *,
+    frame_rgb: np.ndarray | None = None,
+    opt_refs: dict[int, OpticalPlateRef] | None = None,
+    prev_corners: dict[int, np.ndarray] | None = None,
+) -> list[PlateDetection]:
     """Zero-prior geometry carriers for Stage-2 execution, never PMBM updates.
 
     The current cropper accepts geometry carriers, so adaptation of score-free
     requests is confined to this boundary. Only neural outputs are observations.
+    When an optical template exists for `request.target_track_id`, pre-aligns
+    the search ROI onto the sub-pixel IC-LK + ZNCC optical plate position.
     """
     carriers = []
     provenance = getattr(ObservationProvenance, "STAGE2_SEARCH", ObservationProvenance.SEARCH_MEASUREMENT)
     for request in requests:
         assert_not_observation(request)
         x0, y0, x1, y1 = request.roi_xyxy
-        carriers.append(PlateDetection(request.roi_xyxy, 0.0,
-            np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]], dtype=np.float32),
+        c_init = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+        tid = getattr(request, "target_track_id", None)
+        if (
+            frame_rgb is not None
+            and opt_refs is not None
+            and tid is not None
+            and tid in opt_refs
+        ):
+            init_q = prev_corners.get(tid) if prev_corners is not None else None
+            if init_q is not None:
+                # Shift previous 4-corner quad to the predicted search box center
+                q_cx = float(init_q[:, 0].mean())
+                q_cy = float(init_q[:, 1].mean())
+                r_cx = 0.5 * (x0 + x1)
+                r_cy = 0.5 * (y0 + y1)
+                init_q = init_q + np.array([[r_cx - q_cx, r_cy - q_cy]], dtype=np.float32)
+            rad_x = max(18.0, 0.45 * (x1 - x0))
+            rad_y = max(12.0, 0.45 * (y1 - y0))
+            ok_opt, _, opt_q = track_plate_optical(
+                opt_refs[tid],
+                frame_rgb,
+                init_q,
+                search_radius_px=rad_x,
+                search_radius_y=rad_y,
+                allow_scale_search=True,
+                min_zncc=0.56,
+            )
+            if ok_opt and opt_q is not None:
+                h_f, w_f = frame_rgb.shape[:2]
+                ox0 = float(np.clip(opt_q[:, 0].min(), 0.0, float(w_f)))
+                oy0 = float(np.clip(opt_q[:, 1].min(), 0.0, float(h_f)))
+                ox1 = float(np.clip(opt_q[:, 0].max(), 0.0, float(w_f)))
+                oy1 = float(np.clip(opt_q[:, 1].max(), 0.0, float(h_f)))
+                if ox1 - ox0 >= 8.0 and oy1 - oy0 >= 4.0:
+                    x0, y0, x1, y1 = ox0, oy0, ox1, oy1
+                    c_init = opt_q
+        carriers.append(PlateDetection((x0, y0, x1, y1), 0.0,
+            c_init,
             raw_det_score=0.0, provenance=provenance, frame_key=frame_key))
     return carriers
+
+
+def _apply_optical_refinement_and_template_update(
+    frame_rgb: np.ndarray,
+    plates: list[PlateDetection],
+    opt_refs: dict[int, OpticalPlateRef],
+    prev_corners: dict[int, np.ndarray],
+) -> None:
+    """Fuse sub-pixel IC-LK optical corners on observed tracks and maintain crisp optical templates."""
+    h_f, w_f = frame_rgb.shape[:2]
+    for p in plates:
+        tid = p.track_id
+        if tid is None:
+            continue
+        ref = opt_refs.get(tid)
+        if p.is_coasted:
+            # Update visual coasted overlay geometry with sub-pixel lock while keeping ocr_crop_rgb=None
+            if ref is not None:
+                init_q = prev_corners.get(tid, p.corners_xy)
+                ok_c, _, opt_q = track_plate_optical(
+                    ref, frame_rgb, init_q, search_radius_px=28.0, allow_scale_search=True, min_zncc=0.62
+                )
+                if ok_c and opt_q is not None:
+                    p.corners_xy = opt_q
+                    p.bbox_xyxy = (
+                        float(np.clip(opt_q[:, 0].min(), 0.0, float(w_f))),
+                        float(np.clip(opt_q[:, 1].min(), 0.0, float(h_f))),
+                        float(np.clip(opt_q[:, 0].max(), 0.0, float(w_f))),
+                        float(np.clip(opt_q[:, 1].max(), 0.0, float(h_f))),
+                    )
+                    prev_corners[tid] = opt_q.copy()
+            continue
+
+        q_cnn = p.raw_corners_xy if p.raw_corners_xy is not None else p.corners_xy
+        if ref is not None and not p.quad_edge_touch:
+            ok_f, zncc_f, opt_q = track_plate_optical(
+                ref, frame_rgb, q_cnn, search_radius_px=12.0, search_radius_y=8.0, min_zncc=0.72, max_iter=5
+            )
+            if ok_f and opt_q is not None:
+                b_cnn = quad_basis(q_cnn)
+                corner_diff = float(np.linalg.norm(opt_q - q_cnn, axis=-1).mean())
+                if corner_diff <= max(2.5, 0.22 * b_cnn.width):
+                    w_opt = min(0.35, max(0.15, (zncc_f - 0.70) * 1.15))
+                    q_fused = ((1.0 - w_opt) * q_cnn + w_opt * opt_q).astype(np.float32)
+                    if is_valid_plate_quad(q_fused):
+                        p.corners_xy = q_fused
+                        p.raw_corners_xy = q_fused.copy()
+                        p.bbox_xyxy = (
+                            float(np.clip(q_fused[:, 0].min(), 0.0, float(w_f))),
+                            float(np.clip(q_fused[:, 1].min(), 0.0, float(h_f))),
+                            float(np.clip(q_fused[:, 0].max(), 0.0, float(w_f))),
+                            float(np.clip(q_fused[:, 1].max(), 0.0, float(h_f))),
+                        )
+                        p.ocr_crop_rgb = None
+                        p.tight_crop_rgb = None
+                        q_cnn = q_fused
+
+        if not p.quad_edge_touch and float(p.quad_is_plate_prob) >= 0.58:
+            cand_ref = create_optical_ref(frame_rgb, q_cnn)
+            if cand_ref is not None:
+                if ref is None or cand_ref.sharpness >= 0.92 * ref.sharpness or cand_ref.basis.width >= 1.12 * ref.basis.width:
+                    opt_refs[tid] = cand_ref
 
 
 def _search_requests(owner: Any, candidates: list[PlateDetection], ts: float,
@@ -298,6 +409,7 @@ class VehiclePlateVideoPipeline:
         self._camera_motion_estimator = BackgroundCameraMotionEstimator()
         self._retired_decisions: dict[int, Any] = {}
         self._prev_corners: dict[int, np.ndarray] = {}
+        self._opt_refs: dict[int, OpticalPlateRef] = {}
         self._det_hidden_state: tuple[torch.Tensor, torch.Tensor] | None = None
         self._prev_frame_luma: float | None = None
         self._frame_idx: int = 0
@@ -321,6 +433,7 @@ class VehiclePlateVideoPipeline:
         self._camera_motion_estimator.reset()
         self._retired_decisions.clear()
         self._prev_corners.clear()
+        self._opt_refs.clear()
         self._det_hidden_state = None
         self._prev_frame_luma = None
         self._frame_idx = 0
@@ -409,7 +522,15 @@ class VehiclePlateVideoPipeline:
             candidate.frame_key = frame_key
         search_requests = (_search_requests(self, det_candidates, ts, frame_rgb.shape[:2])
                            if self.use_tracker and self.enable_tracker_roi_reacquire and is_dual_quad else [])
-        det_candidates.extend(_search_inputs(search_requests, frame_key))
+        det_candidates.extend(
+            _search_inputs(
+                search_requests,
+                frame_key,
+                frame_rgb=frame_rgb,
+                opt_refs=self._opt_refs,
+                prev_corners=self._prev_corners,
+            )
+        )
         action_meta = ObservationActionMeta(action_id=frame_key, detector_ran_full=True,
             searched_rois_xyxy=tuple(r.roi_xyxy for r in search_requests), frame_key=frame_key)
 
@@ -454,6 +575,7 @@ class VehiclePlateVideoPipeline:
 
             for exp_tid in self.tracker.last_expired_track_ids:
                 self._prev_corners.pop(exp_tid, None)
+                self._opt_refs.pop(exp_tid, None)
                 exp_sess = self._ocr_sessions.pop(exp_tid, None)
                 if exp_sess is not None:
                     exp_dec = _finish_cached(self, exp_tid, exp_sess)
@@ -462,6 +584,10 @@ class VehiclePlateVideoPipeline:
                     retired_this_frame[exp_tid] = exp_dec
                     while len(self._retired_decisions) > self.max_retired_history:
                         self._retired_decisions.pop(next(iter(self._retired_decisions)))
+
+            _apply_optical_refinement_and_template_update(
+                frame_rgb, plates, self._opt_refs, self._prev_corners
+            )
 
             # Strict Crop Ownership Invariant:
             # - On observed frames (`is_coasted == False`), preserve exact `PlateQuadNet` `ocr_crop_rgb` &
@@ -854,6 +980,7 @@ class MultiRateEdgeCascadePipeline:
         self._camera_motion_estimator = BackgroundCameraMotionEstimator()
         self._retired_decisions: dict[int, Any] = {}
         self._prev_corners: dict[int, np.ndarray] = {}
+        self._opt_refs: dict[int, OpticalPlateRef] = {}
         self._cached_vehicles: list[VehicleDetection] = []
         self._cached_vehicle_bboxes: list[tuple[float, float, float, float, float]] = []
         self._frame_idx: int = 0
@@ -885,6 +1012,7 @@ class MultiRateEdgeCascadePipeline:
         self._camera_motion_estimator.reset()
         self._retired_decisions.clear()
         self._prev_corners.clear()
+        self._opt_refs.clear()
         self._cached_vehicles.clear()
         self._cached_vehicle_bboxes.clear()
         self._frame_idx = 0
@@ -1089,7 +1217,15 @@ class MultiRateEdgeCascadePipeline:
             candidate.frame_key = frame_key
         search_requests = (_search_requests(self, det_candidates, ts, frame_rgb.shape[:2])
                            if is_dual_quad else [])
-        det_candidates.extend(_search_inputs(search_requests, frame_key))
+        det_candidates.extend(
+            _search_inputs(
+                search_requests,
+                frame_key,
+                frame_rgb=frame_rgb,
+                opt_refs=self._opt_refs,
+                prev_corners=self._prev_corners,
+            )
+        )
         action_meta = ObservationActionMeta(action_id=frame_key, detector_ran_full=run_full_det,
             searched_rois_xyxy=tuple(r.roi_xyxy for r in search_requests), frame_key=frame_key)
 
@@ -1134,6 +1270,7 @@ class MultiRateEdgeCascadePipeline:
         retired_this_frame: dict[int, Any] = {}
         for exp_tid in self.tracker.last_expired_track_ids:
             self._prev_corners.pop(exp_tid, None)
+            self._opt_refs.pop(exp_tid, None)
             self._dormant_reappear_cooldown.pop(exp_tid, None)
             exp_sess = self._ocr_sessions.pop(exp_tid, None)
             if exp_sess is not None:
@@ -1143,6 +1280,10 @@ class MultiRateEdgeCascadePipeline:
                 retired_this_frame[exp_tid] = exp_dec
                 while len(self._retired_decisions) > self.max_retired_history:
                     self._retired_decisions.pop(next(iter(self._retired_decisions)))
+
+        _apply_optical_refinement_and_template_update(
+            frame_rgb, plates, self._opt_refs, self._prev_corners
+        )
 
         for p in plates:
             if p.is_coasted or p.quad_edge_touch or not np.isfinite(p.support_nonconformity):

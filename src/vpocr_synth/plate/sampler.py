@@ -25,10 +25,10 @@ class SamplerDistribution:
     p_large_plate: float = 0.06
 
     # Classification number structure
-    p_class_3digit_standard: float = 0.88
-    p_class_3digit_latin: float = 0.08   # e.g. 30A, 5FH (MLIT 2017)
-    p_class_2digit: float = 0.03         # e.g. 33, 55 (historic/classic)
-    p_class_1digit: float = 0.01         # e.g. 5, 3 (vintage)
+    p_class_3digit_standard: float = 0.64
+    p_class_3digit_latin: float = 0.10   # e.g. 30A, 5FH (MLIT 2017)
+    p_class_2digit: float = 0.20         # e.g. 88, 80, 11, 33, 44, 55
+    p_class_1digit: float = 0.06         # e.g. 1, 4, 8, 5, 3
 
     # Hiragana usage categories
     p_rental: float = 0.03               # 'わ', 'れ'
