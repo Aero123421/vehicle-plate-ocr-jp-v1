@@ -72,7 +72,7 @@ v0.6.5 は配布・パッケージ整備のリリースです。モデルと校�
 | 街路 hard negatives 400 枚 | full-scene false accepts 0/400 |
 | Wave-5 sealed、未見動画 8 本・読み取り可能 serial 6 件 | serial recall 2/6（33.3%）、余剰予測 1 件、full plate 正解 0/2 |
 
-出典：[Gen-6 実測記録（記録内の版は v0.6.0）](docs/benchmarks/v6_gen6_realworld_benchmark.json)、[Wave-5 sealed 記録](docs/benchmarks/v6_wave5_sealed_eval.json)。静止画の切り出し評価と動画の検出・追跡を含む評価では条件が異なります。20 件・37 件での観測精度は運用時の保証値ではありません。
+出典：[Gen-6 実測記録（記録内の版は v0.6.0）](docs/benchmarks/v6_gen6_realworld_benchmark.json)、[Wave-5 sealed 記録](docs/benchmarks/v6_wave5_video_eval.json)。静止画の切り出し評価と動画の検出・追跡を含む評価では条件が異なります。20 件・37 件での観測精度は運用時の保証値ではありません。
 
 **遠距離・低解像度で 4 フィールド完全認識を保証する SLA はありません。** `CORE_VERIFIED` では不確かな地域・分類番号・かなを `'?'` でマスクします。`OCRDecisionV2.format_verified_text()` またはブラウザーの終端表示を使用し、推測した上段文字を確定値として扱わないでください。公開 predictor の JSON では `CORE_VERIFIED` の全文字列を省略します。視認性や identity が不足する場合は `UNREADABLE` / `TRACK_MIXED` として棄却します。実環境の速度・精度は端末、撮影距離、照明、画素数に依存します。
 
@@ -93,6 +93,41 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -m pytest tests/test_vehicle_plate
 ```
 
 CI は公開パッケージ、Gen-6 契約、地域一覧と文字集合を検証します。`out/` を持たない clone では非配布の旧アーカイブのチェックだけが skip され、公開契約のチェックは実行されます。
+
+### 再学習と再校正（純粋合成データのみ）
+
+全ステージの学習・検証・校正入力は手続き生成した合成データです。検出・4 隅推定は `train` / `val_holdout` / `cal_holdout` を分離し、INT8 化後の Stage-1 / Stage-2 校正を `stage1_int8_cal.json` / `stage2_int8_cal.json` に記録します。OCR は乱数初期化した Base から Nano へ合成データだけで蒸留し、4 個の ONNX グラフと provenance を出力します。検出器の固定 D-FINE バックボーンには公開 Apache-2.0 重みを使い、初回取得にネットワーク接続が必要です。学習用画像や評価映像の取得は不要です。
+
+上記の Python 環境を有効にしてリポジトリ直下で実行します。検出・4 隅推定の学習は **CUDA / bfloat16 対応 GPU** が必要です。OCR は CPU でも実行できますが、全学習には GPU を推奨します。`--help` はモデルや学習依存を読み込まず、ファイルを作成しません。
+
+```bash
+python tools/train_det_quad.py --help
+python tools/train_ocr.py --help
+python tools/calibrate_policy.py --help
+
+# 短縮した学習・エクスポート経路の確認（隔離出力必須、GPU と実行時間が必要）
+python tools/train_det_quad.py --dry-run --out-dir out/dry-det/models --cal-dir out/dry-det/calibration
+python tools/train_ocr.py --dry-run --out-dir out/dry-ocr/models
+
+# 全学習：既定出力は gitignore 対象の out/models と out/calibration
+python tools/train_det_quad.py
+python tools/train_ocr.py
+
+# 学習済みの入れ子構成を再校正し、スキーマ・サイズ・合成 MP4 推論を確認
+python tools/calibrate_policy.py --models-dir out/models --calibration-out out/calibration/gen6.json
+python tools/calibrate_policy.py --models-dir out/models --calibration-out out/calibration/gen6.json --audit-only
+
+# 新規 clone の同梱バンドルを再学習せず監査（7 グラフ + 3 JSON、上限 15.000 MiB）
+python tools/calibrate_policy.py --audit-only
+
+# 同梱バンドルを合成 cal_holdout だけで再校正する場合
+# 既定では web/models/gen6.json を更新するため、公開バンドル更新時だけ実行
+python tools/calibrate_policy.py
+```
+
+学習スクリプトはチェックポイント、FP32 / INT8 ONNX、数値 parity 検証、ソース・フォント・教師モデルのハッシュ記録まで実行します。短縮実行は性能検証の代わりにはなりません。`calibrate_policy.py` は CPU で終端判定と追跡方策を校正し、公開 `create_predictor()` による短い手続き生成 MP4 の smoke test と `__pycache__` の掃除を行います。`--audit-only` は指定した校正 JSON を再利用し、校正値・モデルを更新しません。配布バンドルの既存合計は **10.15 MiB** です。
+
+再学習の成果物は `web/models/` に自動コピーしません。ブラウザー用に配布するときは、Nano の検出・cutout（`out/models/onnx_temporal_det_nano/`）、`stage2.int8.onnx`（`out/models/onnx_det_v4/`）、OCR の 4 個の INT8 グラフ（`out/models/onnx_v2_nano/`）、3 個の校正 JSON（`out/calibration/`）を明示的に `web/models/` へコピーし、`--audit-only` で再確認してください。文法表は上記の再生成コマンドで更新できます。
 
 ## ライセンス
 

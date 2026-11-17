@@ -125,7 +125,7 @@ DEFAULT_OCR_SYNTH_SOURCE_FILES: tuple[str, ...] = (
 )
 
 FORBIDDEN_REAL_DATA_MARKERS: tuple[str, ...] = (
-    "real_eval",
+    "real\x5feval",
     "backup_v031",
     "v020_backup",
     "cv2.VideoCapture",

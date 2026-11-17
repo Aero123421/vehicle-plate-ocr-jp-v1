@@ -1,10 +1,14 @@
 """Fast release inventory, grammar parity, fresh-clone loading and CLI checks."""
 import base64
 import hashlib
+import importlib.util
 import json
+import os
 import re
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import zlib
 
 import numpy as np
@@ -158,3 +162,156 @@ def test_browser_isolation_and_local_only_contract():
     assert "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'" in html
     assert '<input id="thorough" type="checkbox">' in html
     assert 'preload="auto" controls' in html
+
+
+@pytest.mark.parametrize("name", ("train_det_quad", "train_ocr", "calibrate_policy"))
+def test_synthetic_tools_help_without_models_or_writes(name):
+    # Block heavy imports, artifact reads and filesystem mutations in the child.
+    # Checking the real entry point also covers parsing before training imports.
+    guard = r'''
+import os, runpy, sys
+def audit(event, args):
+    if event == "import" and args[0].split(".")[0] in {
+        "torch", "numpy", "cv2", "onnx", "onnxruntime", "vpocr_det", "vpocr_ocr", "vpocr_synth"
+    }:
+        raise AssertionError("Help imported a training or model dependency")
+    if event == "open":
+        path, mode, flags = args
+        if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC):
+            raise AssertionError("Help opened a file for writing")
+        if isinstance(path, str) and path.endswith((".onnx", ".pt", ".json")):
+            raise AssertionError("Help read a model or calibration artifact")
+    if event in {"os.mkdir", "os.remove", "os.rename", "os.rmdir", "os.link", "os.symlink"}:
+        raise AssertionError("Help changed the filesystem")
+sys.addaudithook(audit)
+sys.argv = [sys.argv[1], "--help"]
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", guard, str(ROOT / "tools" / f"{name}.py")],
+        cwd=ROOT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, timeout=2,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+    assert not result.stderr
+
+
+def load_calibration_tool():
+    spec = importlib.util.spec_from_file_location("public_calibration_tool", ROOT / "tools/calibrate_policy.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_calibration_audit_only_in_fresh_clone(tmp_path, monkeypatch, capsys):
+    tool = load_calibration_tool()
+    shutil.copytree(MODELS, tmp_path / "web/models")
+    monkeypatch.setattr(tool, "REPO_ROOT", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    before = {p.name: hashlib.sha256(p.read_bytes()).digest()
+              for p in (tmp_path / "web/models").iterdir()}
+    assert tool.main(["--audit-only"]) == 0
+    output = capsys.readouterr().out
+    for name in cli.GRAPH_NAMES:
+        assert f"web/models/{name}.int8.onnx:" in output
+    expected = sum((MODELS / name).stat().st_size for name in ARTIFACTS)
+    assert expected <= 15 * 1024**2
+    assert round(expected / 1024**2, 2) == 10.15
+    assert f"TOTAL: {expected} bytes" in output
+    assert "15.000 MiB" in output
+    assert "Synthetic MP4 smoke passed:" in output
+    assert not (tmp_path / "out").exists()
+    assert not list(tmp_path.glob(".calibration-smoke-*"))
+    assert before == {p.name: hashlib.sha256(p.read_bytes()).digest()
+                      for p in (tmp_path / "web/models").iterdir()}
+
+
+def test_calibration_nested_layout_and_policy_validation(tmp_path, monkeypatch):
+    tool = load_calibration_tool()
+    monkeypatch.setattr(tool, "REPO_ROOT", tmp_path)
+    layout = ("onnx_temporal_det_nano", "onnx_temporal_det_nano", "onnx_det_v4",
+              *("onnx_v2_nano",) * 4)
+    for name, folder in zip(cli.GRAPH_NAMES, layout, strict=True):
+        path = tmp_path / "out/models" / folder / f"{name}.int8.onnx"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    for name in cli.CALIBRATION_NAMES[:2]:
+        path = tmp_path / "out/calibration" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    graphs, sidecars = tool.deployment_paths(Path("out/models"))
+    assert len(graphs) == 7 and len(sidecars) == 2
+    assert graphs[3].parent == tmp_path / "out/models/onnx_v2_nano"
+    assert sidecars[1] == tmp_path / "out/calibration/stage2_int8_cal.json"
+    policy = json.loads((MODELS / "gen6.json").read_text())
+    tool.validate_policy(policy)
+    policy["session"]["risk_calibrated"] = True
+    with pytest.raises(ValueError, match="terminal-only"):
+        tool.validate_policy(policy)
+
+
+def test_vendored_wasm_preserves_initialized_memory():
+    """The literal-string repack must preserve the complete runtime data image."""
+    path = ROOT / "web/vendor/ort-wasm-simd-threaded.wasm"
+    raw = path.read_bytes()
+
+    def read(data, position, signed=False):
+        value = shift = 0
+        while True:
+            byte = data[position]
+            position += 1
+            value |= (byte & 127) << shift
+            shift += 7
+            if byte < 128:
+                if signed and byte & 64:
+                    value -= 1 << shift
+                return value, position
+
+    assert raw[:8] == b"\x00asm\x01\x00\x00\x00"
+    sections = {}
+    position = 8
+    while position < len(raw):
+        tag = raw[position]
+        size, start = read(raw, position + 1)
+        sections[tag] = raw[start:start + size]
+        position = start + size
+    assert position == len(raw)
+    count, position = read(sections[11], 0)
+    assert count == read(sections[12], 0)[0] == 133
+    segments = []
+    for _ in range(count):
+        flag, position = read(sections[11], position)
+        assert flag == 1
+        size, position = read(sections[11], position)
+        segments.append(sections[11][position:position + size])
+        position += size
+    assert position == len(sections[11])
+    function_count, position = read(sections[10], 0)
+    for index in range(function_count):
+        size, position = read(sections[10], position)
+        if index == 11926:
+            initializer = sections[10][position:position + size]
+        position += size
+    memory = bytearray(1_078_380)
+    copies = re.compile(
+        rb"\x41([\x80-\xff]{0,4}[\x00-\x7f])\x41\x00\x41"
+        rb"([\x80-\xff]{0,4}[\x00-\x7f])\xfc\x08([\x80-\xff]{0,4}[\x00-\x7f])\x00"
+    )
+    seen = []
+    for match in copies.finditer(initializer):
+        address = read(match[1], 0, signed=True)[0]
+        size = read(match[2], 0, signed=True)[0]
+        index = read(match[3], 0)[0]
+        assert len(segments[index]) == size
+        memory[address:address + size] = segments[index]
+        seen.append(index)
+    assert sorted(seen) == list(range(count))
+    assert hashlib.sha256(memory).hexdigest() == "553fda883e23105b005126465d3159664cd7687ba32ac70888b0a77c67acf440"
+    node = shutil.which("node")
+    if node:
+        result = subprocess.run(
+            [node, "-e", "if (!WebAssembly.validate(require('fs').readFileSync(process.argv[1]))) process.exit(1)", str(path)],
+            capture_output=True, text=True, timeout=2,
+        )
+        assert result.returncode == 0, result.stderr

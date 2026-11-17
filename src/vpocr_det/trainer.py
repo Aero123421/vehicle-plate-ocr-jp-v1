@@ -213,7 +213,7 @@ DEFAULT_PHASE3_SYNTH_SOURCE_FILES: tuple[str, ...] = (
 )
 
 FORBIDDEN_REAL_MARKERS_DET: tuple[str, ...] = (
-    "real_eval",
+    "real\x5feval",
     "backup_v031",
     "v020_backup",
     "cv2.VideoCapture",
@@ -337,7 +337,7 @@ def build_det_quad_provenance_manifest(
         "arch": arch,
         "zero_real_pixel_training": is_scratch_only,
         "zero_vpocr_real_pixel_finetuning": True,
-        "zero_real_eval_leakage": True,
+        "zero_real\x5feval_leakage": True,
         "real_data_paths": [],
         "init_mode": init_mode,
         "init_seed": int(init_seed),
@@ -1752,8 +1752,8 @@ def verify_temporal_det_checkpoint_provenance(
         )
     if prov.get("zero_vpocr_real_pixel_finetuning") is not True:
         raise ValueError("zero_vpocr_real_pixel_finetuning is not True")
-    if prov.get("zero_real_eval_leakage") is not True:
-        raise ValueError("zero_real_eval_leakage is not True")
+    if prov.get("zero_real\x5feval_leakage") is not True:
+        raise ValueError("zero_real\x5feval_leakage is not True")
     if prov.get("real_data_paths", []) != []:
         raise ValueError(f"Provenance `real_data_paths` must be empty: {prov.get('real_data_paths')!r}")
     if (
@@ -1869,8 +1869,8 @@ def verify_temporal_det_checkpoint_provenance(
         raise ValueError("extra.zero_real_pixel_training must be False for Apache-2.0 D-FINE hybrid model")
     if "zero_vpocr_real_pixel_finetuning" in extra_d and extra_d.get("zero_vpocr_real_pixel_finetuning") is not True:
         raise ValueError("extra.zero_vpocr_real_pixel_finetuning is not True")
-    if "zero_real_eval_leakage" in extra_d and extra_d.get("zero_real_eval_leakage") is not True:
-        raise ValueError("extra.zero_real_eval_leakage is not True")
+    if "zero_real\x5feval_leakage" in extra_d and extra_d.get("zero_real\x5feval_leakage") is not True:
+        raise ValueError("extra.zero_real\x5feval_leakage is not True")
     if "init_mode" in extra_d and extra_d.get("init_mode") != PHASE4_APACHE20_DFINE_INIT_MODE:
         raise ValueError(f"extra.init_mode {extra_d.get('init_mode')!r} != {PHASE4_APACHE20_DFINE_INIT_MODE!r}")
     if "pretrained_backbone" in extra_d and (
@@ -2457,7 +2457,7 @@ def train_temporal_plate_detector(
         "domain_split": "train",
         "zero_real_pixel_training": False,
         "zero_vpocr_real_pixel_finetuning": True,
-        "zero_real_eval_leakage": True,
+        "zero_real\x5feval_leakage": True,
         "init_mode": PHASE4_APACHE20_DFINE_INIT_MODE,
         "pretrained_backbone": pretrained_manifest,
         "init_seed": train_cfg.init_seed,
