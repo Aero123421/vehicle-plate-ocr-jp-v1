@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Media stays local; only same-origin models, runtime and sample are fetched.
+import { createOpticalRef, sampleGrayBilinear, trackPlateOpticalCore } from './optical_tracker.mjs';
+
 const $ = id => document.getElementById(id);
 const video = $('video');
 const overlay = $('overlay');
@@ -218,6 +220,20 @@ async function resumeSegment() {
   controls();
 }
 
+function extrapolateCorners(corners, vel, sizeVel, dt) {
+  const mx = 0.25 * (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]);
+  const my = 0.25 * (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]);
+  const xs = [corners[0][0], corners[1][0], corners[2][0], corners[3][0]];
+  const ys = [corners[0][1], corners[1][1], corners[2][1], corners[3][1]];
+  const bw = Math.max(8, Math.max(...xs) - Math.min(...xs));
+  const bh = Math.max(4, Math.max(...ys) - Math.min(...ys));
+  const sx = clamp(1 + ((sizeVel?.[0] ?? 0) / bw) * dt * 0.45, 0.82, 1.30);
+  const sy = clamp(1 + ((sizeVel?.[1] ?? 0) / bh) * dt * 0.45, 0.82, 1.30);
+  const dx = (vel?.[0] ?? 0) * dt;
+  const dy = (vel?.[1] ?? 0) * dt;
+  return corners.map(([x, y]) => [mx + (x - mx) * sx + dx, my + (y - my) * sy + dy]);
+}
+
 function updateSmoothingTargets(payload, wallNow) {
   const payloadTime = payload.timestamp;
   const activeV = new Set();
@@ -227,7 +243,7 @@ function updateSmoothingTargets(payload, wallNow) {
     let offset = [0, 0, 0, 0];
     if (prev) {
       const dtPrev = clamp(payloadTime - prev.time, 0, 0.4);
-      const decay = Math.exp(-(wallNow - prev.wall) / 90);
+      const decay = Math.exp(-(wallNow - prev.wall) / 75);
       const predPrev = [
         prev.box[0] + prev.vel[0] * dtPrev - 0.5 * prev.vel[2] * dtPrev + prev.offset[0] * decay,
         prev.box[1] + prev.vel[1] * dtPrev - 0.5 * prev.vel[3] * dtPrev + prev.offset[1] * decay,
@@ -253,19 +269,32 @@ function updateSmoothingTargets(payload, wallNow) {
     let cornersOffset = t.corners.map(() => [0, 0]);
     if (prev) {
       const dtPrev = clamp(payloadTime - prev.time, 0, 0.4);
-      const decay = Math.exp(-(wallNow - prev.wall) / 85);
-      cornersOffset = t.corners.map(([nx, ny], k) => {
-        const px = prev.corners[k][0] + prev.vel[0] * dtPrev + prev.cornersOffset[k][0] * decay;
-        const py = prev.corners[k][1] + prev.vel[1] * dtPrev + prev.cornersOffset[k][1] * decay;
-        return [clamp(px - nx, -48, 48), clamp(py - ny, -48, 48)];
-      });
+      const decay = Math.exp(-(wallNow - prev.wall) / 70);
+      const predC = extrapolateCorners(prev.corners, prev.vel, prev.sizeVel, dtPrev);
+      cornersOffset = t.corners.map(([nx, ny], k) => [
+        clamp(predC[k][0] + prev.cornersOffset[k][0] * decay - nx, -48, 48),
+        clamp(predC[k][1] + prev.cornersOffset[k][1] * decay - ny, -48, 48),
+      ]);
     }
+    const optRef = t.optPatch ? createOpticalRef(t.optPatch, t.corners) : prev?.optRef ?? null;
     smoothPlates.set(t.id, {
       corners: t.corners,
+      box: t.box,
       vel: t.velocity ?? [0, 0],
+      sizeVel: t.sizeVelocity ?? [0, 0],
       time: payloadTime,
       wall: wallNow,
       cornersOffset,
+      optRef,
+      dirty: true,
+      optLocked: prev?.optLocked ?? false,
+      liveCorners: prev?.liveCorners ?? null,
+      liveVel: prev?.liveVel ?? (t.velocity ?? [0, 0]),
+      lastLiveKey: prev?.lastLiveKey ?? -1,
+      lastDt: prev?.lastDt ?? 0,
+      lastLiveWall: prev?.lastLiveWall ?? wallNow,
+      skewOffset: prev?.skewOffset ?? t.corners.map(() => [0, 0]),
+      skewWall: prev?.skewWall ?? wallNow,
     });
   }
   for (const key of smoothPlates.keys()) if (!activeP.has(key)) smoothPlates.delete(key);
@@ -518,6 +547,144 @@ maskCanvas.height = 64;
 const maskContext = maskCanvas.getContext('2d');
 const maskImage = maskContext.createImageData(64, 64);
 
+// Dedicated tiny ROI canvas for 60 FPS sub-millisecond direct video optical lock-on.
+const OPT_ROI_MAX_W = 192;
+const OPT_ROI_MAX_H = 128;
+const optCanvas = document.createElement('canvas');
+optCanvas.width = OPT_ROI_MAX_W;
+optCanvas.height = OPT_ROI_MAX_H;
+const optCtx = optCanvas.getContext('2d', { willReadFrequently: true });
+const optGrayBuf = new Float32Array(OPT_ROI_MAX_W * OPT_ROI_MAX_H);
+
+function alignPlateToLiveVideo(sm, liveKey, dt, w, h, wallNow) {
+  if (!sm?.optRef || video.readyState < 2 || !video.videoWidth || !video.videoHeight || video.seeking) {
+    return null;
+  }
+  if (!sm.dirty && sm.lastLiveKey === liveKey && sm.optLocked && sm.liveCorners) {
+    const skewDecay = Math.exp(-(wallNow - sm.skewWall) / 42);
+    return sm.liveCorners.map(([x, y], k) => [
+      clamp(x + sm.skewOffset[k][0] * skewDecay, 0, w),
+      clamp(y + sm.skewOffset[k][1] * skewDecay, 0, h),
+    ]);
+  }
+
+  const kinCorners = extrapolateCorners(sm.corners, sm.vel, sm.sizeVel, Math.max(0, dt));
+  const kxs = [kinCorners[0][0], kinCorners[1][0], kinCorners[2][0], kinCorners[3][0]];
+  const kys = [kinCorners[0][1], kinCorners[1][1], kinCorners[2][1], kinCorners[3][1]];
+  const kw = Math.max(8, Math.max(...kxs) - Math.min(...kxs));
+  const kh = Math.max(4, Math.max(...kys) - Math.min(...kys));
+  const kinMx = 0.25 * (kinCorners[0][0] + kinCorners[1][0] + kinCorners[2][0] + kinCorners[3][0]);
+  const kinMy = 0.25 * (kinCorners[0][1] + kinCorners[1][1] + kinCorners[2][1] + kinCorners[3][1]);
+
+  let guessCorners;
+  let searchRadiusPx;
+  let allowScaleSearch;
+  let reuseLive = false;
+  if (sm.liveCorners && sm.optLocked && Math.abs(dt - sm.lastDt) < 0.24) {
+    const liveMx = 0.25 * (sm.liveCorners[0][0] + sm.liveCorners[1][0] + sm.liveCorners[2][0] + sm.liveCorners[3][0]);
+    const liveMy = 0.25 * (sm.liveCorners[0][1] + sm.liveCorners[1][1] + sm.liveCorners[2][1] + sm.liveCorners[3][1]);
+    // Self-heal immediately if previous live lock ever strayed too far from worker kinematic anchor.
+    if (Math.abs(liveMx - kinMx) <= Math.max(26, 1.45 * kw) && Math.abs(liveMy - kinMy) <= Math.max(16, 1.15 * kh)) {
+      reuseLive = true;
+    }
+  }
+  if (reuseLive) {
+    const stepDt = clamp(dt - sm.lastDt, -0.04, 0.08);
+    guessCorners = sm.liveCorners.map(([x, y]) => [x + sm.liveVel[0] * stepDt, y + sm.liveVel[1] * stepDt]);
+    searchRadiusPx = sm.dirty ? 24 : 15;
+    allowScaleSearch = sm.dirty;
+  } else {
+    guessCorners = kinCorners;
+    searchRadiusPx = clamp(20 + 200 * Math.abs(dt), 16, 52);
+    allowScaleSearch = true;
+  }
+
+  const gxs = [guessCorners[0][0], guessCorners[1][0], guessCorners[2][0], guessCorners[3][0]];
+  const gys = [guessCorners[0][1], guessCorners[1][1], guessCorners[2][1], guessCorners[3][1]];
+  const gwBox = Math.max(8, Math.max(...gxs) - Math.min(...gxs));
+  const ghBox = Math.max(4, Math.max(...gys) - Math.min(...gys));
+  const padX = Math.max(32, 0.95 * gwBox + searchRadiusPx);
+  const padY = Math.max(24, 1.15 * ghBox + 0.85 * searchRadiusPx);
+  const rx0 = clamp(Math.floor(Math.min(...gxs) - padX), 0, w - 16);
+  const ry0 = clamp(Math.floor(Math.min(...gys) - padY), 0, h - 12);
+  const rx1 = clamp(Math.ceil(Math.max(...gxs) + padX), rx0 + 16, w);
+  const ry1 = clamp(Math.ceil(Math.max(...gys) + padY), ry0 + 12, h);
+  const rw = rx1 - rx0;
+  const rh = ry1 - ry0;
+
+  const roiScale = Math.min(1, OPT_ROI_MAX_W / rw, OPT_ROI_MAX_H / rh);
+  const bufW = clamp(Math.round(rw * roiScale), 24, OPT_ROI_MAX_W);
+  const bufH = clamp(Math.round(rh * roiScale), 16, OPT_ROI_MAX_H);
+  const vScaleX = video.videoWidth / w;
+  const vScaleY = video.videoHeight / h;
+
+  let rgba;
+  try {
+    optCtx.drawImage(video, rx0 * vScaleX, ry0 * vScaleY, rw * vScaleX, rh * vScaleY, 0, 0, bufW, bufH);
+    rgba = optCtx.getImageData(0, 0, bufW, bufH).data;
+  } catch {
+    return null;
+  }
+
+  const pixels = bufW * bufH;
+  for (let i = 0, p = 0; i < pixels; i++, p += 4) {
+    optGrayBuf[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+  }
+
+  const sxRoi = bufW / rw;
+  const syRoi = bufH / rh;
+  const sampleRoi = (nx, ny) => sampleGrayBilinear(optGrayBuf, bufW, bufH, (nx - rx0) * sxRoi, (ny - ry0) * syRoi);
+  const res = trackPlateOpticalCore(sm.optRef, sampleRoi, w, h, guessCorners, {
+    searchRadiusPx,
+    allowScaleSearch,
+    minZncc: 0.60,
+    maxIter: 6,
+  });
+
+  sm.lastLiveKey = liveKey;
+  if (!res.ok) {
+    sm.optLocked = false;
+    sm.dirty = false;
+    return null;
+  }
+
+  if (sm.liveCorners && sm.optLocked) {
+    if (sm.dirty) {
+      const prevDecay = Math.exp(-(wallNow - sm.skewWall) / 42);
+      sm.skewOffset = res.corners.map(([nx, ny], k) => [
+        clamp(sm.liveCorners[k][0] + sm.skewOffset[k][0] * prevDecay - nx, -10, 10),
+        clamp(sm.liveCorners[k][1] + sm.skewOffset[k][1] * prevDecay - ny, -10, 10),
+      ]);
+      sm.skewWall = wallNow;
+    } else {
+      const stepSec = Math.max(0.012, (wallNow - sm.lastLiveWall) / 1000);
+      const oldMx = 0.25 * (sm.liveCorners[0][0] + sm.liveCorners[1][0] + sm.liveCorners[2][0] + sm.liveCorners[3][0]);
+      const oldMy = 0.25 * (sm.liveCorners[0][1] + sm.liveCorners[1][1] + sm.liveCorners[2][1] + sm.liveCorners[3][1]);
+      const newMx = 0.25 * (res.corners[0][0] + res.corners[1][0] + res.corners[2][0] + res.corners[3][0]);
+      const newMy = 0.25 * (res.corners[0][1] + res.corners[1][1] + res.corners[2][1] + res.corners[3][1]);
+      sm.liveVel = [
+        clamp(0.55 * sm.liveVel[0] + 0.45 * ((newMx - oldMx) / stepSec), -w, w),
+        clamp(0.55 * sm.liveVel[1] + 0.45 * ((newMy - oldMy) / stepSec), -h, h),
+      ];
+    }
+  } else {
+    sm.skewOffset = res.corners.map(() => [0, 0]);
+    sm.skewWall = wallNow;
+  }
+
+  sm.liveCorners = res.corners;
+  sm.optLocked = true;
+  sm.dirty = false;
+  sm.lastDt = dt;
+  sm.lastLiveWall = wallNow;
+
+  const skewDecay = Math.exp(-(wallNow - sm.skewWall) / 42);
+  return res.corners.map(([x, y], k) => [
+    clamp(x + sm.skewOffset[k][0] * skewDecay, 0, w),
+    clamp(y + sm.skewOffset[k][1] * skewDecay, 0, h),
+  ]);
+}
+
 function paintSmooth(wallNow) {
   if (!lastPayload) return;
   const payload = lastPayload;
@@ -529,30 +696,83 @@ function paintSmooth(wallNow) {
   }
   ctx.clearRect(0, 0, w, h);
 
-  // Align overlay boxes to current playback timestamp with bounded extrapolation.
+  // Align overlay boxes to current playback timestamp via direct 60 FPS optical lock + kinematic fallback.
   let dt = 0;
-  if (!video.paused && !video.seeking && collecting) {
+  if (!video.seeking && collecting) {
     dt =
       mode === 'camera'
-        ? clamp(wallNow / 1000 - payload.timestamp, 0, 0.2)
-        : clamp(video.currentTime - payload.timestamp, 0, 0.35);
+        ? clamp(wallNow / 1000 - payload.timestamp, 0, 0.25)
+        : clamp(video.currentTime - payload.timestamp, -0.05, 0.42);
   }
+  const liveKey = mode === 'camera' ? Math.floor(wallNow / 16) : Math.round(video.currentTime * 1000);
 
   const unit = Math.max(1, w / 768);
   const fontSize = Math.round(13 * unit);
   ctx.font = `600 ${fontSize}px ui-monospace, monospace`;
 
+  // 1. Solve 60 FPS live plate corners first so owned vehicles can couple rigidly to live optical motion.
+  const allPlates = [...payload.tracks, ...payload.finalizedTracks];
+  const resolvedPlates = [];
+  const vehicleLiveDelta = new Map();
+
+  for (const track of allPlates) {
+    const sm = smoothPlates.get(track.id);
+    let corners = track.corners;
+    const optCorners = sm ? alignPlateToLiveVideo(sm, liveKey, dt, w, h, wallNow) : null;
+    if (optCorners) {
+      corners = optCorners;
+      if (track.vehicleId != null && sm?.box) {
+        const anchorCx = 0.5 * (sm.box[0] + sm.box[2]);
+        const anchorCy = 0.5 * (sm.box[1] + sm.box[3]);
+        const anchorW = Math.max(8, sm.box[2] - sm.box[0]);
+        const lxs = [corners[0][0], corners[1][0], corners[2][0], corners[3][0]];
+        const lys = [corners[0][1], corners[1][1], corners[2][1], corners[3][1]];
+        const liveCx = 0.5 * (Math.min(...lxs) + Math.max(...lxs));
+        const liveCy = 0.5 * (Math.min(...lys) + Math.max(...lys));
+        const liveW = Math.max(8, Math.max(...lxs) - Math.min(...lxs));
+        const scaleRatio = clamp(liveW / anchorW, 0.80, 1.28);
+        vehicleLiveDelta.set(track.vehicleId, {
+          anchorCx,
+          anchorCy,
+          dx: liveCx - anchorCx,
+          dy: liveCy - anchorCy,
+          scale: scaleRatio,
+        });
+      }
+    } else if (sm) {
+      const decay = Math.exp(-(wallNow - sm.wall) / 70);
+      const extrap = extrapolateCorners(sm.corners, sm.vel, sm.sizeVel, Math.max(0, dt));
+      corners = extrap.map(([cx, cy], k) => [
+        clamp(cx + sm.cornersOffset[k][0] * decay, 0, w),
+        clamp(cy + sm.cornersOffset[k][1] * decay, 0, h),
+      ]);
+    }
+    resolvedPlates.push({ track, corners });
+  }
+
+  // 2. Render vehicles (coupled to live optical plate delta when available).
   for (const v of payload.vehicles) {
     const sm = smoothVehicles.get(v.id);
+    const coupled = vehicleLiveDelta.get(v.id);
     let box = v.box;
-    if (sm) {
-      const decay = Math.exp(-(wallNow - sm.wall) / 90);
-      const [vx, vy, vw, vh] = sm.vel;
+    if (coupled && sm) {
+      const decay = Math.exp(-(wallNow - sm.wall) / 75);
+      const { anchorCx, anchorCy, dx, dy, scale } = coupled;
       box = [
-        clamp(sm.box[0] + vx * dt - 0.5 * vw * dt * 0.4 + sm.offset[0] * decay, 0, w),
-        clamp(sm.box[1] + vy * dt - 0.5 * vh * dt * 0.4 + sm.offset[1] * decay, 0, h),
-        clamp(sm.box[2] + vx * dt + 0.5 * vw * dt * 0.4 + sm.offset[2] * decay, 0, w),
-        clamp(sm.box[3] + vy * dt + 0.5 * vh * dt * 0.4 + sm.offset[3] * decay, 0, h),
+        clamp(anchorCx + (sm.box[0] - anchorCx) * scale + dx + sm.offset[0] * decay, 0, w),
+        clamp(anchorCy + (sm.box[1] - anchorCy) * scale + dy + sm.offset[1] * decay, 0, h),
+        clamp(anchorCx + (sm.box[2] - anchorCx) * scale + dx + sm.offset[2] * decay, 0, w),
+        clamp(anchorCy + (sm.box[3] - anchorCy) * scale + dy + sm.offset[3] * decay, 0, h),
+      ];
+    } else if (sm) {
+      const decay = Math.exp(-(wallNow - sm.wall) / 75);
+      const [vx, vy, vw, vh] = sm.vel;
+      const posDt = Math.max(0, dt);
+      box = [
+        clamp(sm.box[0] + vx * posDt - 0.5 * vw * posDt * 0.4 + sm.offset[0] * decay, 0, w),
+        clamp(sm.box[1] + vy * posDt - 0.5 * vh * posDt * 0.4 + sm.offset[1] * decay, 0, h),
+        clamp(sm.box[2] + vx * posDt + 0.5 * vw * posDt * 0.4 + sm.offset[2] * decay, 0, w),
+        clamp(sm.box[3] + vy * posDt + 0.5 * vh * posDt * 0.4 + sm.offset[3] * decay, 0, h),
       ];
     }
     const [a, b, c, d] = box;
@@ -588,18 +808,10 @@ function paintSmooth(wallNow) {
     ctx.fillText(vLabel, lx + 5 * unit, ly - 4 * unit);
   }
 
-  for (const track of [...payload.tracks, ...payload.finalizedTracks]) {
+  // 3. Render optically locked 4-corner plate quads on top.
+  for (const { track, corners } of resolvedPlates) {
     const finalized = track.readouts === 1;
     const color = finalized ? (track.status === 'ACCEPTED' ? '#6ee7b7' : '#fbbf24') : '#a3e635';
-    const sm = smoothPlates.get(track.id);
-    let corners = track.corners;
-    if (sm) {
-      const decay = Math.exp(-(wallNow - sm.wall) / 85);
-      corners = sm.corners.map(([cx, cy], k) => [
-        clamp(cx + sm.vel[0] * dt + sm.cornersOffset[k][0] * decay, 0, w),
-        clamp(cy + sm.vel[1] * dt + sm.cornersOffset[k][1] * decay, 0, h),
-      ]);
-    }
     const minX = Math.min(corners[0][0], corners[1][0], corners[2][0], corners[3][0]);
     const minY = Math.min(corners[0][1], corners[1][1], corners[2][1], corners[3][1]);
 

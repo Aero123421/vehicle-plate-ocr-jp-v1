@@ -2,6 +2,7 @@
 // JP7029732B2 design-around: no character projection while COLLECTING.
 import * as ort from './vendor/ort.wasm.min.mjs';
 import { clamp, sigmoid, unpackGrammar, terminalDecision } from './terminal.mjs';
+import { extractPatchFromRgba, createOpticalRef, trackPlateOnRgba } from './optical_tracker.mjs';
 
 // Shared by the browser WebWorker and local Node parity checks.
 export async function createPipeline({
@@ -78,12 +79,11 @@ export async function createPipeline({
   const vehLogitMin = Math.log(vehThresh / (1 - vehThresh));
 
   const LB_W = 768, LB_H = 448;
-  const ZOOM_W = 384, ZOOM_H = 256;
   const letterboxBuf = new Float32Array(3 * LB_W * LB_H);
+  const zoomFloatBuf = new Float32Array(3 * LB_W * LB_H);
   const fovea1Buf = new Float32Array(3 * 96 * 160);
   const surround1Buf = new Float32Array(3 * 64 * 96);
   const policy1Buf = new BigInt64Array(1);
-  const zoomTileBuf = new Uint8ClampedArray(ZOOM_W * ZOOM_H * 4);
   const zeroH3 = zero([1, 36, 56, 96]);
   const zeroH4 = zero([1, 36, 28, 48]);
   const cropBuf = new Float32Array(3 * 80 * 160);
@@ -609,6 +609,9 @@ export async function createPipeline({
       velocity: [0, 0],
       sizeVelocity: [0, 0],
       reidEmb: null,
+      optRef: null,
+      optPatch: null,
+      curOpt: null,
       vehicleId: null,
       missed: 0,
     };
@@ -693,10 +696,17 @@ export async function createPipeline({
 
   function predictedCorners(track, time) {
     const dt = clamp(time - track.last, 0, 0.45);
-    const decay = track.missed > 0 ? Math.exp(-2.2 * dt) : 1;
+    const decay = track.state === 'FINALIZED' ? 0.5 * Math.exp(-1.5 * dt) : (track.missed > 0 ? Math.exp(-2.2 * dt) : 1);
     const dx = track.velocity[0] * dt * decay;
     const dy = track.velocity[1] * dt * decay;
-    return track.corners.map(([x, y]) => [x + dx, y + dy]);
+    const [vw, vh] = (track.state === 'FINALIZED' || track.missed > 0) ? [0, 0] : (track.sizeVelocity ?? [0, 0]);
+    const bw = Math.max(8, track.box[2] - track.box[0]);
+    const bh = Math.max(4, track.box[3] - track.box[1]);
+    const sx = clamp(1 + (vw / bw) * dt * 0.45 * decay, 0.84, 1.26);
+    const sy = clamp(1 + (vh / bh) * dt * 0.45 * decay, 0.84, 1.26);
+    const mx = 0.25 * (track.corners[0][0] + track.corners[1][0] + track.corners[2][0] + track.corners[3][0]);
+    const my = 0.25 * (track.corners[0][1] + track.corners[1][1] + track.corners[2][1] + track.corners[3][1]);
+    return track.corners.map(([x, y]) => [mx + (x - mx) * sx + dx, my + (y - my) * sy + dy]);
   }
 
   function predictedVehicleBox(vt, time) {
@@ -868,93 +878,61 @@ export async function createPipeline({
 
   async function runSmartZoomMosaic(rois, curStrongBoxes) {
     if (!rois.length) return [];
+    // Render zoom ROIs directly into native 768x448 detector resolution (eliminates 384x256 blur bottleneck).
+    const zFloat = zoomFloatBuf;
+    zFloat.fill(114 / 255);
+    const zStride = LB_W * LB_H;
     const subRegions = [];
-    const subBuf = zoomTileBuf;
-    const isMosaic = rois.length >= 2;
-    if (isMosaic) {
-      subBuf.fill(114);
-      const qw = Math.floor(ZOOM_W / 2) - 1;
-      const qh = Math.floor(ZOOM_H / 2) - 1;
+    const fillTile = (rx0, ry0, rx1, ry1, qx0, qy0, qx1, qy1) => {
+      const rw = Math.max(16, rx1 - rx0);
+      const rh = Math.max(12, ry1 - ry0);
+      const sw = qx1 - qx0;
+      const sh = qy1 - qy0;
+      const sc = Math.min(sw / rw, sh / rh);
+      const nw = Math.max(1, Math.round(rw * sc));
+      const nh = Math.max(1, Math.round(rh * sc));
+      const px = qx0 + Math.floor((sw - nw) / 2);
+      const py = qy0 + Math.floor((sh - nh) / 2);
+      for (let y = 0; y < nh; y++) {
+        const sy = clamp(ry0 + (y + 0.5) / sc - 0.5, 0, hOrig - 1);
+        const y0 = sy | 0, y1 = y0 + 1 < hOrig ? y0 + 1 : y0, fy = sy - y0;
+        const dstRow = (py + y) * LB_W + px;
+        for (let x = 0; x < nw; x++) {
+          const sx = clamp(rx0 + (x + 0.5) / sc - 0.5, 0, wOrig - 1);
+          const x0 = sx | 0, x1 = x0 + 1 < wOrig ? x0 + 1 : x0, fx = sx - x0;
+          const wa = ((1 - fx) * (1 - fy)) / 255, wb2 = (fx * (1 - fy)) / 255;
+          const wd = ((1 - fx) * fy) / 255, we = (fx * fy) / 255;
+          const a = (y0 * wOrig + x0) * 4, b = (y0 * wOrig + x1) * 4;
+          const d = (y1 * wOrig + x0) * 4, e = (y1 * wOrig + x1) * 4;
+          const dst = dstRow + x;
+          zFloat[dst] = frame[a] * wa + frame[b] * wb2 + frame[d] * wd + frame[e] * we;
+          zFloat[dst + zStride] = frame[a + 1] * wa + frame[b + 1] * wb2 + frame[d + 1] * wd + frame[e + 1] * we;
+          zFloat[dst + 2 * zStride] = frame[a + 2] * wa + frame[b + 2] * wb2 + frame[d + 2] * wd + frame[e + 2] * we;
+        }
+      }
+      subRegions.push({ qx0, qy0, qx1, qy1, sc, px, py, rx0, ry0, rx1, ry1 });
+    };
+
+    if (rois.length >= 2) {
+      const qw = Math.floor(LB_W / 2) - 2;
+      const qh = Math.floor(LB_H / 2) - 2;
       const slots = [
         [0, 0, qw, qh],
-        [qw + 2, 0, ZOOM_W, qh],
-        [0, qh + 2, qw, ZOOM_H],
-        [qw + 2, qh + 2, ZOOM_W, ZOOM_H],
+        [qw + 4, 0, LB_W, qh],
+        [0, qh + 4, qw, LB_H],
+        [qw + 4, qh + 4, LB_W, LB_H],
       ];
       const count = Math.min(4, rois.length);
       for (let i = 0; i < count; i++) {
         const [rx0, ry0, rx1, ry1] = rois[i];
-        const rw = Math.max(16, rx1 - rx0);
-        const rh = Math.max(12, ry1 - ry0);
         const [qx0, qy0, qx1, qy1] = slots[i];
-        const sw = qx1 - qx0, sh = qy1 - qy0;
-        const sc = Math.min(sw / rw, sh / rh);
-        const nw = Math.max(1, Math.round(rw * sc));
-        const nh = Math.max(1, Math.round(rh * sc));
-        const px = qx0 + Math.floor((sw - nw) / 2);
-        const py = qy0 + Math.floor((sh - nh) / 2);
-        for (let y = 0; y < nh; y++) {
-          const sy = clamp(ry0 + (y + 0.5) / sc - 0.5, 0, hOrig - 1);
-          const y0 = sy | 0, y1 = y0 + 1 < hOrig ? y0 + 1 : y0, fy = sy - y0;
-          for (let x = 0; x < nw; x++) {
-            const sx = clamp(rx0 + (x + 0.5) / sc - 0.5, 0, wOrig - 1);
-            const x0 = sx | 0, x1 = x0 + 1 < wOrig ? x0 + 1 : x0, fx = sx - x0;
-            const wa = (1 - fx) * (1 - fy), wb2 = fx * (1 - fy), wd = (1 - fx) * fy, we = fx * fy;
-            const a = (y0 * wOrig + x0) * 4, b = (y0 * wOrig + x1) * 4;
-            const d = (y1 * wOrig + x0) * 4, e = (y1 * wOrig + x1) * 4;
-            const dst = ((py + y) * ZOOM_W + (px + x)) * 4;
-            subBuf[dst] = frame[a] * wa + frame[b] * wb2 + frame[d] * wd + frame[e] * we;
-            subBuf[dst + 1] = frame[a + 1] * wa + frame[b + 1] * wb2 + frame[d + 1] * wd + frame[e + 1] * we;
-            subBuf[dst + 2] = frame[a + 2] * wa + frame[b + 2] * wb2 + frame[d + 2] * wd + frame[e + 2] * we;
-          }
-        }
-        subRegions.push({ qx0, qy0, qx1, qy1, sc, px, py, rx0, ry0, rx1, ry1 });
+        fillTile(rx0, ry0, rx1, ry1, qx0, qy0, qx1, qy1);
       }
     } else {
-      subBuf.fill(114);
       const [rx0, ry0, rx1, ry1] = rois[0];
-      const rw = Math.max(16, rx1 - rx0), rh = Math.max(12, ry1 - ry0);
-      const sc = Math.min(ZOOM_W / rw, ZOOM_H / rh);
-      const nw = Math.max(1, Math.round(rw * sc)), nh = Math.max(1, Math.round(rh * sc));
-      const px = Math.floor((ZOOM_W - nw) / 2), py = Math.floor((ZOOM_H - nh) / 2);
-      for (let y = 0; y < nh; y++) {
-        const sy = clamp(ry0 + (y + 0.5) / sc - 0.5, 0, hOrig - 1);
-        const y0 = sy | 0, y1 = y0 + 1 < hOrig ? y0 + 1 : y0, fy = sy - y0;
-        for (let x = 0; x < nw; x++) {
-          const sx = clamp(rx0 + (x + 0.5) / sc - 0.5, 0, wOrig - 1);
-          const x0 = sx | 0, x1 = x0 + 1 < wOrig ? x0 + 1 : x0, fx = sx - x0;
-          const wa = (1 - fx) * (1 - fy), wb2 = fx * (1 - fy), wd = (1 - fx) * fy, we = fx * fy;
-          const a = (y0 * wOrig + x0) * 4, b = (y0 * wOrig + x1) * 4;
-          const d = (y1 * wOrig + x0) * 4, e = (y1 * wOrig + x1) * 4;
-          const dst = ((py + y) * ZOOM_W + (px + x)) * 4;
-          subBuf[dst] = frame[a] * wa + frame[b] * wb2 + frame[d] * wd + frame[e] * we;
-          subBuf[dst + 1] = frame[a + 1] * wa + frame[b + 1] * wb2 + frame[d + 1] * wd + frame[e + 1] * we;
-          subBuf[dst + 2] = frame[a + 2] * wa + frame[b + 2] * wb2 + frame[d + 2] * wd + frame[e + 2] * we;
-        }
-      }
-      subRegions.push({ qx0: 0, qy0: 0, qx1: ZOOM_W, qy1: ZOOM_H, sc, px, py, rx0, ry0, rx1, ry1 });
+      fillTile(rx0, ry0, rx1, ry1, 0, 0, LB_W, LB_H);
     }
-    // Upsample 384x256 zoom mosaic cleanly into fixed 768x448 input tensor (stateless: zero h3/h4).
-    const zFloat = new Float32Array(3 * LB_W * LB_H);
-    const zStride = LB_W * LB_H;
-    const sxTile = ZOOM_W / LB_W;
-    const syTile = ZOOM_H / LB_H;
-    for (let y = 0; y < LB_H; y++) {
-      const sy = (y + 0.5) * syTile - 0.5;
-      const y0 = Math.max(0, sy | 0), y1 = Math.min(ZOOM_H - 1, y0 + 1), fy = Math.max(0, sy - y0);
-      for (let x = 0; x < LB_W; x++) {
-        const sx = (x + 0.5) * sxTile - 0.5;
-        const x0 = Math.max(0, sx | 0), x1 = Math.min(ZOOM_W - 1, x0 + 1), fx = Math.max(0, sx - x0);
-        const wa = (1 - fx) * (1 - fy) / 255, wb2 = fx * (1 - fy) / 255;
-        const wd = (1 - fx) * fy / 255, we = fx * fy / 255;
-        const a = (y0 * ZOOM_W + x0) * 4, b = (y0 * ZOOM_W + x1) * 4;
-        const d = (y1 * ZOOM_W + x0) * 4, e = (y1 * ZOOM_W + x1) * 4;
-        const dst = y * LB_W + x;
-        zFloat[dst] = subBuf[a] * wa + subBuf[b] * wb2 + subBuf[d] * wd + subBuf[e] * we;
-        zFloat[dst + zStride] = subBuf[a + 1] * wa + subBuf[b + 1] * wb2 + subBuf[d + 1] * wd + subBuf[e + 1] * we;
-        zFloat[dst + 2 * zStride] = subBuf[a + 2] * wa + subBuf[b + 2] * wb2 + subBuf[d + 2] * wd + subBuf[e + 2] * we;
-      }
-    }
+
     const zOut = await sessions.temporal_det_nano.run({
       images: float(zFloat, [1, 3, LB_H, LB_W]),
       h_p3_in: zeroH3,
@@ -964,30 +942,30 @@ export async function createPipeline({
     const boxes = zOut.pred_boxes.data;
     const cornersData = zOut.pred_corners?.data;
     const total = cls.length / 3;
-    const zoomThresh = Math.max(plateThresh, 0.28);
+    const zoomThresh = Math.max(plateThresh, 0.26);
     const zoomLogitMin = Math.log(zoomThresh / (1 - zoomThresh));
     const found = [];
     for (let i = 0; i < total; i++) {
       const pL = cls[i * 3], vL = cls[i * 3 + 1], sL = cls[i * 3 + 2];
       if (pL < zoomLogitMin || pL <= vL || pL <= sL) continue;
-      const tcx = 0.5 * (boxes[i * 4] + boxes[i * 4 + 2]) * sxTile;
-      const tcy = 0.5 * (boxes[i * 4 + 1] + boxes[i * 4 + 3]) * syTile;
+      const tcx = 0.5 * (boxes[i * 4] + boxes[i * 4 + 2]);
+      const tcy = 0.5 * (boxes[i * 4 + 1] + boxes[i * 4 + 3]);
       for (const reg of subRegions) {
         if (tcx < reg.qx0 || tcx > reg.qx1 || tcy < reg.qy0 || tcy > reg.qy1) continue;
         const invZ = 1 / Math.max(1e-6, reg.sc);
         const box = [
-          clamp((boxes[i * 4] * sxTile - reg.px) * invZ + reg.rx0, 0, wOrig),
-          clamp((boxes[i * 4 + 1] * syTile - reg.py) * invZ + reg.ry0, 0, hOrig),
-          clamp((boxes[i * 4 + 2] * sxTile - reg.px) * invZ + reg.rx0, 0, wOrig),
-          clamp((boxes[i * 4 + 3] * syTile - reg.py) * invZ + reg.ry0, 0, hOrig),
+          clamp((boxes[i * 4] - reg.px) * invZ + reg.rx0, 0, wOrig),
+          clamp((boxes[i * 4 + 1] - reg.py) * invZ + reg.ry0, 0, hOrig),
+          clamp((boxes[i * 4 + 2] - reg.px) * invZ + reg.rx0, 0, wOrig),
+          clamp((boxes[i * 4 + 3] - reg.py) * invZ + reg.ry0, 0, hOrig),
         ];
         const bw = box[2] - box[0], bh = box[3] - box[1];
         if (bw < 5 || bh < 2.8 || bw / Math.max(1e-3, bh) < 0.5 || bw / Math.max(1e-3, bh) > 4.8) continue;
         if (curStrongBoxes.some(sb => iou(sb, box) >= 0.35)) continue;
         const corners = cornersData
           ? Array.from({ length: 4 }, (_, k) => [
-              clamp((cornersData[i * 8 + k * 2] * sxTile - reg.px) * invZ + reg.rx0, 0, wOrig),
-              clamp((cornersData[i * 8 + k * 2 + 1] * syTile - reg.py) * invZ + reg.ry0, 0, hOrig),
+              clamp((cornersData[i * 8 + k * 2] - reg.px) * invZ + reg.rx0, 0, wOrig),
+              clamp((cornersData[i * 8 + k * 2 + 1] - reg.py) * invZ + reg.ry0, 0, hOrig),
             ])
           : null;
         found.push({ box, score: sigmoid(pL), corners, provenance: 1 });
@@ -1254,16 +1232,41 @@ export async function createPipeline({
           if (zoomRois.some(prev => iou(prev, win) >= 0.6)) return;
           zoomRois.push(win);
         };
+        const alreadyLockedVehIds = new Set(
+          tracks
+            .filter(
+              t =>
+                (t.state === 'COLLECTING' && t.frames >= 2 && t.missed === 0) ||
+                (t.state === 'FINALIZED' && t.result?.status === 'ACCEPTED')
+            )
+            .map(t => t.vehicleId)
+            .filter(v => v !== null && v !== undefined)
+        );
         for (const vt of vtracks) {
           if (zoomRois.length >= 4) break;
+          if (alreadyLockedVehIds.has(vt.id)) continue;
           const vb = predictedVehicleBox(vt, time);
           const vw = vb[2] - vb[0], vh = vb[3] - vb[1];
           const hasStrong = pass1StrongBoxes.some(pb => {
             const pcx = 0.5 * (pb[0] + pb[2]), pcy = 0.5 * (pb[1] + pb[3]);
             return pcx >= vb[0] - 0.06 * vw && pcx <= vb[2] + 0.06 * vw && pcy >= vb[1] && pcy <= vb[3] + 0.16 * vh;
           });
-          if (!hasStrong && vw * scale <= 360) {
-            enqBox(vb[0] - 0.1 * vw, vb[1] + 0.25 * vh, vb[2] + 0.1 * vw, vb[3] + 0.1 * vh);
+          if (!hasStrong) {
+            if (vt.mountRel && vt.mountProb >= 0.35) {
+              const mx0 = vb[0] + vt.mountRel[0] * vw, my0 = vb[1] + vt.mountRel[1] * vh;
+              const mx1 = vb[0] + vt.mountRel[2] * vw, my1 = vb[1] + vt.mountRel[3] * vh;
+              const mcx = 0.5 * (mx0 + mx1), mcy = 0.5 * (my0 + my1);
+              const zw = Math.max(0.58 * vw, 3.2 * (mx1 - mx0), 96);
+              const zh = Math.max(0.45 * vh, 3.6 * (my1 - my0), 64);
+              enqBox(
+                Math.max(vb[0] - 0.08 * vw, mcx - 0.5 * zw),
+                Math.max(vb[1] + 0.16 * vh, mcy - 0.5 * zh),
+                Math.min(vb[2] + 0.08 * vw, mcx + 0.5 * zw),
+                Math.min(vb[3] + 0.12 * vh, mcy + 0.5 * zh)
+              );
+            } else if (vw * scale <= 540) {
+              enqBox(vb[0] - 0.08 * vw, vb[1] + 0.25 * vh, vb[2] + 0.08 * vw, vb[3] + 0.10 * vh);
+            }
           }
         }
         if (zoomRois.length < 4) {
@@ -1359,18 +1362,45 @@ export async function createPipeline({
       return best;
     };
 
+    // Sub-pixel optical pre-alignment on current frame before Stage-2 search window generation.
+    for (const track of [...active, ...finalizedActive, ...dormant]) {
+      track.curOpt = null;
+      if (!scout.sceneCut && track.optRef && time - track.last <= 0.65) {
+        const dtOpt = clamp(time - track.last, 0.01, 0.5);
+        const kinCorners = predictedCorners(track, time);
+        const opt = trackPlateOnRgba(track.optRef, frame, wOrig, hOrig, kinCorners, {
+          searchRadiusPx: clamp(22 + 240 * dtOpt, 18, 60),
+          allowScaleSearch: dtOpt >= 0.04,
+          minZncc: 0.58,
+        });
+        if (opt.ok && validCorners(opt.corners)) track.curOpt = opt;
+      }
+    }
+
     // Smoothly predict active & dormant tracks and generate Stage-2 tracking search proposals.
+    const proposalBoxFor = track => {
+      const kin = predictedBox(track, time);
+      const opt = track.curOpt;
+      if (!opt) return kin;
+      if (opt.zncc >= 0.70) return opt.box;
+      return [
+        0.5 * (kin[0] + opt.box[0]),
+        0.5 * (kin[1] + opt.box[1]),
+        0.5 * (kin[2] + opt.box[2]),
+        0.5 * (kin[3] + opt.box[3]),
+      ];
+    };
     for (const track of active) {
       proposals.push({
-        box: predictedBox(track, time),
+        box: proposalBoxFor(track),
         score: full ? 0.45 : 1.0,
         track,
         provenance: 2,
       });
     }
     for (const track of finalizedActive) {
-      const box = predictedBox(track, time);
-      if (!full || ownerOf(box) !== null) {
+      const box = proposalBoxFor(track);
+      if (!full || ownerOf(box) !== null || Boolean(track.curOpt && track.curOpt.zncc >= 0.70)) {
         proposals.push({
           box,
           score: full ? 0.01 : 0.9,
@@ -1382,7 +1412,7 @@ export async function createPipeline({
     for (const track of dormant) {
       if (time - track.dormantSince <= 0.65) {
         proposals.push({
-          box: predictedBox(track, time),
+          box: proposalBoxFor(track),
           score: 0.35,
           track,
           provenance: 2,
@@ -1439,7 +1469,7 @@ export async function createPipeline({
       let bestTrack = null, bestIou = 0.25;
       for (const t of tracks) {
         if (t.state !== 'COLLECTING') continue;
-        const ov = iou(predictedBox(t, time), c.box);
+        const ov = Math.max(iou(predictedBox(t, time), c.box), t.curOpt ? iou(t.curOpt.box, c.box) : 0);
         if (ov >= bestIou) {
           bestIou = ov;
           bestTrack = t;
@@ -1452,13 +1482,18 @@ export async function createPipeline({
     // Notice UNREADABLE premature exits do NOT lock out future readable sightings!
     const used = new Set();
     const acceptedOwners = new Set();
+    for (const ft of finalizedActive) {
+      const ow = ownerOf(ft.curOpt ? ft.curOpt.box : predictedBox(ft, time));
+      if (ow) acceptedOwners.add(ow.id);
+    }
     const remaining = [];
     for (const candidate of nms(contained, 16, 0.45)) {
       const cq = candidate.corners;
       const cBox = validCorners(cq) ? cornersToBox(cq) : candidate.box;
       const acceptedCover = tracks.find(t => {
         if (t.state !== 'FINALIZED' || t.result.status !== 'ACCEPTED') return false;
-        const pBox = predictedBox(t, time);
+        const kinBox = predictedBox(t, time);
+        const pBox = t.curOpt && iou(t.curOpt.box, cBox) > iou(kinBox, cBox) ? t.curOpt.box : kinBox;
         if (iou(pBox, cBox) < 0.20) return false;
         const ratio = Math.max(1, cBox[2] - cBox[0]) / Math.max(1, pBox[2] - pBox[0]);
         return ratio >= 0.45 && ratio <= 2.2;
@@ -1466,18 +1501,38 @@ export async function createPipeline({
       if (acceptedCover) {
         if (!used.has(acceptedCover.id)) {
           const dt = Math.max(0.03, time - acceptedCover.last);
-          const dx = 0.5 * (cBox[0] + cBox[2] - acceptedCover.box[0] - acceptedCover.box[2]);
-          const dy = 0.5 * (cBox[1] + cBox[3] - acceptedCover.box[1] - acceptedCover.box[3]);
-          if (validCorners(cq)) {
-            acceptedCover.velocity = [
-              clamp(0.6 * acceptedCover.velocity[0] + 0.4 * (dx / dt), -480, 480),
-              clamp(0.6 * acceptedCover.velocity[1] + 0.4 * (dy / dt), -480, 480),
-            ];
-            acceptedCover.corners = cq;
+          const opt = acceptedCover.curOpt;
+          let nextCorners, nextBox;
+          if (opt && opt.zncc >= 0.62) {
+            nextCorners = validCorners(cq)
+              ? opt.corners.map((oc, k) => [0.78 * oc[0] + 0.22 * cq[k][0], 0.78 * oc[1] + 0.22 * cq[k][1]])
+              : opt.corners;
+            nextBox = cornersToBox(nextCorners);
+          } else if (validCorners(cq)) {
+            nextCorners = cq;
+            nextBox = cBox;
           } else {
-            acceptedCover.corners = acceptedCover.corners.map(([x, y]) => [x + dx, y + dy]);
+            const dx0 = 0.5 * (cBox[0] + cBox[2] - acceptedCover.box[0] - acceptedCover.box[2]);
+            const dy0 = 0.5 * (cBox[1] + cBox[3] - acceptedCover.box[1] - acceptedCover.box[3]);
+            nextCorners = acceptedCover.corners.map(([x, y]) => [x + dx0, y + dy0]);
+            nextBox = cBox;
           }
-          acceptedCover.box = cBox;
+          const dx = 0.5 * (nextBox[0] + nextBox[2] - acceptedCover.box[0] - acceptedCover.box[2]);
+          const dy = 0.5 * (nextBox[1] + nextBox[3] - acceptedCover.box[1] - acceptedCover.box[3]);
+          acceptedCover.velocity = [
+            clamp(0.55 * acceptedCover.velocity[0] + 0.45 * (dx / dt), -480, 480),
+            clamp(0.55 * acceptedCover.velocity[1] + 0.45 * (dy / dt), -480, 480),
+          ];
+          acceptedCover.corners = nextCorners;
+          acceptedCover.box = nextBox;
+          if (validCorners(cq) || (opt && opt.zncc >= 0.78)) {
+            const patchU8 = extractPatchFromRgba(frame, wOrig, hOrig, nextCorners);
+            const nextRef = createOpticalRef(patchU8, nextCorners);
+            if (nextRef) {
+              acceptedCover.optRef = nextRef;
+              acceptedCover.optPatch = patchU8;
+            }
+          }
           acceptedCover.last = time;
           acceptedCover.lastFrame = frameIndex;
           acceptedCover.missed = 0;
@@ -1567,7 +1622,8 @@ export async function createPipeline({
         const pcx = 0.5 * (box[0] + box[2]), pcy = 0.5 * (box[1] + box[3]);
         for (const t of tracks) {
           if (t.state !== 'COLLECTING' || used.has(t.id)) continue;
-          const pBox = predictedBox(t, time);
+          const kinBox = predictedBox(t, time);
+          const pBox = t.curOpt && iou(t.curOpt.box, box) > iou(kinBox, box) ? t.curOpt.box : kinBox;
           const ov = iou(pBox, box);
           const tcx = 0.5 * (pBox[0] + pBox[2]), tcy = 0.5 * (pBox[1] + pBox[3]);
           const lastCx = 0.5 * (t.box[0] + t.box[2]), lastCy = 0.5 * (t.box[1] + t.box[3]);
@@ -1657,14 +1713,43 @@ export async function createPipeline({
         ];
         const smCx = predCx + alpha * rCx;
         const smCy = predCy + alpha * rCy;
-        const smW = oldW + 0.65 * (measW - oldW);
-        const smH = oldH + 0.65 * (measH - oldH);
-        const prevPredCorners = predictedCorners(track, time);
-        track.corners = corners.map((c, k) => [
-          0.25 * prevPredCorners[k][0] + 0.75 * c[0],
-          0.25 * prevPredCorners[k][1] + 0.75 * c[1],
-        ]);
-        track.box = [smCx - 0.5 * smW, smCy - 0.5 * smH, smCx + 0.5 * smW, smCy + 0.5 * smH];
+        const smW = oldW + 0.72 * (measW - oldW);
+        const smH = oldH + 0.72 * (measH - oldH);
+        const opt = track.curOpt;
+        if (opt && opt.zncc >= 0.66) {
+          const maxDiff =
+            Math.max(...corners.map((c, k) => Math.hypot(c[0] - opt.corners[k][0], c[1] - opt.corners[k][1]))) /
+            Math.max(12, measW);
+          if (maxDiff < 0.20) {
+            // Fuse zero-lag sub-pixel optical alignment with Stage-2 perspective corners (kills CNN micro-jitter).
+            const wOpt = clamp(0.68 * opt.zncc, 0.42, 0.66);
+            track.corners = corners.map((c, k) => [
+              wOpt * opt.corners[k][0] + (1 - wOpt) * c[0],
+              wOpt * opt.corners[k][1] + (1 - wOpt) * c[1],
+            ]);
+            track.box = cornersToBox(track.corners);
+          } else {
+            track.corners = corners;
+            track.box = [smCx - 0.5 * smW, smCy - 0.5 * smH, smCx + 0.5 * smW, smCy + 0.5 * smH];
+          }
+        } else {
+          const prevPredCorners = predictedCorners(track, time);
+          track.corners = corners.map((c, k) => [
+            0.18 * prevPredCorners[k][0] + 0.82 * c[0],
+            0.18 * prevPredCorners[k][1] + 0.82 * c[1],
+          ]);
+          track.box = [smCx - 0.5 * smW, smCy - 0.5 * smH, smCx + 0.5 * smW, smCy + 0.5 * smH];
+        }
+      }
+
+      // Refresh optical reference template whenever Stage-2 support is clean or no reference exists yet.
+      if (!track.optRef || loc.support >= 0.58) {
+        const patchU8 = extractPatchFromRgba(frame, wOrig, hOrig, track.corners);
+        const nextRef = createOpticalRef(patchU8, track.corners);
+        if (nextRef) {
+          track.optRef = nextRef;
+          track.optPatch = patchU8;
+        }
       }
 
       if (loc.reidEmb) {
@@ -1752,6 +1837,8 @@ export async function createPipeline({
           box: t.box,
           corners: t.corners,
           velocity: t.velocity,
+          sizeVelocity: t.sizeVelocity,
+          optPatch: t.optPatch,
           vehicleId: t.vehicleId,
           status: t.result.status,
           text: t.result.text,
@@ -1769,17 +1856,22 @@ export async function createPipeline({
             (used.has(t.id) || t.missed <= 2) &&
             (!discardShortUnreadable || t.frames >= 2)
         )
-        .map(t => ({
-          id: t.id,
-          box: used.has(t.id) ? t.box : predictedBox(t, time),
-          corners: used.has(t.id) ? t.corners : predictedCorners(t, time),
-          velocity: t.velocity,
-          vehicleId: t.vehicleId,
-          coasted: !used.has(t.id),
-          state: t.state,
-          frames: t.frames,
-          readouts: t.readouts,
-        })),
+        .map(t => {
+          const coastOpt = !used.has(t.id) && t.curOpt && t.curOpt.zncc >= 0.65 ? t.curOpt : null;
+          return {
+            id: t.id,
+            box: used.has(t.id) ? t.box : coastOpt ? coastOpt.box : predictedBox(t, time),
+            corners: used.has(t.id) ? t.corners : coastOpt ? coastOpt.corners : predictedCorners(t, time),
+            velocity: t.velocity,
+            sizeVelocity: t.sizeVelocity,
+            optPatch: t.optPatch,
+            vehicleId: t.vehicleId,
+            coasted: !used.has(t.id),
+            state: t.state,
+            frames: t.frames,
+            readouts: t.readouts,
+          };
+        }),
     };
   }
 
