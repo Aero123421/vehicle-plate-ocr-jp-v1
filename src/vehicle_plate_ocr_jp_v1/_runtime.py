@@ -230,7 +230,8 @@ def create_predictor(repo_root: Path, config: dict) -> INT8Predictor:
     vocab = PlateVocab()
     det = UnifiedTemporalDetORT(paths["detector"], paths["cutout"])
     options = ort.SessionOptions()
-    options.intra_op_num_threads = 1
+    # Stage-2 convolutions benefit from a small, bounded native CPU pool.
+    options.intra_op_num_threads = 2
     stage2 = ort.InferenceSession(str(paths["stage2"]), options, providers=["CPUExecutionProvider"])
     if ({meta.name for meta in stage2.get_outputs()} != set(STAGE2_OUTPUT_NAMES)
             or [meta.name for meta in stage2.get_inputs()] != ["fovea_rois", "surround_rois", "sampling_policy"]):

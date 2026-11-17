@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import zlib
@@ -15,6 +16,20 @@ from vehicle_plate_ocr_jp_v1 import cli
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "web/models"
 ARTIFACTS = tuple(f"{name}.int8.onnx" for name in cli.GRAPH_NAMES) + cli.CALIBRATION_NAMES
+
+
+@pytest.fixture(scope="module", autouse=True)
+def bounded_cpu_threads():
+    """Keep this targeted smoke suite within its short CPU-only budget."""
+    import torch
+    import cv2
+    previous = torch.get_num_threads()
+    previous_cv = cv2.getNumThreads()
+    torch.set_num_threads(1)
+    cv2.setNumThreads(1)
+    yield
+    torch.set_num_threads(previous)
+    cv2.setNumThreads(previous_cv)
 
 
 def test_release_inventory_and_size():
@@ -126,3 +141,20 @@ def test_synthetic_browser_demo_has_accepted_terminal_prediction():
     predictions = package.create_predictor().predict_clip(
         ROOT / "web/samples/synthetic_gate_demo.mp4")
     assert predictions, "The browser sample must yield an ACCEPTED terminal prediction"
+
+
+def test_browser_isolation_and_local_only_contract():
+    worker = ROOT / "web/coi-sw.js"
+    assert worker.is_file()
+    source = worker.read_text()
+    # Escapes keep private identifiers out of the public release itself.
+    forbidden = re.compile(r"\x6b\x74\x72\x61\x63\x65|\x6b\x74\x6f\x70", re.I)
+    assert not forbidden.search(source)
+    assert "Apache-2.0" in source
+    for header in ("Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy",
+                   "Cross-Origin-Resource-Policy"):
+        assert header in source
+    html = (ROOT / "web/index.html").read_text()
+    assert "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'" in html
+    assert '<input id="thorough" type="checkbox">' in html
+    assert 'preload="auto" controls' in html
