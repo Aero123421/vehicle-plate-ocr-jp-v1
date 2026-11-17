@@ -5,31 +5,119 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="日本の車両とナンバープレートをブラウザー内で認識。動画のアップロードは 0 bytes。">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'">
-  <title>vehicle-plate-ocr-jp-v1 · ローカル推論</title>
+  <title>vehicle-plate-ocr-jp-v1 · ローカル推論ワークベンチ</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main>
-  <header><span class="eyebrow">APACHE-2.0 · v0.6.5 · LOCAL INFERENCE</span><h1>vehicle-plate-ocr-jp-v1</h1><p>Japanese vehicle detection & terminal plate OCR</p></header>
-  <section class="intro"><h2>映像を選ぶだけ。すべて、この端末で。</h2><p>車両とプレートを追跡し、鮮明な証拠を蓄積。各トラックが安定・退出した時点で一度だけ文字を読み出します。外部通信・解析なし、映像のアップロード <strong>0 bytes</strong>。</p></section>
-  <div class="controls" role="group" aria-label="映像を選択して認識を開始">
-    <button id="pick-file">動画ファイルを選択</button><input id="file" type="file" accept="video/*" hidden>
-    <button id="camera">カメラで試す</button>
-    <button id="sample">サンプル動画で試す</button>
-    <button id="stop" disabled>今すぐ確定</button>
-    <label class="toggle"><input id="thorough" type="checkbox"> 全フレーム解析 (12 FPS)</label>
-  </div>
-  <section id="drop" tabindex="0" aria-label="動画をドロップすると認識を自動開始">
-    <div class="viewport"><video id="video" playsinline muted preload="auto" controls></video><canvas id="overlay" aria-label="車両とプレートの追跡表示"></canvas></div>
-    <p>動画をここへドロップすると自動開始。高速リアルタイム再生が標準です。いつでも再生・一時停止・シークできます。カメラは「今すぐ確定」で停止します。</p>
-  </section>
-  <p id="status" role="status" aria-live="polite">動画を選択・ドロップ、またはカメラやサンプルで始めてください。</p>
-  <section class="results"><h2>認識結果 <span class="muted">LIVE · ONE READOUT / TRACK</span></h2><div id="results-cards"><p class="muted">安定・退出したトラックの確定結果を順次表示します。</p></div>
-    <details id="raw-results"><summary>JSON 出力を表示</summary><pre id="results-json">[]</pre></details>
-  </section>
-  <details><summary>デモについて</summary><p>モデルと WASM は同じサイトから読み込み、専用 Worker で処理します。通常は 1.0 倍速で再生し、推論できるフレームを解析します。全フレーム解析では 12 FPS の各フレームを順に解析します。カメラの利用には HTTPS または localhost が必要です。</p><p>サンプルは合成映像です。ブラウザー版の追跡は簡易 IoU 方式で、Python 版の PMBM 追跡・Smart-Zoom と異なります。遠距離・低解像度では棄却や「?」表示が増えます。公開ベンチマークは Python 版の記録です。</p></details>
-  <footer><a href="LICENSE">Apache-2.0</a> · <a href="NOTICE">NOTICE</a> · <a href="THIRD_PARTY_NOTICES.md">Third-party notices</a></footer>
-</main>
+<div class="app-shell">
+  <header class="topbar">
+    <div class="brand-block">
+      <span class="eyebrow">APACHE-2.0 · v0.6.5 · ON-DEVICE TELEMETRY</span>
+      <div class="title-row">
+        <h1>vehicle-plate-ocr-jp-v1</h1>
+        <span class="badge-local">0 bytes uploaded</span>
+      </div>
+      <p class="subtitle">Japanese vehicle detection &amp; terminal plate OCR — すべてこの端末内の Worker / WASM で完結</p>
+    </div>
+  </header>
+
+  <main class="workbench">
+    <section class="primary-pane" aria-label="映像入力とライブ追跡ビューポート">
+      <div class="controls" role="group" aria-label="映像を選択して認識を開始">
+        <button id="pick-file" type="button">動画ファイルを選択</button>
+        <input id="file" type="file" accept="video/*" hidden>
+        <button id="camera" type="button">カメラで試す</button>
+        <button id="sample" type="button">サンプル動画で試す</button>
+        <label class="toggle" for="thorough">
+          <input id="thorough" type="checkbox">
+          <span>全フレーム解析 (12 FPS)</span>
+        </label>
+        <button id="stop" type="button" disabled>今すぐ確定</button>
+      </div>
+
+      <section id="drop" tabindex="0" aria-label="動画をドロップすると認識を自動開始">
+        <div class="viewport">
+          <video id="video" playsinline muted preload="auto" controls></video>
+          <canvas id="overlay" aria-label="車両とプレートの追跡表示"></canvas>
+        </div>
+        <p class="drop-hint">動画ファイルをここへドロップすると自動開始します。通常の 1.0 倍速再生・一時停止・シークに対応し、カメラは「今すぐ確定」で停止します。</p>
+      </section>
+
+      <section class="telemetry-bar" aria-label="ライブ推論テレメトリー">
+        <p id="status" role="status" aria-live="polite">動画を選択・ドロップ、またはカメラやサンプルで始めてください。</p>
+        <dl class="stat-grid">
+          <div class="stat-cell">
+            <dt>PHASE</dt>
+            <dd id="stat-phase">IDLE</dd>
+          </div>
+          <div class="stat-cell">
+            <dt>LATENCY</dt>
+            <dd id="stat-latency">-- ms</dd>
+          </div>
+          <div class="stat-cell">
+            <dt>FPS</dt>
+            <dd id="stat-fps">--</dd>
+          </div>
+          <div class="stat-cell">
+            <dt>VEHICLES</dt>
+            <dd id="stat-vehicles">0</dd>
+          </div>
+          <div class="stat-cell">
+            <dt>TRACKS</dt>
+            <dd id="stat-tracks">0</dd>
+          </div>
+          <div class="stat-cell">
+            <dt>THREADS</dt>
+            <dd id="stat-threads">WASM</dd>
+          </div>
+        </dl>
+      </section>
+    </section>
+
+    <aside class="inspector-pane" aria-label="アクティブトラックと確定認識結果">
+      <section class="live-strip-section" aria-label="追跡中のトラック">
+        <div class="panel-header">
+          <h2>LIVE TRACKS</h2>
+          <span class="panel-tag">COLLECTING · 0 READOUTS</span>
+        </div>
+        <div id="live-tracks" class="live-tracks">
+          <p class="muted empty-hint">追跡中の車両・プレートはありません。</p>
+        </div>
+      </section>
+
+      <section class="results" aria-label="確定認識結果">
+        <div class="panel-header">
+          <h2>認識結果</h2>
+          <span class="panel-tag">TERMINAL · 1 READOUT / TRACK</span>
+        </div>
+        <div id="results-cards">
+          <p class="muted empty-hint">安定・退出したトラックの確定結果を順次表示します。</p>
+        </div>
+        <details id="raw-results">
+          <summary>JSON 出力を表示</summary>
+          <pre id="results-json">[]</pre>
+        </details>
+      </section>
+    </aside>
+  </main>
+
+  <details class="about-note">
+    <summary>アーキテクチャとローカル推論について</summary>
+    <p>モデルと WASM ランタイムは同一オリジンから読み込み、専用 Web Worker 内で処理します。映像や画像が外部へ送信されることはありません（アップロード <strong>0 bytes</strong>）。通常再生では再生を止めずにフレームを取得し、全フレーム解析 (12 FPS) では 12 FPS 間隔で各フレームを順に解析します。カメラ入力には HTTPS または localhost が必要です。</p>
+    <p>追跡パイプラインは 2D Kalman フィルター＋ReID による車両・プレート追跡、Pass-2 マウント探索 / Smart-Zoom 高解像度切り出し、および 60 FPS 描画スムージングを実行します。文字認識は JP7029732B2 準拠の終端読み出し（<code>COLLECTING</code> 中は <code>0</code> 回、トラック確定・退出時にのみ <code>1</code> 回）に厳密に限定されています。サンプル映像は合成動画であり、遠距離・低解像度では棄却（<code>UNREADABLE</code>）される場合があります。</p>
+  </details>
+
+  <footer>
+    <span>vehicle-plate-ocr-jp-v1 · Local Inference Workbench</span>
+    <nav aria-label="ライセンスと通知">
+      <a href="LICENSE">Apache-2.0</a>
+      <span aria-hidden="true">·</span>
+      <a href="NOTICE">NOTICE</a>
+      <span aria-hidden="true">·</span>
+      <a href="THIRD_PARTY_NOTICES.md">Third-party notices</a>
+    </nav>
+  </footer>
+</div>
 <script type="module" src="app.mjs"></script>
 </body>
 </html>
