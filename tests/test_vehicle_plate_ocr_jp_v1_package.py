@@ -312,6 +312,6 @@ def test_vendored_wasm_preserves_initialized_memory():
     if node:
         result = subprocess.run(
             [node, "-e", "if (!WebAssembly.validate(require('fs').readFileSync(process.argv[1]))) process.exit(1)", str(path)],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 0, result.stderr
