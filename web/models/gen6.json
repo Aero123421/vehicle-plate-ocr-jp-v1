@@ -1,0 +1,50 @@
+{
+  "pipeline": {
+    "enable_far_zoom": true,
+    "heartbeat_interval": 6,
+    "max_heartbeat_interval": 12
+  },
+  "session": {
+    "C_abstain": 0.05,
+    "C_abstain_full": 0.05,
+    "C_wrong": 1.0,
+    "C_wrong_full": 1.0,
+    "risk_calibrated": false
+  },
+  "terminal": {
+    "conflict_weight": 0.2798930939552888,
+    "identity_probability": 1.0,
+    "mixed_bias": -1.0571780030044766,
+    "mixed_logit_scale": 1.0,
+    "null_bias": 0.2728072791705002,
+    "null_temperature": 0.9693154776452002,
+    "readability_weight": 4.4784997030742374e-05,
+    "readout_precision_ceiling": 2.5,
+    "support_weight": 0.018207182705664477,
+    "temperature": 0.8112198331908363
+  },
+  "tracker": {
+    "acceleration_spectral_density": 100.0,
+    "appearance_kappa": 12.0,
+    "assignment_node_budget": 20000,
+    "birth_odds": 0.042328900672298345,
+    "c_false": 19.0,
+    "c_retain": 1.0,
+    "c_retire": 0.01,
+    "c_wait": 1.0,
+    "detection_probability": 0.9056603773584906,
+    "dormant_after_s": 0.3,
+    "innovation_tau_s": 0.5,
+    "max_hypotheses": 32,
+    "persistent_birth_ratio": 0.25,
+    "plate_clutter_density": 1e-20,
+    "policy_birth_odds": {
+      "detector_far_zoom": 0.05765769544709412,
+      "detector_full": 0.042328900672298345,
+      "search_measurement": 0.05474256969124608,
+      "standalone_precrop": 0.045270834189361446
+    },
+    "survival_tau_s": 120.0,
+    "vehicle_clutter_density": 1e-12
+  }
+}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="日本の車両とナンバープレートをブラウザー内で認識。動画のアップロードは 0 bytes。">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'">
+  <title>vehicle-plate-ocr-jp-v1 · ローカル推論</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header><span class="eyebrow">APACHE-2.0 · v0.6.5 · LOCAL INFERENCE</span><h1>vehicle-plate-ocr-jp-v1</h1><p>Japanese vehicle detection & terminal plate OCR</p></header>
+  <section class="intro"><h2>映像を選ぶだけ。すべて、この端末で。</h2><p>車両とプレートを追跡し、鮮明な証拠を蓄積。終了時に一度だけ文字を読み出します。外部通信・解析なし、映像のアップロード <strong>0 bytes</strong>。</p></section>
+  <div class="controls" role="group" aria-label="映像を選択して認識を開始">
+    <button id="pick-file">動画ファイルを選択</button><input id="file" type="file" accept="video/*" hidden>
+    <button id="camera">カメラで試す</button>
+    <button id="sample">サンプル動画で試す</button>
+    <button id="start" hidden>再実行</button><button id="stop" hidden>終了して読み出す</button>
+  </div>
+  <section id="drop" tabindex="0" aria-label="動画をドロップすると認識を自動開始">
+    <div class="viewport"><video id="video" playsinline muted preload="auto" controls></video><canvas id="overlay" aria-label="車両とプレートの追跡表示"></canvas></div>
+    <p>動画をここへドロップすると自動開始。カメラは「終了して読み出す」で結果を表示し、停止します。</p>
+  </section>
+  <p id="status" role="status" aria-live="polite">動画を選択・ドロップ、またはカメラやサンプルで始めてください。</p>
+  <section class="results"><h2>認識結果 <span class="muted">TERMINAL ONLY</span></h2><div id="results-cards"><p class="muted">映像の終了後、ここに結果を表示します。</p></div>
+    <details id="raw-results"><summary>JSON 出力を表示</summary><pre id="results-json">[]</pre></details>
+  </section>
+  <details><summary>デモについて</summary><p>モデルと WASM は同じサイトから読み込み、専用 Worker で処理します。動画は 12 FPS で解析します。カメラの利用には HTTPS または localhost が必要です。</p><p>サンプルは合成映像です。ブラウザー版の追跡は簡易 IoU 方式で、Python 版の PMBM 追跡・Smart-Zoom と異なります。遠距離・低解像度では棄却や「?」表示が増えます。公開ベンチマークは Python 版の記録です。</p></details>
+  <footer><a href="LICENSE">Apache-2.0</a> · <a href="NOTICE">NOTICE</a> · <a href="THIRD_PARTY_NOTICES.md">Third-party notices</a></footer>
+</main>
+<script type="module" src="app.mjs"></script>
+</body>
+</html>

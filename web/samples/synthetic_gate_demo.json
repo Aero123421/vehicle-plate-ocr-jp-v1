@@ -1,0 +1,37 @@
+{
+  "generator": "Scene3DGPUEngine",
+  "seed": 20265119,
+  "domain_split": "val_holdout",
+  "split": "val",
+  "bank_size": 64,
+  "bank_seed": 20264040,
+  "scene_mode": "close_gate",
+  "grammar_combo_id": "vh_boom_lattice_placard",
+  "font_family_id": "noto_sans_medium",
+  "camera_motion_family": "pole_bimodal_flutter",
+  "width": 768,
+  "height": 448,
+  "frames": 28,
+  "render_frames": 32,
+  "fps": 12,
+  "codec": "H.264",
+  "pixel_format": "yuv420p",
+  "crf": 20,
+  "bytes": 238607,
+  "expected_predictions": [
+    {
+      "serial": "3532"
+    }
+  ],
+  "expected_serial": "3532",
+  "verification": "create_predictor().predict_clip(encoded_mp4): ACCEPTED",
+  "render_options": {
+    "p_negative_clip": 0,
+    "p_night_scene": 0,
+    "p_rain_wet": 0,
+    "p_chainlink_fence": 0,
+    "p_gate_pillar_occlusion": 0,
+    "p_stationary_clip": 0,
+    "max_substeps": 1
+  }
+}

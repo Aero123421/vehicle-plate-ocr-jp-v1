@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install package and test dependencies
+        run: |
+          uv pip install --system 'torch>=2.15.0' --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e . pytest
+      - name: Verify public package and Gen-6 contracts
+        run: python -B -m pytest tests/test_vehicle_plate_ocr_jp_v1_package.py tests/test_gen6_contracts.py tests/test_all_regions.py tests/test_charset.py -p no:cacheprovider -q

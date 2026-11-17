@@ -1,0 +1,775 @@
+{
+  "version": "0.6.0",
+  "audit_contract": "Gen-6 sealed sessions including v0.6.1 episode quality API",
+  "created_at_utc": "2026-11-17T00:14:52.504733+00:00",
+  "device": "cuda",
+  "evaluation_role": "Dev-Audit; inference and diagnostics only; no training or calibration",
+  "nano_int8_3stage_stack": {
+    "total_7graphs_bytes": 10639746,
+    "total_7graphs_mib": 10.146852493286133,
+    "total_deployed_with_cal_bytes": 10646951,
+    "total_deployed_with_cal_mib": 10.15372371673584,
+    "budget_bytes": 15728640,
+    "within_15_000_mib_budget": true,
+    "cpu_ort_latency": {
+      "1_thread": {
+        "serial_streaming_6graphs_ms": 182.3689988013939,
+        "terminal_memory_readout_ms": 0.09041489829542115,
+        "all_7graphs_serial_ms": 182.45941369968932,
+        "cascade_k6_effective_ms_estimate": 56.86628178542985,
+        "cascade_k6_effective_fps_estimate": 17.585113156742697,
+        "estimate_assumptions": "Detector+cutout every 6 frames, 1 Stage-2 ROI/frame, 0.5 OCR tracks/frame; excludes preprocessing, tracking, copies, rendering and terminal readout. Not measured end-to-end FPS."
+      },
+      "2_thread": {
+        "serial_streaming_6graphs_ms": 118.93018820264842,
+        "terminal_memory_readout_ms": 0.09521299944026396,
+        "all_7graphs_serial_ms": 119.02540120208869,
+        "cascade_k6_effective_ms_estimate": 35.621577886195155,
+        "cascade_k6_effective_fps_estimate": 28.07287210001839,
+        "estimate_assumptions": "Detector+cutout every 6 frames, 1 Stage-2 ROI/frame, 0.5 OCR tracks/frame; excludes preprocessing, tracking, copies, rendering and terminal readout. Not measured end-to-end FPS."
+      }
+    }
+  },
+  "alpr60_human_gt": {
+    "v0_6_0_base": {
+      "count": 60,
+      "raw_exact_4field": 0.633333,
+      "region_acc": 0.883333,
+      "classification_acc": 0.866667,
+      "hiragana_acc": 0.783333,
+      "serial_acc": 0.966667,
+      "region_2char_acc": 0.837838,
+      "accepted_rate": 0.966667,
+      "strict_emitted_precision": 0.948276,
+      "full_4field_count": 21,
+      "full_4field_exact_precision": 0.952381,
+      "core_verified_count": 37,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct + 5%-margin + supported Stage-2 crop; one source-frame factor",
+      "stage2_provenance": "STANDALONE_PRECROP"
+    },
+    "v0_6_0_base_direct_0margin": {
+      "count": 60,
+      "raw_exact_4field": 0.566667,
+      "region_acc": 0.866667,
+      "classification_acc": 0.8,
+      "hiragana_acc": 0.683333,
+      "serial_acc": 0.933333,
+      "region_2char_acc": 0.810811,
+      "accepted_rate": 0.933333,
+      "strict_emitted_precision": 0.928571,
+      "full_4field_count": 19,
+      "full_4field_exact_precision": 0.947368,
+      "core_verified_count": 37,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct 0-margin",
+      "stage2_provenance": null
+    },
+    "v0_6_0_nano": {
+      "count": 60,
+      "raw_exact_4field": 0.683333,
+      "region_acc": 0.883333,
+      "classification_acc": 0.883333,
+      "hiragana_acc": 0.8,
+      "serial_acc": 0.95,
+      "region_2char_acc": 0.837838,
+      "accepted_rate": 0.95,
+      "strict_emitted_precision": 0.947368,
+      "full_4field_count": 20,
+      "full_4field_exact_precision": 1.0,
+      "core_verified_count": 37,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct + 5%-margin + supported Stage-2 crop; one source-frame factor",
+      "stage2_provenance": "STANDALONE_PRECROP"
+    },
+    "v0_6_0_nano_direct_0margin": {
+      "count": 60,
+      "raw_exact_4field": 0.616667,
+      "region_acc": 0.816667,
+      "classification_acc": 0.783333,
+      "hiragana_acc": 0.733333,
+      "serial_acc": 0.9,
+      "region_2char_acc": 0.756757,
+      "accepted_rate": 0.9,
+      "strict_emitted_precision": 0.944444,
+      "full_4field_count": 18,
+      "full_4field_exact_precision": 0.944444,
+      "core_verified_count": 36,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct 0-margin",
+      "stage2_provenance": null
+    },
+    "v0_6_0_nano_int8_onnx": {
+      "count": 60,
+      "raw_exact_4field": 0.7,
+      "region_acc": 0.883333,
+      "classification_acc": 0.883333,
+      "hiragana_acc": 0.816667,
+      "serial_acc": 0.95,
+      "region_2char_acc": 0.837838,
+      "accepted_rate": 0.95,
+      "strict_emitted_precision": 0.929825,
+      "full_4field_count": 20,
+      "full_4field_exact_precision": 1.0,
+      "core_verified_count": 37,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct + 5%-margin + supported Stage-2 crop; one source-frame factor",
+      "stage2_provenance": "STANDALONE_PRECROP"
+    },
+    "v0_6_0_nano_int8_onnx_direct_0margin": {
+      "count": 60,
+      "raw_exact_4field": 0.616667,
+      "region_acc": 0.816667,
+      "classification_acc": 0.783333,
+      "hiragana_acc": 0.733333,
+      "serial_acc": 0.9,
+      "region_2char_acc": 0.756757,
+      "accepted_rate": 0.9,
+      "strict_emitted_precision": 0.944444,
+      "full_4field_count": 18,
+      "full_4field_exact_precision": 0.944444,
+      "core_verified_count": 36,
+      "core_verified_serial_precision": 1.0,
+      "view_protocol": "direct 0-margin",
+      "stage2_provenance": null
+    }
+  },
+  "street_400_hard_negatives": {
+    "negatives_count": 400,
+    "quad_topo_reject_rate": 0.1425,
+    "rejection_definition": "calibrated Stage-2 decision or physical crop support failure; differs from Gen-5 topology gates",
+    "cutout_joint_false_accept_count": 0,
+    "cutout_joint_false_accept_rate": 0.0,
+    "full_scene_false_accept_count": 0,
+    "full_scene_false_accept_rate": 0.0,
+    "streaming_character_readouts": 0
+  },
+  "construction_gate_unseen": {
+    "static_vehicle_detected_base": 32,
+    "static_vehicle_64x64_cutout_base": 32,
+    "static_plate_detected_k1_base": 30,
+    "static_plate_accepted_k1_base": 6,
+    "static_plate_full_4field_k1_base": 0,
+    "static_vehicle_detected_nano": 32,
+    "static_vehicle_64x64_cutout_nano": 32,
+    "static_plate_detected_k1_nano": 30,
+    "static_plate_accepted_k1_nano": 4,
+    "static_plate_full_4field_k1_nano": 1,
+    "static_scenes_total": 32,
+    "static_gt_accepted_serial_precision": 0.75,
+    "static_gt_scored_count": 4,
+    "video_aggregate": {
+      "clips_total": 24,
+      "accepted_clips": 9,
+      "full_4field_clips": 1,
+      "accepted_tracks": 18,
+      "full_4field_tracks": 1,
+      "clips_with_duplicate_id_splits": 2,
+      "duplicate_serial_groups": 2,
+      "spawned_vehicle_ids": 1012,
+      "spawned_plate_ids": 9701,
+      "vehicle_subtype_flip_count": 473,
+      "vehicle_subtype_transition_count": 4316,
+      "streaming_character_readouts": 0,
+      "vehicle_subtype_flip_rate": 0.109592,
+      "mean_vehicle_subtype_flip_rate_per_clip": 0.114965875
+    },
+    "max_simultaneous_vehicle_tracks": 8,
+    "max_simultaneous_plate_tracks": 37,
+    "coupled_vehicle_plate_track_pairs": 136,
+    "parallel_batched_ocr_frames": 569,
+    "multi_plate_accepted_clips": 3,
+    "long_dwell_ge25f_tracks": 21,
+    "natural_occlusion_relink_frames": 11,
+    "injected_pillar_occlusion_test": "not run; natural relinks reported without changing tracker calibration",
+    "mean_cascade_detector_duty_cycle": 0.519213,
+    "mean_real_video_wallclock_fps": 2.57427472002612,
+    "patent_clean_zero_intermediate_readouts": true,
+    "streaming_character_readouts": 0,
+    "hd_videos_total": 12,
+    "hd_videos_detected_nano": 12,
+    "hd_videos_accepted_nano": 9,
+    "hd_videos_full_4field_nano": 1,
+    "lowres_videos_total": 12,
+    "lowres_videos_detected_nano": 12,
+    "lowres_videos_accepted_nano": 0,
+    "lowres_videos_full_4field_nano": 0
+  },
+  "wave3_extra_unseen": {
+    "static_vehicle_detected_base": 31,
+    "static_vehicle_64x64_cutout_base": 31,
+    "static_plate_detected_k1_base": 30,
+    "static_plate_accepted_k1_base": 3,
+    "static_plate_full_4field_k1_base": 1,
+    "static_vehicle_detected_nano": 32,
+    "static_vehicle_64x64_cutout_nano": 32,
+    "static_plate_detected_k1_nano": 30,
+    "static_plate_accepted_k1_nano": 1,
+    "static_plate_full_4field_k1_nano": 0,
+    "static_scenes_total": 32,
+    "static_gt_accepted_serial_precision": 1.0,
+    "static_gt_scored_count": 1,
+    "video_aggregate": {
+      "clips_total": 20,
+      "accepted_clips": 5,
+      "full_4field_clips": 0,
+      "accepted_tracks": 8,
+      "full_4field_tracks": 0,
+      "clips_with_duplicate_id_splits": 1,
+      "duplicate_serial_groups": 1,
+      "spawned_vehicle_ids": 630,
+      "spawned_plate_ids": 4852,
+      "vehicle_subtype_flip_count": 287,
+      "vehicle_subtype_transition_count": 3015,
+      "streaming_character_readouts": 0,
+      "vehicle_subtype_flip_rate": 0.095191,
+      "mean_vehicle_subtype_flip_rate_per_clip": 0.11874345000000001
+    },
+    "max_simultaneous_vehicle_tracks": 9,
+    "max_simultaneous_plate_tracks": 24,
+    "coupled_vehicle_plate_track_pairs": 95,
+    "parallel_batched_ocr_frames": 782,
+    "multi_plate_accepted_clips": 1,
+    "long_dwell_ge25f_tracks": 22,
+    "natural_occlusion_relink_frames": 18,
+    "injected_pillar_occlusion_test": "not run; natural relinks reported without changing tracker calibration",
+    "mean_cascade_detector_duty_cycle": 0.4713888,
+    "mean_real_video_wallclock_fps": 2.561534205403502,
+    "patent_clean_zero_intermediate_readouts": true,
+    "streaming_character_readouts": 0,
+    "hd_videos_total": 10,
+    "hd_videos_detected_nano": 10,
+    "hd_videos_accepted_nano": 5,
+    "hd_videos_full_4field_nano": 0,
+    "lowres_videos_total": 10,
+    "lowres_videos_detected_nano": 10,
+    "lowres_videos_accepted_nano": 0,
+    "lowres_videos_full_4field_nano": 0
+  },
+  "frozen_int8_ort_showcase_verification": {
+    "predictor": "tools.frozen_gen6_adapter.create_predictor(REPO_ROOT, {})",
+    "model_load_seconds": 1.2919379599916283,
+    "clips_total": 3,
+    "streaming_character_readouts": 0,
+    "patent_clean_zero_intermediate_readouts": true,
+    "all_terminal_prediction_multisets_equal": false,
+    "parity_equal_clips": 2,
+    "cpu_wallclock_fps": 0.2504531718586038,
+    "parity_interpretation": "Matched complete original clips. Eager FP32 Stage-1/OCR plus calibrated INT8 Stage-2 may differ numerically from all-INT8 deployment; mismatches are recorded, never hidden or treated as validation success."
+  },
+  "head_to_head_vs_v0_5_0": {
+    "baseline_version": "0.5.0",
+    "candidate_version": "0.6.0",
+    "deployed_size": {
+      "seven_graph_bytes": {
+        "v0_5_0": 12115922,
+        "v0_6_0": 10639746,
+        "delta_v6_minus_v5": -1476176,
+        "unit": "bytes"
+      },
+      "graphs_plus_calibration_bytes": {
+        "v0_5_0": null,
+        "v0_6_0": 10646951,
+        "delta_v6_minus_v5": null,
+        "unit": "bytes",
+        "availability": "Gen-5 metric unavailable; no value inferred",
+        "note": "Gen-5 graph-only size must not be silently treated as graph-plus-calibration size"
+      }
+    },
+    "alpr60": {
+      "v0_6_0_base": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.7,
+          "v0_6_0": 0.633333,
+          "delta_v6_minus_v5": -0.06666699999999992,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.95,
+          "v0_6_0": 0.883333,
+          "delta_v6_minus_v5": -0.06666699999999992,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8667,
+          "v0_6_0": 0.866667,
+          "delta_v6_minus_v5": -3.300000000006076e-05,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.7667,
+          "v0_6_0": 0.783333,
+          "delta_v6_minus_v5": 0.016632999999999898,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 0.9833,
+          "v0_6_0": 0.966667,
+          "delta_v6_minus_v5": -0.016632999999999898,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.9667,
+          "v0_6_0": 0.966667,
+          "delta_v6_minus_v5": -3.2999999999949736e-05,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9483,
+          "v0_6_0": 0.948276,
+          "delta_v6_minus_v5": -2.4000000000024002e-05,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 24,
+          "v0_6_0": 21,
+          "delta_v6_minus_v5": -3,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 0.9583,
+          "v0_6_0": 0.952381,
+          "delta_v6_minus_v5": -0.005919000000000008,
+          "unit": "fraction"
+        }
+      },
+      "v0_6_0_base_direct_0margin": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.7167,
+          "v0_6_0": 0.566667,
+          "delta_v6_minus_v5": -0.15003299999999997,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.9333,
+          "v0_6_0": 0.866667,
+          "delta_v6_minus_v5": -0.06663300000000005,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8667,
+          "v0_6_0": 0.8,
+          "delta_v6_minus_v5": -0.06669999999999998,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.8167,
+          "v0_6_0": 0.683333,
+          "delta_v6_minus_v5": -0.133367,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 0.9667,
+          "v0_6_0": 0.933333,
+          "delta_v6_minus_v5": -0.033367000000000036,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.95,
+          "v0_6_0": 0.933333,
+          "delta_v6_minus_v5": -0.016666999999999987,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9649,
+          "v0_6_0": 0.928571,
+          "delta_v6_minus_v5": -0.036328999999999945,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 22,
+          "v0_6_0": 19,
+          "delta_v6_minus_v5": -3,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 1.0,
+          "v0_6_0": 0.947368,
+          "delta_v6_minus_v5": -0.05263200000000001,
+          "unit": "fraction"
+        }
+      },
+      "v0_6_0_nano": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.7167,
+          "v0_6_0": 0.683333,
+          "delta_v6_minus_v5": -0.033367000000000036,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.95,
+          "v0_6_0": 0.883333,
+          "delta_v6_minus_v5": -0.06666699999999992,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8833,
+          "v0_6_0": 0.883333,
+          "delta_v6_minus_v5": 3.300000000006076e-05,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.8,
+          "v0_6_0": 0.8,
+          "delta_v6_minus_v5": 0.0,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 1.0,
+          "v0_6_0": 0.95,
+          "delta_v6_minus_v5": -0.050000000000000044,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.9833,
+          "v0_6_0": 0.95,
+          "delta_v6_minus_v5": -0.033299999999999996,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9661,
+          "v0_6_0": 0.947368,
+          "delta_v6_minus_v5": -0.01873199999999997,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 24,
+          "v0_6_0": 20,
+          "delta_v6_minus_v5": -4,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 0.9583,
+          "v0_6_0": 1.0,
+          "delta_v6_minus_v5": 0.04169999999999996,
+          "unit": "fraction"
+        }
+      },
+      "v0_6_0_nano_direct_0margin": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.5667,
+          "v0_6_0": 0.616667,
+          "delta_v6_minus_v5": 0.049966999999999984,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.9,
+          "v0_6_0": 0.816667,
+          "delta_v6_minus_v5": -0.08333299999999999,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8333,
+          "v0_6_0": 0.783333,
+          "delta_v6_minus_v5": -0.049967000000000095,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.7667,
+          "v0_6_0": 0.733333,
+          "delta_v6_minus_v5": -0.033367000000000036,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 0.9667,
+          "v0_6_0": 0.9,
+          "delta_v6_minus_v5": -0.06669999999999998,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.9333,
+          "v0_6_0": 0.9,
+          "delta_v6_minus_v5": -0.033299999999999996,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9286,
+          "v0_6_0": 0.944444,
+          "delta_v6_minus_v5": 0.01584399999999997,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 15,
+          "v0_6_0": 18,
+          "delta_v6_minus_v5": 3,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 0.8667,
+          "v0_6_0": 0.944444,
+          "delta_v6_minus_v5": 0.07774399999999992,
+          "unit": "fraction"
+        }
+      },
+      "v0_6_0_nano_int8_onnx": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.7167,
+          "v0_6_0": 0.7,
+          "delta_v6_minus_v5": -0.016700000000000048,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.95,
+          "v0_6_0": 0.883333,
+          "delta_v6_minus_v5": -0.06666699999999992,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8833,
+          "v0_6_0": 0.883333,
+          "delta_v6_minus_v5": 3.300000000006076e-05,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.8,
+          "v0_6_0": 0.816667,
+          "delta_v6_minus_v5": 0.016666999999999987,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 1.0,
+          "v0_6_0": 0.95,
+          "delta_v6_minus_v5": -0.050000000000000044,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.9833,
+          "v0_6_0": 0.95,
+          "delta_v6_minus_v5": -0.033299999999999996,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9661,
+          "v0_6_0": 0.929825,
+          "delta_v6_minus_v5": -0.036274999999999946,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 24,
+          "v0_6_0": 20,
+          "delta_v6_minus_v5": -4,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 0.9583,
+          "v0_6_0": 1.0,
+          "delta_v6_minus_v5": 0.04169999999999996,
+          "unit": "fraction"
+        }
+      },
+      "v0_6_0_nano_int8_onnx_direct_0margin": {
+        "raw_exact_4field": {
+          "v0_5_0": 0.5667,
+          "v0_6_0": 0.616667,
+          "delta_v6_minus_v5": 0.049966999999999984,
+          "unit": "fraction"
+        },
+        "region_acc": {
+          "v0_5_0": 0.9,
+          "v0_6_0": 0.816667,
+          "delta_v6_minus_v5": -0.08333299999999999,
+          "unit": "fraction"
+        },
+        "classification_acc": {
+          "v0_5_0": 0.8333,
+          "v0_6_0": 0.783333,
+          "delta_v6_minus_v5": -0.049967000000000095,
+          "unit": "fraction"
+        },
+        "hiragana_acc": {
+          "v0_5_0": 0.7667,
+          "v0_6_0": 0.733333,
+          "delta_v6_minus_v5": -0.033367000000000036,
+          "unit": "fraction"
+        },
+        "serial_acc": {
+          "v0_5_0": 0.9667,
+          "v0_6_0": 0.9,
+          "delta_v6_minus_v5": -0.06669999999999998,
+          "unit": "fraction"
+        },
+        "accepted_rate": {
+          "v0_5_0": 0.9167,
+          "v0_6_0": 0.9,
+          "delta_v6_minus_v5": -0.016699999999999937,
+          "unit": "fraction"
+        },
+        "strict_emitted_precision": {
+          "v0_5_0": 0.9455,
+          "v0_6_0": 0.944444,
+          "delta_v6_minus_v5": -0.001056000000000057,
+          "unit": "fraction"
+        },
+        "full_4field_count": {
+          "v0_5_0": 14,
+          "v0_6_0": 18,
+          "delta_v6_minus_v5": 4,
+          "unit": "count"
+        },
+        "full_4field_exact_precision": {
+          "v0_5_0": 0.9286,
+          "v0_6_0": 0.944444,
+          "delta_v6_minus_v5": 0.01584399999999997,
+          "unit": "fraction"
+        }
+      }
+    },
+    "street_400_hard_negatives": {
+      "cutout_joint_false_accept_count": {
+        "v0_5_0": 0,
+        "v0_6_0": 0,
+        "delta_v6_minus_v5": 0,
+        "unit": "count"
+      },
+      "full_scene_false_accept_count": {
+        "v0_5_0": 0,
+        "v0_6_0": 0,
+        "delta_v6_minus_v5": 0,
+        "unit": "count"
+      }
+    },
+    "video_suites": {
+      "construction_gate_unseen": {
+        "hd_videos_accepted_nano": {
+          "v0_5_0": 8,
+          "v0_6_0": 9,
+          "delta_v6_minus_v5": 1,
+          "unit": "count"
+        },
+        "hd_videos_full_4field_nano": {
+          "v0_5_0": 1,
+          "v0_6_0": 1,
+          "delta_v6_minus_v5": 0,
+          "unit": "count"
+        },
+        "lowres_videos_accepted_nano": {
+          "v0_5_0": 1,
+          "v0_6_0": 0,
+          "delta_v6_minus_v5": -1,
+          "unit": "count"
+        },
+        "lowres_videos_full_4field_nano": {
+          "v0_5_0": null,
+          "v0_6_0": 0,
+          "delta_v6_minus_v5": null,
+          "unit": "count",
+          "availability": "Gen-5 metric unavailable; no value inferred"
+        }
+      },
+      "wave3_extra_unseen": {
+        "hd_videos_accepted_nano": {
+          "v0_5_0": 5,
+          "v0_6_0": 5,
+          "delta_v6_minus_v5": 0,
+          "unit": "count"
+        },
+        "hd_videos_full_4field_nano": {
+          "v0_5_0": 1,
+          "v0_6_0": 0,
+          "delta_v6_minus_v5": -1,
+          "unit": "count"
+        },
+        "lowres_videos_accepted_nano": {
+          "v0_5_0": 0,
+          "v0_6_0": 0,
+          "delta_v6_minus_v5": 0,
+          "unit": "count"
+        },
+        "lowres_videos_full_4field_nano": {
+          "v0_5_0": null,
+          "v0_6_0": 0,
+          "delta_v6_minus_v5": null,
+          "unit": "count",
+          "availability": "Gen-5 metric unavailable; no value inferred"
+        }
+      }
+    },
+    "video_all_44": {
+      "candidate_aggregate": {
+        "clips_total": 44,
+        "accepted_clips": 14,
+        "full_4field_clips": 1,
+        "accepted_tracks": 26,
+        "full_4field_tracks": 1,
+        "clips_with_duplicate_id_splits": 3,
+        "duplicate_serial_groups": 3,
+        "spawned_vehicle_ids": 1642,
+        "spawned_plate_ids": 14553,
+        "vehicle_subtype_flip_count": 760,
+        "vehicle_subtype_transition_count": 7331,
+        "streaming_character_readouts": 0,
+        "vehicle_subtype_flip_rate": 0.103669,
+        "mean_vehicle_subtype_flip_rate_per_clip": 0.11668295454545455
+      },
+      "matched_telemetry_clips": 22,
+      "deltas": {
+        "accepted_clips": {
+          "v0_5_0": 13,
+          "v0_6_0": 14,
+          "delta_v6_minus_v5": 1,
+          "unit": "count"
+        },
+        "full_4field_clips": {
+          "v0_5_0": 2,
+          "v0_6_0": 1,
+          "delta_v6_minus_v5": -1,
+          "unit": "count"
+        },
+        "accepted_tracks": {
+          "v0_5_0": 59,
+          "v0_6_0": 26,
+          "delta_v6_minus_v5": -33,
+          "unit": "count"
+        },
+        "full_4field_tracks": {
+          "v0_5_0": 2,
+          "v0_6_0": 1,
+          "delta_v6_minus_v5": -1,
+          "unit": "count"
+        },
+        "clips_with_duplicate_id_splits": {
+          "v0_5_0": 8,
+          "v0_6_0": 3,
+          "delta_v6_minus_v5": -5,
+          "unit": "count"
+        },
+        "duplicate_serial_groups": {
+          "v0_5_0": 12,
+          "v0_6_0": 3,
+          "delta_v6_minus_v5": -9,
+          "unit": "count"
+        },
+        "spawned_vehicle_ids": {
+          "v0_5_0": 1696,
+          "v0_6_0": 982,
+          "delta_v6_minus_v5": -714,
+          "unit": "count"
+        },
+        "spawned_plate_ids": {
+          "v0_5_0": 3660,
+          "v0_6_0": 9395,
+          "delta_v6_minus_v5": 5735,
+          "unit": "count"
+        },
+        "mean_vehicle_subtype_flip_rate_per_clip": {
+          "v0_5_0": 0.07022727272727272,
+          "v0_6_0": 0.1191075,
+          "delta_v6_minus_v5": 0.048880227272727284,
+          "unit": "fraction"
+        }
+      },
+      "sample_schedule": {
+        "target_fps": 12,
+        "max_sampled_frames": 180
+      },
+      "default_gen5_schedule_match": true,
+      "comparison_limits": [
+        "Gen-5 video telemetry used approximately 12 FPS / up to 180 samples; changing frame cap changes comparability.",
+        "Both generations are measured with their own released calibration and trackers.",
+        "Gen-5 static evaluation used its K=1 pipeline; Gen-6 uses terminal consolidation of a one-frame calibrated cascade episode.",
+        "Duplicate serial groups are candidate identity splits, not a human identity annotation."
+      ]
+    }
+  },
+  "elapsed_sec": 17064.635651696008
+}

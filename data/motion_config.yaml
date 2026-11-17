@@ -1,0 +1,113 @@
+# vehicle-plate-ocr-jp-v1 Motion Generator (Part 2) Configuration
+# Defines scenario distributions, vehicle dynamics, and camera setups.
+
+# Scenarios distribution
+scenario_weights:
+  straight_approach: 0.35      # 直進接近 (標準ゲート進入)
+  decelerate_stop: 0.25        # 減速して停止 (一時停止バー前)
+  stop_and_go: 0.15            # 停止状態からの再発進
+  curving_entry: 0.15          # カーブしながらの進入 (角度付きアクセス路)
+  switchback_reversing: 0.05   # 切り返し・後退調整
+  pass_through_rear: 0.05      # 退出車両 (リア側ナンバープレート)
+
+# Vehicle dynamics (construction site speeds: typically <= 20 km/h)
+speed_kmh:
+  min: 2.0
+  max: 25.0
+  typical_mean: 12.0
+  typical_std: 4.0
+
+# Camera extrinsics (Security pole / gantry setup)
+camera:
+  # Mounting height above ground (meters)
+  height_m:
+    min: 2.0
+    max: 3.6
+    default: 2.6
+  # Lateral offset from lane center (meters, positive = right side pole)
+  lateral_offset_m:
+    min: -1.6
+    max: 1.6
+    default: 1.0
+  # Gate line / stop bar distance along lane (meters)
+  gate_distance_m: 4.5
+  # Pitch angle (俯角 degrees down from horizontal, i-PRO recommended <= 30 deg)
+  pitch_deg:
+    min: 14.0
+    max: 26.0
+    default: 18.0
+  # Yaw angle (水平パン degrees toward approaching vehicle, i-PRO recommended <= 30 deg)
+  yaw_deg:
+    min: -14.0
+    max: 14.0
+    default: 4.0
+  # Roll angle (degrees slight pole tilt)
+  roll_deg:
+    min: -1.5
+    max: 1.5
+    default: 0.0
+
+# Camera intrinsics
+intrinsics:
+  resolutions:
+    - [1920, 1080]   # Full HD (1080p, most common)
+    - [1280, 720]    # 720p
+    - [3840, 2160]   # 4K
+  resolution_weights: [0.75, 0.20, 0.05]
+  # Horizontal Field of View (degrees, full 30 to 110 deg range)
+  fov_h_deg:
+    min: 30.0
+    max: 110.0
+    default: 55.0
+
+# Frame timing
+timing:
+  fps_choices: [10, 15, 20, 25, 29.97, 30]
+  fps_weights: [0.08, 0.15, 0.20, 0.22, 0.15, 0.20]
+  # Duration of sequence (seconds, full 1.0 to 8.0 s range)
+  duration_s:
+    min: 1.0
+    max: 8.0
+  # Timestamp jitter stddev (seconds)
+  jitter_std_s: 0.001
+  # Frame drop probability (network packet loss)
+  p_frame_drop: 0.02
+
+# Vehicle body context colors
+vehicle_colors:
+  - [240, 240, 242]  # White
+  - [35, 36, 38]     # Black / Dark Gray
+  - [180, 182, 186]  # Silver
+  - [100, 105, 115]  # Slate Gray
+  - [220, 180, 40]   # Construction Yellow / Amber
+  - [30, 60, 120]    # Navy
+  - [160, 40, 40]    # Dark Red
+
+# Arbitrary 360-degree multi-camera gate rig configuration
+multicam:
+  height_m:
+    min: 0.8         # Low temporary pipe mount
+    max: 8.0         # 2F site office prefab look-down
+  radius_m:
+    min: 3.8
+    max: 9.5
+  roll_deg:
+    min: -8.0
+    max: 8.0
+  wind_shake_deg:
+    min: 0.02
+    max: 0.30
+  clock_offset_s:
+    min: -0.15
+    max: 0.15
+  azimuth_zones_deg:
+    front: [-25.0, 25.0]
+    oblique: [25.0, 65.0]
+    pure_side: [70.0, 110.0]
+    oblique_rear: [115.0, 155.0]
+    rear: [155.0, 180.0]
+  rig_presets:
+    gate_standard_3cam: ["front", "oblique", "rear"]
+    construction_4cam_360: ["front", "oblique", "pure_side", "rear"]
+    side_and_front_2cam: ["front", "pure_side"]
+    front_rear_2cam: ["front", "rear"]

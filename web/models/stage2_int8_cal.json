@@ -1,0 +1,77 @@
+{
+  "stage": 2,
+  "policies": {
+    "0": {
+      "calibrated": true,
+      "cal_temp": 2.5441189931758985,
+      "cal_bias": 0.708767675846345,
+      "nll_before": 0.2588866605801842,
+      "nll_after": 0.13634068465008495,
+      "num_observations": 391,
+      "support_quantile": 1.5185086727142334,
+      "support_num_clips": 47,
+      "support_bounded": true
+    },
+    "1": {
+      "calibrated": true,
+      "cal_temp": 1.5965141546277064,
+      "cal_bias": 1.0065338385534572,
+      "nll_before": 0.10598030202353466,
+      "nll_after": 0.0787346174262209,
+      "num_observations": 387,
+      "support_quantile": 1.8245218992233276,
+      "support_num_clips": 48,
+      "support_bounded": true
+    },
+    "2": {
+      "calibrated": true,
+      "cal_temp": 1.7106466045676323,
+      "cal_bias": 2.2297180814784983,
+      "nll_before": 0.2743574743223259,
+      "nll_after": 0.11493513833485539,
+      "num_observations": 387,
+      "support_quantile": 1.6261897087097168,
+      "support_num_clips": 47,
+      "support_bounded": true
+    },
+    "3": {
+      "calibrated": true,
+      "cal_temp": 1.8484324059462776,
+      "cal_bias": -0.32992798618243435,
+      "nll_before": 0.12015505586539185,
+      "nll_after": 0.09528644542444366,
+      "num_observations": 371,
+      "support_quantile": 1.6458919048309326,
+      "support_num_clips": 48,
+      "support_bounded": true
+    }
+  },
+  "support_alpha": 0.05,
+  "support_unit": "positive_clip_max",
+  "support_scope": "all_retained_positive_proposals",
+  "prior_source": "per_policy_calibration_sampling_frequency",
+  "num_clips": 64,
+  "seed": 20260602,
+  "cal_temp": [
+    2.544118881225586,
+    1.596514105796814,
+    1.710646629333496,
+    1.8484324216842651
+  ],
+  "cal_bias": [
+    0.7087676525115967,
+    1.0065338611602783,
+    2.229717969894409,
+    -0.3299279808998108
+  ],
+  "pi_train": [
+    0.46035805344581604,
+    0.5374677181243896,
+    0.524547815322876,
+    0.47708895802497864
+  ],
+  "domain_split": "cal_holdout",
+  "distribution": "synthetic",
+  "onnx_path": "web/models/stage2.int8.onnx",
+  "calibrated_onnx_sha256": "5aa5b8c1db7dcd4e1124a262c5bf753ca83f87499dd3c33fbc0f892883630046"
+}

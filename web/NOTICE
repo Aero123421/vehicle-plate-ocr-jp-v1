@@ -1,0 +1,36 @@
+vehicle-plate-ocr-jp-v1 v0.6.5
+Copyright 2026 vehicle-plate-ocr-jp-v1 contributors.
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This distribution incorporates or adapts the following works:
+
+D-FINE
+https://github.com/Peterande/D-FINE
+Copyright (c) 2024 The D-FINE Authors (Yansong Peng, Hebei Li, Peixi Wu,
+Yueyi Zhang, Xiaoyan Sun, Feng Wu), University of Science and Technology of China.
+Licensed under the Apache License, Version 2.0.
+
+Hugging Face Transformers: HGNetV2 & D-FINE modeling port
+https://github.com/huggingface/transformers
+Copyright 2025 Baidu Inc. and The HuggingFace Inc. team.
+Licensed under the Apache License, Version 2.0.
+The self-contained modeling port and its modifications are described in
+THIRD_PARTY_NOTICES.md, whose original bytes are retained for model provenance.
+
+ONNX Runtime & onnxruntime-web
+https://github.com/microsoft/onnxruntime
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the MIT License. The browser runtime license is supplied at
+web/vendor/onnxruntime-web-LICENSE; its third-party notices are supplied alongside.
+
+Bundled Japanese Synthetic Rendering Fonts (data/fonts/)
+BIZ UDPGothic: Copyright 2022 The BIZ UDGothic Project Authors.
+M PLUS Rounded 1c: Copyright 2016 The Rounded M+ Project Authors.
+Zen Maru Gothic: Copyright 2021 The Zen Maru Gothic Project Authors.
+Licensed under the SIL Open Font License 1.1. See data/fonts/*-OFL.txt for
+complete, authoritative copyright and license notices for each font family.
+See also THIRD_PARTY_NOTICES.md for the preserved upstream attribution record.
+Fonts are used to render synthetic training/demo imagery; their licenses remain
+in effect independently of the Apache-2.0 project license.
+
+This NOTICE supplies attribution information and does not modify any license.

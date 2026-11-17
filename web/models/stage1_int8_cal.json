@@ -1,0 +1,16 @@
+{
+  "stage": 1,
+  "cal_temp": 1.3623236328196564,
+  "cal_bias": -0.6754588798978581,
+  "nll_before": 0.013902203094933568,
+  "nll_after": 0.012819390041801534,
+  "num_observations": 76800,
+  "num_positive": 482,
+  "num_clips": 24,
+  "seed": 20260601,
+  "target": "vehicle_query",
+  "domain_split": "cal_holdout",
+  "distribution": "synthetic",
+  "onnx_path": "web/models/temporal_det_nano.int8.onnx",
+  "calibrated_onnx_sha256": "cdd2553a3968f50c1c09acc402e3056774a3865574e75d1fb25ef7089e381dd7"
+}

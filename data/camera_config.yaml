@@ -1,0 +1,87 @@
+# vehicle-plate-ocr-jp-v1 Camera Simulator (Part 3) Configuration
+# Defines realistic optical, sensor, illumination, and compression degradation profiles.
+
+profiles:
+  - id: "day_standard_cctv"
+    name: "日中標準CCTV"
+    illumination: "day_clear"
+    shutter_speed_s: [0.0005, 0.002]   # 1/2000 to 1/500 s
+    gain_db: [0.0, 6.0]
+    subframe_samples: 5
+    enable_sharpening: true
+    sharpening_amount: [0.3, 0.7]
+    jpeg_quality_i: [78, 88]
+    jpeg_quality_p: [55, 70]
+    gop_size: 15
+    vignette_strength: 0.15
+    defocus_scale: 0.4
+
+  - id: "dusk_backlight_h264"
+    name: "夕方逆光・低ビットレート"
+    illumination: "backlight"
+    shutter_speed_s: [0.002, 0.008]   # 1/500 to 1/125 s
+    gain_db: [4.0, 12.0]
+    subframe_samples: 5
+    enable_sharpening: true
+    sharpening_amount: [0.5, 0.9]
+    jpeg_quality_i: [65, 78]
+    jpeg_quality_p: [40, 55]
+    gop_size: 20
+    vignette_strength: 0.25
+    defocus_scale: 0.6
+
+  - id: "night_ir_monochrome"
+    name: "夜間赤外線IR・高ゲイン"
+    illumination: "night_ir"
+    shutter_speed_s: [0.016, 0.033]   # 1/60 to 1/30 s (long shutter -> visible motion blur)
+    gain_db: [16.0, 26.0]              # high sensor grain
+    subframe_samples: 7
+    enable_sharpening: true
+    sharpening_amount: [0.6, 1.1]
+    jpeg_quality_i: [60, 75]
+    jpeg_quality_p: [38, 52]
+    gop_size: 15
+    vignette_strength: 0.30
+    defocus_scale: 0.8
+    ir_plate_reflectance_boost: 1.8   # retro-reflective license plate glow
+
+  - id: "night_headlights_color"
+    name: "夜間カラー・ヘッドライト反射"
+    illumination: "night_headlights"
+    shutter_speed_s: [0.012, 0.025]   # 1/80 to 1/40 s
+    gain_db: [14.0, 22.0]
+    subframe_samples: 7
+    enable_sharpening: true
+    sharpening_amount: [0.4, 0.8]
+    jpeg_quality_i: [62, 75]
+    jpeg_quality_p: [42, 56]
+    gop_size: 15
+    vignette_strength: 0.28
+    defocus_scale: 0.7
+
+  - id: "cloudy_rain_dirty"
+    name: "曇天雨天・レンズ水滴"
+    illumination: "day_cloudy"
+    shutter_speed_s: [0.002, 0.006]   # 1/500 to 1/160 s
+    gain_db: [3.0, 10.0]
+    subframe_samples: 5
+    enable_sharpening: true
+    sharpening_amount: [0.4, 0.7]
+    jpeg_quality_i: [70, 82]
+    jpeg_quality_p: [48, 62]
+    gop_size: 15
+    vignette_strength: 0.20
+    defocus_scale: 0.5
+    lens_dirt_prob: 0.8
+
+# Combinatorial random profile axis bounds for CameraSimulator.sample_random_profile
+combinatorial_axes:
+  ev_bias_range: [-1.5, 1.5]
+  ae_lag_alpha_range: [0.06, 0.50]
+  wb_temp_shift_range: [-0.85, 0.85]
+  wdr_strength_range: [0.0, 1.0]
+  temporal_nr_strength_range: [0.0, 0.80]
+  shutter_speed_s_range: [0.0005, 0.0667]  # 1/2000s to 1/15s independent of FPS
+  gain_db_range: [0.0, 28.0]
+  substream_scales: [1.0, 0.75, 0.5, 0.4]
+  glare_modes: ["none", "random_sweep", "complementary_rows", "full_washout"]
