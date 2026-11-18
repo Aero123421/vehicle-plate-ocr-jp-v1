@@ -19,17 +19,25 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
 import os
+from pathlib import Path
 import random
+from typing import Any
 
 os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 
+import cv2
 import numpy as np
+from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
 
 from vpocr_ocr.vocab import NUM_SLOTS, PlateVocab
 from vpocr_synth.plate.geometry import PlateGeometry
-from vpocr_synth.plate.glyph_dies import GlyphSDFAtlas, get_default_glyph_atlas
+from vpocr_synth.plate.glyph_dies import (
+    GlyphSDFAtlas,
+    get_default_glyph_atlas,
+    load_permissive_truetype,
+)
 from vpocr_synth.plate.models import PlateConfig, PlateSize, PlateText, PlateType
 
 EXT_H: int = 192
@@ -46,6 +54,220 @@ EXT_PLATE_CORNERS_XY: tuple[tuple[float, float], ...] = (
     (float(PAD_X + PLATE_W) - 0.5, float(PAD_Y + PLATE_H) - 0.5),  # BR: (351.5, 175.5)
     (float(PAD_X) - 0.5, float(PAD_Y + PLATE_H) - 0.5),        # BL: (31.5, 175.5)
 )
+
+_BUNDLED_FONTS_DIR = Path(__file__).resolve().parents[3] / "data" / "fonts"
+
+
+class NonPlateStencilAtlas:
+    """Cached `(48, 3, 96, 160)` atlas of Japanese text-bearing non-plate hard negatives.
+
+    Renders real Katakana/Kanji/digit roadside & vehicle-body stencils (`319` blue route shields,
+    `スケルトン車` painted door text, `最大積載量 5000kg` decals, single-row `春日 2503` stencils,
+    `50` speed rings, phone numbers, and shop-window/grille clutter) exclusively from bundled
+    SIL-OFL-1.1 fonts so `target_status == 1` (`UNREADABLE`) defeats text-bearing false positives.
+    """
+
+    ROI_H: int = 96
+    ROI_W: int = 160
+
+    def __init__(self) -> None:
+        self.templates_rgb: np.ndarray = self._build_templates()  # (48, 3, 96, 160) float32
+        self._device_cache: dict[torch.device, torch.Tensor] = {}
+
+    def to_torch(self, device: torch.device | str) -> torch.Tensor:
+        dev = torch.device(device)
+        cached = self._device_cache.get(dev)
+        if cached is None:
+            cached = torch.from_numpy(self.templates_rgb).to(dev, non_blocking=True)
+            self._device_cache[dev] = cached
+        return cached
+
+    @torch.no_grad()
+    def sample_crops(
+        self,
+        num_samples: int,
+        out_hw: tuple[int, int],
+        device: torch.device | str,
+        gen: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Sample `(N, 3, H, W)` augmented text-bearing non-plate crops on `device`."""
+        dev = torch.device(device)
+        bank = self.to_torch(dev)
+        k_tot = bank.shape[0]
+        n = max(1, int(num_samples))
+        if gen is not None and gen.device == dev:
+            idx = torch.randint(0, k_tot, (n,), generator=gen, device=dev)
+            r_u = torch.rand((n, 7), generator=gen, device=dev)
+        else:
+            idx = torch.randint(0, k_tot, (n,), generator=gen).to(dev)
+            r_u = torch.rand((n, 7), generator=gen).to(dev)
+
+        base = bank.index_select(0, idx)  # (N, 3, 96, 160)
+        h_out, w_out = int(out_hw[0]), int(out_hw[1])
+
+        # Mild affine scale/translation/shear so stencils appear at realistic Stage-2 crop offsets
+        sx = (0.80 + 0.36 * r_u[:, 0]).unsqueeze(1)
+        sy = (0.80 + 0.36 * r_u[:, 1]).unsqueeze(1)
+        sh = (-0.14 + 0.28 * r_u[:, 2]).unsqueeze(1)
+        tx = (-0.18 + 0.36 * r_u[:, 3]).unsqueeze(1)
+        ty = (-0.18 + 0.36 * r_u[:, 4]).unsqueeze(1)
+        zeros = torch.zeros_like(sx)
+        row0 = torch.cat([sx, sh, tx], dim=1)
+        row1 = torch.cat([zeros, sy, ty], dim=1)
+        theta = torch.stack([row0, row1], dim=1)  # (N, 2, 3)
+        grid = F.affine_grid(theta, size=[n, 3, h_out, w_out], align_corners=False)
+        warped = F.grid_sample(base, grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+        gain = (0.55 + 0.65 * r_u[:, 5]).view(n, 1, 1, 1)
+        is_ir = (r_u[:, 6] < 0.22).view(n, 1, 1, 1)
+        lit = (warped * gain).clamp(0.0, 1.0)
+        mono = (0.299 * lit[:, 0:1] + 0.587 * lit[:, 1:2] + 0.114 * lit[:, 2:3]).expand_as(lit)
+        return torch.where(is_ir, mono, lit)
+
+    @classmethod
+    def _build_templates(cls) -> np.ndarray:
+        h, w = cls.ROI_H, cls.ROI_W
+        font_paths = [
+            str(_BUNDLED_FONTS_DIR / "BIZUDPGothic-Bold.ttf"),
+            str(_BUNDLED_FONTS_DIR / "MPLUSRounded1c-Bold.ttf"),
+            str(_BUNDLED_FONTS_DIR / "ZenMaruGothic-Bold.ttf"),
+        ]
+        f_cache: dict[tuple[int, int], Any] = {}
+
+        def gf(fi: int, sz: int):
+            key = (fi % len(font_paths), sz)
+            if key not in f_cache:
+                f_cache[key] = load_permissive_truetype(font_paths[key[0]], size=sz, index=0)
+            return f_cache[key]
+
+        def draw_centered(draw: ImageDraw.ImageDraw, text: str, fnt: Any, cx: int, cy: int, fill: tuple[int, int, int]) -> None:
+            bb = draw.textbbox((0, 0), text, font=fnt)
+            tw, th = bb[2] - bb[0], bb[3] - bb[1]
+            draw.text((cx - tw // 2 - bb[0], cy - th // 2 - bb[1]), text, fill=fill, font=fnt)
+
+        templates: list[np.ndarray] = []
+
+        # 1. 12x Blue MLIT Route Shield / Highway Number Signs ("319", "246", "16", "4", etc.)
+        route_specs = [
+            ("国道", "319"), ("国道", "246"), ("国道", "16"), ("国道", "4"),
+            ("国道", "17"), ("国道", "254"), ("国道", "58"), ("国道", "1"),
+            ("県道", "43"), ("都道", "318"), ("R", "319"), ("ROUTE", "129"),
+        ]
+        for idx_r, (hdr, num) in enumerate(route_specs):
+            bg_v = 48 + (idx_r * 13) % 70
+            img = Image.new("RGB", (w, h), (bg_v, bg_v + 6, bg_v + 12))
+            dr = ImageDraw.Draw(img)
+            # Rounded blue shield / rectangular highway panel
+            pad_x = 18 if len(num) >= 3 else 26
+            dr.rounded_rectangle([pad_x, 8, w - pad_x, h - 8], radius=18, fill=(14, 72, 176), outline=(244, 246, 250), width=4)
+            draw_centered(dr, hdr, gf(idx_r, 15), w // 2, 24, (242, 245, 250))
+            draw_centered(dr, num, gf(idx_r + 1, 42 if len(num) <= 3 else 34), w // 2, 58, (248, 250, 252))
+            templates.append(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+
+        # 2. 14x Painted Truck Door / Tailgate Katakana & Kanji Decals ("スケルトン車", "最大積載量", etc.)
+        decal_specs = [
+            ("スケルトン車", "", (238, 240, 242), (24, 32, 42)),
+            ("スケルトン車", "", (28, 86, 52), (242, 244, 240)),
+            ("最大積載量 5000kg", "", (232, 234, 236), (22, 24, 26)),
+            ("最大積載量 3500kg", "", (36, 58, 108), (245, 245, 242)),
+            ("最大積載量", "2000kg", (228, 186, 32), (20, 20, 20)),
+            ("産業廃棄物収集運搬車", "", (240, 242, 240), (18, 62, 36)),
+            ("産業廃棄物", "第 013-3190 号", (42, 46, 52), (240, 242, 244)),
+            ("自家用", "", (235, 236, 238), (26, 28, 30)),
+            ("安全第一", "制限速度厳守", (242, 244, 240), (22, 92, 46)),
+            ("積載車", "架装番号 319", (196, 202, 208), (24, 26, 32)),
+            ("限定車", "SPECIAL", (32, 34, 38), (236, 204, 68)),
+            ("高圧ガス", "火気厳禁", (24, 26, 28), (238, 46, 38)),
+            ("回送車", "OUT OF SERVICE", (38, 42, 48), (246, 172, 36)),
+            ("作業中", "追突注意", (236, 198, 28), (22, 22, 22)),
+        ]
+        for idx_d, (line1, line2, bg_c, fg_c) in enumerate(decal_specs):
+            img = Image.new("RGB", (w, h), bg_c)
+            dr = ImageDraw.Draw(img)
+            # Subtle truck body panel seam line
+            dr.line([(0, 10), (w, 10)], fill=(max(0, bg_c[0] - 28), max(0, bg_c[1] - 28), max(0, bg_c[2] - 28)), width=2)
+            if line2:
+                sz1 = 24 if len(line1) <= 6 else 18
+                draw_centered(dr, line1, gf(idx_d, sz1), w // 2, 34, fg_c)
+                draw_centered(dr, line2, gf(idx_d + 1, 20), w // 2, 66, fg_c)
+            else:
+                sz1 = 28 if len(line1) <= 6 else (20 if len(line1) <= 9 else 14)
+                draw_centered(dr, line1, gf(idx_d, sz1), w // 2, h // 2, fg_c)
+            templates.append(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+
+        # 3. 10x Single-Row Fleet / Gate Stencils ("春日 2503", "社番 1082", etc. — strictly 1-row!)
+        stencil_specs = [
+            ("春日 2503", (62, 74, 66), (238, 240, 236)),
+            ("春日 3190", (226, 228, 230), (24, 28, 34)),
+            ("社番 1082", (38, 64, 112), (244, 244, 240)),
+            ("No. 319", (236, 236, 232), (26, 26, 28)),
+            ("品川 048", (184, 190, 196), (22, 24, 28)),
+            ("B-2503", (44, 48, 54), (242, 206, 48)),
+            ("営 5802", (26, 78, 48), (242, 244, 242)),
+            ("88-319", (212, 214, 218), (28, 30, 34)),
+            ("東 409", (52, 56, 62), (238, 240, 242)),
+            ("K-0319", (228, 184, 34), (24, 24, 24)),
+        ]
+        for idx_s, (txt_s, bg_c, fg_c) in enumerate(stencil_specs):
+            img = Image.new("RGB", (w, h), bg_c)
+            dr = ImageDraw.Draw(img)
+            if idx_s % 2 == 0:
+                dr.rectangle([8, 20, w - 8, h - 20], outline=fg_c, width=2)
+            draw_centered(dr, txt_s, gf(idx_s, 30), w // 2, h // 2, fg_c)
+            templates.append(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+
+        # 4. 8x Speed Limit Rings & Commercial Door Phone Numbers ("50", "40", "TEL 03-...", etc.)
+        sign_specs = [
+            ("ring", "50"), ("ring", "40"), ("ring", "60"), ("ring", "30"),
+            ("phone", "TEL 03-5912-3408"), ("phone", "0120-88-3190"),
+            ("phone", "FAX 06-6319-2503"), ("phone", "駐車禁止 NO PARKING"),
+        ]
+        for idx_p, (kind, txt_p) in enumerate(sign_specs):
+            if kind == "ring":
+                img = Image.new("RGB", (w, h), (76, 82, 88))
+                dr = ImageDraw.Draw(img)
+                r_c = 38
+                dr.ellipse([w // 2 - r_c, h // 2 - r_c, w // 2 + r_c, h // 2 + r_c], fill=(246, 246, 246), outline=(218, 28, 26), width=9)
+                draw_centered(dr, txt_p, gf(idx_p, 36), w // 2, h // 2, (24, 32, 48))
+            else:
+                bg_c = (240, 242, 244) if idx_p % 2 == 0 else (34, 42, 56)
+                fg_c = (22, 48, 118) if idx_p % 2 == 0 else (244, 244, 240)
+                img = Image.new("RGB", (w, h), bg_c)
+                dr = ImageDraw.Draw(img)
+                dr.rectangle([6, 14, w - 6, h - 14], outline=(204, 36, 32) if "駐車" in txt_p else fg_c, width=3)
+                draw_centered(dr, txt_p, gf(idx_p, 16), w // 2, h // 2, fg_c)
+            templates.append(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+
+        # 5. 4x Chrome Radiator Grilles & Mullion Window Clutter
+        for idx_g in range(4):
+            arr = np.zeros((3, h, w), dtype=np.float32)
+            yy, xx = np.meshgrid(np.linspace(0.0, 1.0, h, dtype=np.float32), np.linspace(0.0, 1.0, w, dtype=np.float32), indexing="ij")
+            if idx_g < 2:
+                slats = (np.sin(yy * math.pi * (10 + 6 * idx_g)) > 0.25).astype(np.float32)
+                posts = (np.sin(xx * math.pi * (8 + 4 * idx_g)) > 0.72).astype(np.float32)
+                lum = np.clip(0.10 + 0.62 * slats + 0.22 * posts, 0.0, 1.0)
+                arr[:] = lum[None]
+            else:
+                # Dark tinted cab glass + vertical window mullions + specular sky bar
+                mullion = (np.abs(np.sin(xx * math.pi * 5.0)) > 0.92).astype(np.float32)
+                sky_ref = np.exp(-((yy - 0.34 + 0.12 * xx) ** 2) / 0.018).astype(np.float32)
+                arr[0] = np.clip(0.12 + 0.55 * mullion + 0.28 * sky_ref, 0.0, 1.0)
+                arr[1] = np.clip(0.15 + 0.56 * mullion + 0.36 * sky_ref, 0.0, 1.0)
+                arr[2] = np.clip(0.20 + 0.58 * mullion + 0.48 * sky_ref, 0.0, 1.0)
+            templates.append(arr)
+
+        return np.stack(templates[:48], axis=0).astype(np.float32)
+
+
+_DEFAULT_STENCIL_ATLAS: NonPlateStencilAtlas | None = None
+
+
+def get_default_nonplate_stencil_atlas() -> NonPlateStencilAtlas:
+    """Return process-cached `NonPlateStencilAtlas` singleton."""
+    global _DEFAULT_STENCIL_ATLAS
+    if _DEFAULT_STENCIL_ATLAS is None:
+        _DEFAULT_STENCIL_ATLAS = NonPlateStencilAtlas()
+    return _DEFAULT_STENCIL_ATLAS
 
 
 @dataclass
@@ -115,6 +337,8 @@ class PlateSurface25DBuilder:
         c_red_ink = torch.tensor([0.86, 0.09, 0.09], device=dev).view(1, 3, 1, 1)
         c_bolt = torch.tensor([0.74, 0.76, 0.78], device=dev).view(1, 3, 1, 1)
         c_mud = torch.tensor([0.26, 0.21, 0.16], device=dev).view(1, 3, 1, 1)
+        c_salt = torch.tensor([0.76, 0.78, 0.77], device=dev).view(1, 3, 1, 1)
+        c_rust = torch.tensor([0.44, 0.21, 0.09], device=dev).view(1, 3, 1, 1)
         pat_cols = torch.tensor(
             [
                 [0.96, 0.62, 0.74],  # flower
@@ -187,13 +411,30 @@ class PlateSurface25DBuilder:
         slash_geom = torch.clamp((8.5 - dist_slash) * 1.2, 0.0, 1.0) * in_plate
         carbon_weave = (0.12 + 0.05 * torch.sin(xx_mm * 1.8) * torch.cos(yy_mm * 1.8))[None, None, :, :]
 
+        # Gravity-driven vertical bolt rust streaks below Medium (60, 270; y=25) & Large (75, 255; y=26.25) upper bolts
+        dy_r_med = (yy_mm - 26.5).clamp_min(0.0)
+        dx_r_med = torch.minimum(torch.abs(xx_mm - 60.0), torch.abs(xx_mm - 270.0))
+        rust_streak_med = (
+            torch.exp(-((dx_r_med / (3.2 - 0.03 * dy_r_med.clamp_max(55.0))) ** 2))
+            * torch.exp(-dy_r_med / 22.0)
+            * (yy_mm >= 25.5).float()
+        )[None, None, :, :] * in_plate
+        dy_r_lg = (yy_mm - 27.75).clamp_min(0.0)
+        dx_r_lg = torch.minimum(torch.abs(xx_mm - 75.0), torch.abs(xx_mm - 255.0))
+        rust_streak_lg = (
+            torch.exp(-((dx_r_lg / (3.6 - 0.03 * dy_r_lg.clamp_max(55.0))) ** 2))
+            * torch.exp(-dy_r_lg / 24.0)
+            * (yy_mm >= 26.75).float()
+        )[None, None, :, :] * in_plate
+
         cached = (
             xx_mm, yy_mm, x_p_1d, y_p_1d,
-            c_yel, c_grn, c_el_grn, c_el_amb, c_red_ink, c_bolt, c_mud, pat_cols,
+            c_yel, c_grn, c_el_grn, c_el_amb, c_red_ink, c_bolt, c_mud, c_salt, c_rust, pat_cols,
             sd_plate_mm, in_plate, grille_stripes, hood_geom, in_ribbon, rim_geom,
             d_left_bolt, d_right_bolt, h_left_bolt, h_right_bolt,
             d_left_bolt_lg, d_right_bolt_lg, h_left_bolt_lg, h_right_bolt_lg,
             d_bot_bolt_lg, h_bot_bolt_lg, slash_geom, carbon_weave,
+            rust_streak_med, rust_streak_lg,
         )
         self._coord_cache[dev] = cached
         return cached
@@ -230,11 +471,12 @@ class PlateSurface25DBuilder:
         atlas_t = self.atlas.to_torch(dev)  # (2, 8, 254, 64, 64) uint8
         (
             xx_mm, yy_mm, x_p_1d, y_p_1d,
-            c_yel, c_grn, c_el_grn, c_el_amb, c_red_ink, c_bolt, c_mud, pat_cols,
+            c_yel, c_grn, c_el_grn, c_el_amb, c_red_ink, c_bolt, c_mud, c_salt, c_rust, pat_cols,
             sd_plate_mm, in_plate, grille_stripes, hood_geom, in_ribbon, rim_geom,
             d_left_bolt, d_right_bolt, h_left_bolt, h_right_bolt,
             d_left_bolt_lg, d_right_bolt_lg, h_left_bolt_lg, h_right_bolt_lg,
             d_bot_bolt_lg, h_bot_bolt_lg, slash_geom, carbon_weave,
+            rust_streak_med, rust_streak_lg,
         ) = self._get_grids(dev)
 
         rng = random.Random(seed)
@@ -292,6 +534,10 @@ class PlateSurface25DBuilder:
         mud_lvl_np = np.zeros(bsz, dtype=np.float32)
         weather_np = np.zeros(bsz, dtype=np.float32)
         slash_nir_alpha_np = np.zeros(bsz, dtype=np.float32)
+        plate_rough_np = np.full(bsz, 0.26, dtype=np.float32)
+        frame_top_extra_np = np.zeros(bsz, dtype=np.float32)
+        rust_lvl_np = np.zeros(bsz, dtype=np.float32)
+        salt_dust_np = np.zeros(bsz, dtype=np.float32)
 
         is_large_np = np.zeros(bsz, dtype=bool)
         bot_bolt_mode_np = np.zeros(bsz, dtype=np.int64)   # 0=none, 1=raised M10 hex+washer (85%), 2=flush/unbolted hole (15%)
@@ -447,7 +693,7 @@ class PlateSurface25DBuilder:
                 w_txt = rng.uniform(0.86, 0.98) - 0.08 * weath
                 txt_rgb_np[b] = [w_txt, w_txt, w_txt - 0.02]
                 rim_rgb_np[b] = txt_rgb_np[b]
-                bg_nir_np[b] = rng.uniform(0.09, 0.21)
+                bg_nir_np[b] = rng.uniform(0.09, 0.48)
                 txt_nir_np[b] = rng.uniform(0.82, 0.93)
                 bg_retro_np[b] = 0.04
                 txt_retro_np[b] = rng.uniform(0.72, 0.90)
@@ -519,10 +765,24 @@ class PlateSurface25DBuilder:
                 else:
                     frame_h_np[b] = rng.uniform(3.5, 5.2)
                     frame_in_np[b] = rng.uniform(4.0, 6.5)
+                if rng.random() < 0.30:
+                    frame_top_extra_np[b] = rng.uniform(0.5, 5.0)
+
+            if polarity_np[b] < 0.0:
+                plate_rough_np[b] = rng.uniform(0.10, 0.30)
+            else:
+                plate_rough_np[b] = rng.uniform(0.12, 0.38)
+
+            if bolt_cap_r_np[b] > 0.1 and not is_temp_np[b]:
+                p_rust = 0.32 if (polarity_np[b] < 0.0 or weath > 0.10) else 0.14
+                if rng.random() < p_rust:
+                    rust_lvl_np[b] = rng.uniform(0.28, 0.88)
 
             bumper_depth_np[b] = rng.uniform(-8.0, -2.5)
             hood_h_np[b] = rng.uniform(8.0, 18.0) if rng.random() < 0.45 else 0.0
             mud_lvl_np[b] = float(cfg.mud_level)
+            if mud_lvl_np[b] > 1e-3 and polarity_np[b] < 0.0 and rng.random() < 0.52:
+                salt_dust_np[b] = 1.0
 
         any_graphic = bool(is_graphic_np.any())
         any_illum = bool(is_illum_np.any())
@@ -531,7 +791,7 @@ class PlateSurface25DBuilder:
         any_frame = bool((frame_type_np > 0).any())
         any_mud = bool((mud_lvl_np > 1e-3).any())
 
-        # Pack all per-plate float32 scalars into ONE contiguous (B, 23) tensor upload!
+        # Pack all per-plate float32 scalars into ONE contiguous (B, 27) tensor upload!
         float_pack_np = np.column_stack(
             [
                 bg_rgb_np,          # 0..2
@@ -551,6 +811,10 @@ class PlateSurface25DBuilder:
                 hood_h_np,          # 20
                 mud_lvl_np,         # 21
                 slash_nir_alpha_np, # 22
+                plate_rough_np,     # 23
+                frame_top_extra_np, # 24
+                rust_lvl_np,        # 25
+                salt_dust_np,       # 26
             ]
         ).astype(np.float32, copy=False)
         fp = torch.from_numpy(float_pack_np).to(dev)
@@ -572,6 +836,10 @@ class PlateSurface25DBuilder:
         hood_h = fp[:, 20:21, None, None]
         mud_lvl = fp[:, 21:22, None, None]
         slash_nir_alpha = fp[:, 22:23, None, None]
+        plate_rough = fp[:, 23:24, None, None]
+        frame_top_extra = fp[:, 24:25, None, None]
+        rust_lvl = fp[:, 25:26, None, None]
+        salt_dust = fp[:, 26:27, None, None]
 
         # Pack all per-plate int64 scalars into ONE contiguous (B, 26) tensor upload!
         int_pack_np = np.column_stack(
@@ -722,11 +990,13 @@ class PlateSurface25DBuilder:
             d_right_eff = torch.where(is_lg_t, d_right_bolt_lg, d_right_bolt)
             h_left_eff = torch.where(is_lg_t, h_left_bolt_lg, h_left_bolt)
             h_right_eff = torch.where(is_lg_t, h_right_bolt_lg, h_right_bolt)
+            rust_streak_eff = torch.where(is_lg_t, rust_streak_lg, rust_streak_med)
         else:
             d_left_eff = d_left_bolt
             d_right_eff = d_right_bolt
             h_left_eff = h_left_bolt
             h_right_eff = h_right_bolt
+            rust_streak_eff = rust_streak_med
 
         (
             albedo,
@@ -762,6 +1032,7 @@ class PlateSurface25DBuilder:
             h_bot_bolt_lg,
             slash_geom,
             carbon_weave,
+            rust_streak_eff,
             c_yel,
             c_grn,
             rim_rgb,
@@ -773,6 +1044,8 @@ class PlateSurface25DBuilder:
             c_red_ink,
             c_bolt,
             c_mud,
+            c_salt,
+            c_rust,
             graphic_rim,
             has_border,
             is_graphic,
@@ -789,6 +1062,10 @@ class PlateSurface25DBuilder:
             frame_in,
             mud_lvl,
             slash_nir_alpha,
+            plate_rough,
+            frame_top_extra,
+            rust_lvl,
+            salt_dust,
             warm_el,
             mud_low,
         )
@@ -1004,6 +1281,7 @@ def _compose_surface_tail_impl(
     h_bot_bolt_lg: torch.Tensor,
     slash_geom: torch.Tensor,
     carbon_weave: torch.Tensor,
+    rust_streak_geom: torch.Tensor,
     c_yel: torch.Tensor,
     c_grn: torch.Tensor,
     rim_rgb: torch.Tensor,
@@ -1015,6 +1293,8 @@ def _compose_surface_tail_impl(
     c_red_ink: torch.Tensor,
     c_bolt: torch.Tensor,
     c_mud: torch.Tensor,
+    c_salt: torch.Tensor,
+    c_rust: torch.Tensor,
     graphic_rim: torch.Tensor,
     has_border: torch.Tensor,
     is_graphic: torch.Tensor,
@@ -1031,6 +1311,10 @@ def _compose_surface_tail_impl(
     frame_in: torch.Tensor,
     mud_lvl: torch.Tensor,
     slash_nir_alpha: torch.Tensor,
+    plate_rough: torch.Tensor,
+    frame_top_extra: torch.Tensor,
+    rust_lvl: torch.Tensor,
+    salt_dust: torch.Tensor,
     warm_el: torch.Tensor,
     mud_low: torch.Tensor,
 ) -> tuple[
@@ -1054,7 +1338,7 @@ def _compose_surface_tail_impl(
     nir = surround_base.mean(dim=1, keepdim=True) * grille_stripes
     hood_mask = hood_geom * (hood_h > 0.0).float()
     height_mm = bumper_depth * (1.0 - in_plate) + hood_h * hood_mask
-    rough = 0.70 * (1.0 - in_plate) + 0.30 * in_plate
+    rough = 0.70 * (1.0 - in_plate) + plate_rough * in_plate
 
     yel_mask = (graphic_rim == 1)[:, None, None, None].float() * in_ribbon
     grn_mask = (graphic_rim == 2)[:, None, None, None].float() * in_ribbon
@@ -1076,8 +1360,15 @@ def _compose_surface_tail_impl(
     albedo = albedo * (1.0 - s_mask) + txt_rgb * s_mask
     nir = nir * (1.0 - s_mask) + txt_nir * s_mask
     retro = retro * (1.0 - s_mask) + txt_retro * s_mask
-    rough = rough * (1.0 - s_mask) + 0.24 * s_mask
+    rough = rough * (1.0 - s_mask) + 0.22 * s_mask
     height_mm = height_mm + 1.5 * emboss_bevel * in_plate * has_emboss[:, None, None, None].float()
+
+    # Vertical bolt rust streaks below upper mounting bolts
+    rust_alpha = (rust_streak_geom * rust_lvl * 0.78).clamp(0.0, 0.78)
+    albedo = albedo * (1.0 - rust_alpha) + c_rust * rust_alpha
+    nir = nir * (1.0 - 0.65 * rust_alpha) + 0.22 * (0.65 * rust_alpha)
+    retro = retro * (1.0 - 0.85 * rust_alpha)
+    rough = rough * (1.0 - rust_alpha) + 0.84 * rust_alpha
 
     illum_f = is_illum[:, None, None, None].float()
     el_col = (1.0 - warm_el) * c_el_grn + warm_el * c_el_amb
@@ -1088,7 +1379,7 @@ def _compose_surface_tail_impl(
     albedo = albedo * (1.0 - 0.94 * slash_mask) + c_red_ink * (0.94 * slash_mask)
     nir = nir * (1.0 - slash_nir_alpha * slash_mask) + 0.78 * (slash_nir_alpha * slash_mask)
     retro = retro * (1.0 - 0.55 * slash_mask)
-    occ_2d_ext = slash_mask
+    occ_2d_ext = torch.maximum(slash_mask, 0.55 * rust_alpha)
 
     has_bolts = (bolt_cap_r > 0.1).float()
     no_seal_f = (~has_seal)[:, None, None, None].float()
@@ -1137,9 +1428,10 @@ def _compose_surface_tail_impl(
 
     f_f = (frame_type > 0)[:, None, None, None].float()
     bot_extra = ((frame_type == 3)[:, None, None, None].float()) * 4.5 * (yy_mm[None, None, :, :] > 120.0).float()
+    top_extra = frame_top_extra * (yy_mm[None, None, :, :] < 34.0).float()
     in_frame = (
         torch.clamp((4.0 - sd_plate_mm) * 1.3, 0.0, 1.0)
-        * torch.clamp((sd_plate_mm + frame_in + bot_extra) * 1.3, 0.0, 1.0)
+        * torch.clamp((sd_plate_mm + frame_in + bot_extra + top_extra) * 1.3, 0.0, 1.0)
         * f_f
     )
     is_chrome = (frame_type == 1)[:, None, None, None].float()
@@ -1156,8 +1448,10 @@ def _compose_surface_tail_impl(
     mud_noise = F.interpolate(mud_low, size=(EXT_H, EXT_W), mode="bilinear", align_corners=False)
     lower_bias = torch.clamp((yy_mm[None, None, :, :] + 20.0) / 185.0, 0.2, 1.0)
     mud_alpha = torch.clamp((mud_noise * lower_bias - (1.0 - 0.85 * mud_lvl)) * 3.2, 0.0, 0.92) * (mud_lvl > 1e-3).float()
-    albedo = torch.clamp(albedo * (1.0 - mud_alpha) + c_mud * mud_alpha, 0.0, 1.0)
-    nir = torch.clamp(nir * (1.0 - mud_alpha) + 0.24 * mud_alpha, 0.0, 1.0)
+    grime_rgb = (1.0 - salt_dust) * c_mud + salt_dust * c_salt
+    grime_nir = (1.0 - salt_dust) * 0.24 + salt_dust * 0.68
+    albedo = torch.clamp(albedo * (1.0 - mud_alpha) + grime_rgb * mud_alpha, 0.0, 1.0)
+    nir = torch.clamp(nir * (1.0 - mud_alpha) + grime_nir * mud_alpha, 0.0, 1.0)
     retro = torch.clamp(retro * (1.0 - 0.95 * mud_alpha), 0.0, 1.0)
     rough = torch.clamp(rough * (1.0 - mud_alpha) + 0.88 * mud_alpha, 0.05, 1.0)
     metal = torch.clamp(metal, 0.0, 1.0)

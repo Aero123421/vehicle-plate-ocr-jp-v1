@@ -46,9 +46,34 @@ _JPEG_CHROMA_Q50 = [
 ]
 
 
+_H264_LUMA_Q4 = [
+    [13, 15, 20, 25],
+    [15, 19, 25, 31],
+    [20, 25, 32, 39],
+    [25, 31, 39, 48],
+]
+
+_H264_CHROMA_Q4 = [
+    [16, 20, 28, 42],
+    [20, 26, 38, 56],
+    [28, 38, 58, 78],
+    [42, 56, 78, 96],
+]
+
+
 def _build_dct8_matrix(dev: torch.device) -> torch.Tensor:
     """Build exact `8x8` orthonormal DCT-II matrix `D` (`D @ D^T == I`)."""
     n = 8
+    k = torch.arange(n, device=dev, dtype=torch.float32)[:, None]
+    i = torch.arange(n, device=dev, dtype=torch.float32)[None, :]
+    mat = torch.cos((math.pi / float(n)) * (i + 0.5) * k) * math.sqrt(2.0 / float(n))
+    mat[0, :] *= 1.0 / math.sqrt(2.0)
+    return mat
+
+
+def _build_dct4_matrix(dev: torch.device) -> torch.Tensor:
+    """Build exact `4x4` orthonormal DCT-II matrix `D4` (`D4 @ D4^T == I`) for H.264 4x4 transform."""
+    n = 4
     k = torch.arange(n, device=dev, dtype=torch.float32)[:, None]
     i = torch.arange(n, device=dev, dtype=torch.float32)[None, :]
     mat = torch.cos((math.pi / float(n)) * (i + 0.5) * k) * math.sqrt(2.0 / float(n))
@@ -86,17 +111,20 @@ def _optics_halation_blur_impl(
     x_defoc = _sep_blur5(x, k5_h, k5_v)
     x = x * (1.0 - defocus_amt) + x_defoc * defocus_amt
 
+    # Uniform 9-tap boxcar directional motion blur across [-0.5, +0.5] exposure trajectory (zero center spike!)
     mot_mag = torch.hypot(mv[:, 0], mv[:, 1])
-    has_mot = (mot_mag > 0.14)[:, None, None, None]
+    has_mot = (mot_mag > 0.12)[:, None, None, None]
     dx_n = mv[:, 0, None, None] * (2.0 / float(w_r))
     dy_n = mv[:, 1, None, None] * (2.0 / float(h_r))
-    g_neg = torch.stack([base_grid[..., 0] - 0.38 * dx_n, base_grid[..., 1] - 0.38 * dy_n], dim=-1)
-    g_pos = torch.stack([base_grid[..., 0] + 0.38 * dx_n, base_grid[..., 1] + 0.38 * dy_n], dim=-1)
-    x_neg = F.grid_sample(x, g_neg, mode="bilinear", padding_mode="border", align_corners=False)
-    x_pos = F.grid_sample(x, g_pos, mode="bilinear", padding_mode="border", align_corners=False)
-    x_mot = 0.50 * x + 0.25 * x_neg + 0.25 * x_pos
-    # Smooth continuous 1/15s..1/30s long-shutter smear when |mv| > 2.2 px
-    long_sh_w = torch.clamp((mot_mag - 2.2) * 0.22, 0.0, 0.52)[:, None, None, None]
+    bx = base_grid[..., 0]
+    by = base_grid[..., 1]
+    acc_mot = x
+    for tap_s in (-0.50, -0.375, -0.25, -0.125, 0.125, 0.25, 0.375, 0.50):
+        g_tap = torch.stack([bx + tap_s * dx_n, by + tap_s * dy_n], dim=-1)
+        acc_mot = acc_mot + F.grid_sample(x, g_tap, mode="bilinear", padding_mode="border", align_corners=False)
+    x_mot = acc_mot * (1.0 / 9.0)
+    # Smooth continuous long-shutter optical point-spread softening when |mv| > 3.2 px
+    long_sh_w = torch.clamp((mot_mag - 3.2) * 0.18, 0.0, 0.42)[:, None, None, None]
     x_mot = x_mot * (1.0 - long_sh_w) + _sep_blur5(x_mot, k5_h, k5_v) * long_sh_w
     out = torch.where(has_mot, x_mot, x)
     return out, defocus_amt.reshape(-1, 1)
@@ -208,6 +236,12 @@ def _sensor_noise_usm_impl(
     return torch.clamp(x + usm_amt * (x - x_blur), 0.0, 1.0)
 
 
+def _deadzone_quant(coeff: torch.Tensor, q_mat: torch.Tensor, dz_mask: torch.Tensor) -> torch.Tensor:
+    """H.264 / AVC dead-zone scalar quantizer `sign(c) * floor(relu(|c|/q - dz) + 0.5) * q`."""
+    mag_q = torch.floor(F.relu(coeff.abs() / q_mat - dz_mask) + 0.5)
+    return torch.sign(coeff) * mag_q * q_mat
+
+
 def _yuv420_dct8x8_impl(
     rgb: torch.Tensor,
     q_val: torch.Tensor,
@@ -217,7 +251,7 @@ def _yuv420_dct8x8_impl(
     q_luma: torch.Tensor,
     q_chroma: torch.Tensor,
 ) -> torch.Tensor:
-    """Exact `YUV420` (`NV12`) 2x2 chroma subsampling + `8x8` 2D DCT quantization on `(H_roi, W_roi)`."""
+    """Exact `YUV420` (`NV12`) 2x2 chroma subsampling + `8x8` 2D DCT quantization on `(H, W)` multiples of 16."""
     n_bt, _, h_r, w_r = rgb.shape
     bh_y, bw_y = h_r // 8, w_r // 8
     n_y_blk = bh_y * bw_y
@@ -236,7 +270,7 @@ def _yuv420_dct8x8_impl(
     cb_sub = F.avg_pool2d(cb_lvl, kernel_size=2, stride=2)
     cr_sub = F.avg_pool2d(cr_lvl, kernel_size=2, stride=2)
 
-    q_clamped = q_val.clamp(10.0, 95.0)
+    q_clamped = q_val.clamp(8.0, 95.0)
     scale = torch.where(q_clamped < 50.0, 5000.0 / q_clamped, 200.0 - 2.0 * q_clamped) / 100.0
     s_view = scale.view(n_bt, 1, 1, 1, 1)
 
@@ -273,6 +307,135 @@ def _yuv420_dct8x8_impl(
     g_out = (y_rec - 0.344136 * cb_up - 0.714136 * cr_up) / 255.0
     b_out = (y_rec + 1.772 * cb_up) / 255.0
     return torch.clamp(torch.cat([r_out, g_out, b_out], dim=1), 0.0, 1.0)
+
+
+def _yuv420_h264_mb_deadzone_impl(
+    rgb_in: torch.Tensor,
+    ox: torch.Tensor,
+    oy: torch.Tensor,
+    q_val: torch.Tensor,
+    ir_mode: torch.Tensor,
+    use_dct4: torch.Tensor,
+    dct8_m: torch.Tensor,
+    dct8_mt: torch.Tensor,
+    q8_luma: torch.Tensor,
+    q8_chroma: torch.Tensor,
+    dct4_m: torch.Tensor,
+    dct4_mt: torch.Tensor,
+    q4_luma: torch.Tensor,
+    q4_chroma: torch.Tensor,
+    dz8_intra: torch.Tensor,
+    dz4_intra: torch.Tensor,
+    is_residual: bool,
+) -> torch.Tensor:
+    """Sliding `(rx0 % 8, ry0 % 8)` macroblock `YUV420` + H.264 `8x8` & `4x4` dead-zone DCT."""
+    n_bt, _, h_orig, w_orig = rgb_in.shape
+    dev = rgb_in.device
+    h_p, w_p = h_orig + 16, w_orig + 16  # (112, 176), exact multiple of 16!
+
+    rgb_p8 = F.pad(rgb_in, (8, 8, 8, 8), mode="replicate")
+    yi_in = (torch.arange(h_p, device=dev)[None, :] + (8 - oy[:, None])).clamp(0, h_p - 1)
+    xi_in = (torch.arange(w_p, device=dev)[None, :] + (8 - ox[:, None])).clamp(0, w_p - 1)
+    sh_y = torch.gather(rgb_p8, 2, yi_in[:, None, :, None].expand(n_bt, 3, h_p, w_p))
+    rgb = torch.gather(sh_y, 3, xi_in[:, None, None, :].expand(n_bt, 3, h_p, w_p))
+
+    is_mono_ir = ir_mode > 0
+    r255 = rgb[:, 0:1] * 255.0
+    g255 = rgb[:, 1:2] * 255.0
+    b255 = rgb[:, 2:3] * 255.0
+
+    y_off = 0.0 if is_residual else 128.0
+    y_lvl = (0.299 * r255 + 0.587 * g255 + 0.114 * b255) - y_off
+    cb_lvl = -0.168736 * r255 - 0.331264 * g255 + 0.500 * b255
+    cr_lvl = 0.500 * r255 - 0.418688 * g255 - 0.081312 * b255
+
+    cb_sub = F.avg_pool2d(cb_lvl, kernel_size=2, stride=2)
+    cr_sub = F.avg_pool2d(cr_lvl, kernel_size=2, stride=2)
+
+    q_clamped = q_val.clamp(8.0, 95.0)
+    scale = torch.where(q_clamped < 50.0, 5000.0 / q_clamped, 200.0 - 2.0 * q_clamped) / 100.0
+    s_view = scale.view(n_bt, 1, 1, 1, 1)
+
+    dz8 = torch.full_like(dz8_intra, 0.34) if is_residual else dz8_intra
+    dz4 = torch.full_like(dz4_intra, 0.34) if is_residual else dz4_intra
+
+    # 8x8 High-Profile branch
+    bh8_y, bw8_y = h_p // 8, w_p // 8
+    n8_y = bh8_y * bw8_y
+    bh8_c, bw8_c = h_p // 16, w_p // 16
+    n8_c = bh8_c * bw8_c
+    ql8 = (q8_luma * s_view).clamp(1.0, 255.0).reshape(n_bt, 1, 8, 8)
+    qc8 = (q8_chroma * s_view).clamp(1.0, 255.0).reshape(n_bt, 1, 8, 8)
+
+    yb8 = y_lvl.reshape(n_bt, bh8_y, 8, bw8_y, 8).permute(0, 1, 3, 2, 4).reshape(n_bt, n8_y, 8, 8)
+    yd8 = torch.matmul(dct8_m, torch.matmul(yb8, dct8_mt))
+    yq8 = _deadzone_quant(yd8, ql8, dz8)
+    yr8 = (
+        torch.matmul(dct8_mt, torch.matmul(yq8, dct8_m))
+        .reshape(n_bt, bh8_y, bw8_y, 8, 8)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(n_bt, 1, h_p, w_p)
+    )
+
+    cbb8 = cb_sub.reshape(n_bt, bh8_c, 8, bw8_c, 8).permute(0, 1, 3, 2, 4).reshape(n_bt, n8_c, 8, 8)
+    crb8 = cr_sub.reshape(n_bt, bh8_c, 8, bw8_c, 8).permute(0, 1, 3, 2, 4).reshape(n_bt, n8_c, 8, 8)
+    cb8 = torch.cat([cbb8, crb8], dim=1)
+    cd8 = torch.matmul(dct8_m, torch.matmul(cb8, dct8_mt))
+    cq8 = _deadzone_quant(cd8, qc8, dz8)
+    cr8_blk = torch.matmul(dct8_mt, torch.matmul(cq8, dct8_m))
+    cbr8 = cr8_blk[:, :n8_c].reshape(n_bt, bh8_c, bw8_c, 8, 8).permute(0, 1, 3, 2, 4).reshape(n_bt, 1, h_p // 2, w_p // 2)
+    crr8 = cr8_blk[:, n8_c:].reshape(n_bt, bh8_c, bw8_c, 8, 8).permute(0, 1, 3, 2, 4).reshape(n_bt, 1, h_p // 2, w_p // 2)
+
+    # 4x4 H.264 Baseline/Main-Profile branch
+    bh4_y, bw4_y = h_p // 4, w_p // 4
+    n4_y = bh4_y * bw4_y
+    bh4_c, bw4_c = h_p // 8, w_p // 8
+    n4_c = bh4_c * bw4_c
+    ql4 = (q4_luma * s_view).clamp(1.0, 255.0).reshape(n_bt, 1, 4, 4)
+    qc4 = (q4_chroma * s_view).clamp(1.0, 255.0).reshape(n_bt, 1, 4, 4)
+
+    yb4 = y_lvl.reshape(n_bt, bh4_y, 4, bw4_y, 4).permute(0, 1, 3, 2, 4).reshape(n_bt, n4_y, 4, 4)
+    yd4 = torch.matmul(dct4_m, torch.matmul(yb4, dct4_mt))
+    yq4 = _deadzone_quant(yd4, ql4, dz4)
+    yr4 = (
+        torch.matmul(dct4_mt, torch.matmul(yq4, dct4_m))
+        .reshape(n_bt, bh4_y, bw4_y, 4, 4)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(n_bt, 1, h_p, w_p)
+    )
+
+    cbb4 = cb_sub.reshape(n_bt, bh4_c, 4, bw4_c, 4).permute(0, 1, 3, 2, 4).reshape(n_bt, n4_c, 4, 4)
+    crb4 = cr_sub.reshape(n_bt, bh4_c, 4, bw4_c, 4).permute(0, 1, 3, 2, 4).reshape(n_bt, n4_c, 4, 4)
+    cb4 = torch.cat([cbb4, crb4], dim=1)
+    cd4 = torch.matmul(dct4_m, torch.matmul(cb4, dct4_mt))
+    cq4 = _deadzone_quant(cd4, qc4, dz4)
+    cr4_blk = torch.matmul(dct4_mt, torch.matmul(cq4, dct4_m))
+    cbr4 = cr4_blk[:, :n4_c].reshape(n_bt, bh4_c, bw4_c, 4, 4).permute(0, 1, 3, 2, 4).reshape(n_bt, 1, h_p // 2, w_p // 2)
+    crr4 = cr4_blk[:, n4_c:].reshape(n_bt, bh4_c, bw4_c, 4, 4).permute(0, 1, 3, 2, 4).reshape(n_bt, 1, h_p // 2, w_p // 2)
+
+    u4_m = use_dct4[:, None, None, None]
+    y_rec = torch.where(u4_m, yr4, yr8) + y_off
+    cb_rec = torch.where(u4_m, cbr4, cbr8)
+    cr_rec = torch.where(u4_m, crr4, crr8)
+
+    c_rec = torch.cat([cb_rec, cr_rec], dim=0)
+    c_up = F.interpolate(c_rec, size=(h_p, w_p), mode="bilinear", align_corners=False)
+    ir_damp = torch.where(is_mono_ir[:, None, None, None], 0.15, 1.0)
+    cb_up = c_up[:n_bt] * ir_damp
+    cr_up = c_up[n_bt:] * ir_damp
+
+    r_out = (y_rec + 1.402 * cr_up) / 255.0
+    g_out = (y_rec - 0.344136 * cb_up - 0.714136 * cr_up) / 255.0
+    b_out = (y_rec + 1.772 * cb_up) / 255.0
+    rgb_rec = torch.cat([r_out, g_out, b_out], dim=1)
+
+    yi_out = (torch.arange(h_orig, device=dev)[None, :] + oy[:, None]).clamp(0, h_p - 1)
+    xi_out = (torch.arange(w_orig, device=dev)[None, :] + ox[:, None]).clamp(0, w_p - 1)
+    un_y = torch.gather(rgb_rec, 2, yi_out[:, None, :, None].expand(n_bt, 3, h_orig, w_p))
+    out = torch.gather(un_y, 3, xi_out[:, None, None, :].expand(n_bt, 3, h_orig, w_orig))
+    if is_residual:
+        return out.clamp(-1.0, 1.0)
+    return torch.clamp(out, 0.0, 1.0)
 
 
 def _tdnr_and_isp_tail_impl(
@@ -348,10 +511,20 @@ class SensorCodecGPU:
         q_luma = torch.tensor(_JPEG_LUMA_Q50, device=dev, dtype=torch.float32).view(1, 1, 8, 1, 8)
         q_chroma = torch.tensor(_JPEG_CHROMA_Q50, device=dev, dtype=torch.float32).view(1, 1, 8, 1, 8)
 
+        dct4_m = _build_dct4_matrix(dev)
+        dct4_mt = dct4_m.t().contiguous()
+        q4_luma = torch.tensor(_H264_LUMA_Q4, device=dev, dtype=torch.float32).view(1, 1, 4, 1, 4)
+        q4_chroma = torch.tensor(_H264_CHROMA_Q4, device=dev, dtype=torch.float32).view(1, 1, 4, 1, 4)
+
+        dz8_intra = torch.full((1, 1, 8, 8), 0.22, device=dev, dtype=torch.float32)
+        dz8_intra[0, 0, 0, 0] = 0.0
+        dz4_intra = torch.full((1, 1, 4, 4), 0.22, device=dev, dtype=torch.float32)
+        dz4_intra[0, 0, 0, 0] = 0.0
+
         gy = (torch.arange(SENSOR_ROI_H, device=dev, dtype=torch.float32) + 0.5) * (2.0 / float(SENSOR_ROI_H)) - 1.0
         gx = (torch.arange(SENSOR_ROI_W, device=dev, dtype=torch.float32) + 0.5) * (2.0 / float(SENSOR_ROI_W)) - 1.0
         yy, xx = torch.meshgrid(gy, gx, indexing="ij")
-        base_grid = torch.stack([xx, yy], dim=-1)[None]  # (1, 112, 176, 2)
+        base_grid = torch.stack([xx, yy], dim=-1)[None]  # (1, 96, 160, 2)
 
         g5_1d = torch.tensor([0.0625, 0.25, 0.375, 0.25, 0.0625], device=dev, dtype=torch.float32)
         k5_h = g5_1d.view(1, 1, 1, 5).expand(3, 1, 1, 5).contiguous()
@@ -359,9 +532,52 @@ class SensorCodecGPU:
         y_phase = torch.linspace(0.0, 1.0, SENSOR_ROI_H, device=dev)[None, None, :, None]
         xx_r = torch.linspace(0.0, 1.0, SENSOR_ROI_W, device=dev)[None, None, None, :]
 
-        out = (dct_m, dct_mt, q_luma, q_chroma, base_grid, k5_h, k5_v, y_phase, xx_r)
+        out = (
+            dct_m,
+            dct_mt,
+            q_luma,
+            q_chroma,
+            dct4_m,
+            dct4_mt,
+            q4_luma,
+            q4_chroma,
+            dz8_intra,
+            dz4_intra,
+            base_grid,
+            k5_h,
+            k5_v,
+            y_phase,
+            xx_r,
+        )
         self._cache[dev] = out
         return out
+
+    @torch.no_grad()
+    def apply_light_dct_crops(
+        self,
+        crops_flat: torch.Tensor,
+        ir_mode_flat: torch.Tensor,
+        gen: torch.Generator,
+        q_lo: float = 56.0,
+        q_hi: float = 86.0,
+    ) -> torch.Tensor:
+        """Apply light YUV420 + 8x8 DCT codec to `(N, 3, 80, 160)` close-up canonical crops."""
+        dev = crops_flat.device
+        tables = self._get_device_tables(dev)
+        dct_m, dct_mt, q_luma, q_chroma = tables[:4]
+        n_c = crops_flat.shape[0]
+        q_val = q_lo + (q_hi - q_lo) * torch.rand((n_c,), generator=gen, device=dev)
+        return _dispatch_codec_cuda(
+            "dct_light_crop",
+            _yuv420_dct8x8_impl,
+            crops_flat,
+            q_val,
+            ir_mode_flat,
+            dct_m,
+            dct_mt,
+            q_luma,
+            q_chroma,
+        )
 
     @torch.no_grad()
     def process_rois(
@@ -380,7 +596,23 @@ class SensorCodecGPU:
         dev = hdr.device
         stage = int(max(1, min(4, curriculum_stage)))
 
-        dct_m, dct_mt, q_luma, q_chroma, base_grid, k5_h, k5_v, y_phase, xx_r = self._get_device_tables(dev)
+        (
+            dct_m,
+            dct_mt,
+            q_luma,
+            q_chroma,
+            dct4_m,
+            dct4_mt,
+            q4_luma,
+            q4_chroma,
+            dz8_intra,
+            dz4_intra,
+            base_grid,
+            k5_h,
+            k5_v,
+            y_phase,
+            xx_r,
+        ) = self._get_device_tables(dev)
         gen = torch.Generator(device=dev)
         gen.manual_seed((seed * 2654435761 + 97531) & 0x7FFFFFFF)
         rng_py = random.Random(seed * 31 + 7)
@@ -479,18 +711,103 @@ class SensorCodecGPU:
         )
         del noise_rgb, row_fpn_raw, col_fpn_raw, plume_low
 
-        # 4. YUV420 (NV12) 2x2 Chroma Subsampling + Exact 8x8 2D DCT Codec
+        # 4. Sliding (rx0 % 8, ry0 % 8) Macroblock YUV420 + H.264 8x8 & 4x4 Dead-Zone DCT + P-Frame Residual Codec
         if jpeg_quality_override is not None:
             q_val = torch.full((n_bt,), float(jpeg_quality_override), device=dev)
         else:
-            q_lo = {1: 54.0, 2: 34.0, 3: 22.0, 4: 18.0}[stage]
-            q_hi = 78.0
-            q_val = q_lo + (q_hi - q_lo) * torch.rand((n_bt,), generator=gen, device=dev)
+            q_lo = {1: 50.0, 2: 28.0, 3: 10.0, 4: 8.0}[stage]
+            q_hi = 76.0
+            q_seq_base = q_lo + (q_hi - q_lo) * torch.rand((bsz, 1), generator=gen, device=dev)
+            q_jit = -4.0 + 8.0 * torch.rand((bsz, seq_len), generator=gen, device=dev)
+            q_val = (q_seq_base + q_jit).clamp(q_lo, q_hi).reshape(n_bt)
 
-        x = _dispatch_codec_cuda("dct", _yuv420_dct8x8_impl, x, q_val, ir_mode, dct_m, dct_mt, q_luma, q_chroma)
+        ox_flat = (traj.roi_origin_xy[..., 0].round().long() % 8).reshape(n_bt)
+        oy_flat = (traj.roi_origin_xy[..., 1].round().long() % 8).reshape(n_bt)
+        use_dct4_seq = (torch.rand((bsz, 1), generator=gen, device=dev) < (0.50 if stage >= 2 else 0.25)).expand(
+            bsz, seq_len
+        )
+        use_dct4_flat = use_dct4_seq.reshape(n_bt)
+
+        x_pre_bt = x.reshape(bsz, seq_len, 3, h_r, w_r)
+        x_iframe = _dispatch_codec_cuda(
+            "dct_h264_intra",
+            _yuv420_h264_mb_deadzone_impl,
+            x,
+            ox_flat,
+            oy_flat,
+            q_val,
+            ir_mode,
+            use_dct4_flat,
+            dct_m,
+            dct_mt,
+            q_luma,
+            q_chroma,
+            dct4_m,
+            dct4_mt,
+            q4_luma,
+            q4_chroma,
+            dz8_intra,
+            dz4_intra,
+            False,
+        ).reshape(bsz, seq_len, 3, h_r, w_r)
+
+        if seq_len >= 2 and stage >= 2 and jpeg_quality_override is None:
+            pframe_seq = torch.rand((bsz,), generator=gen, device=dev) < 0.62
+            ox_bt = ox_flat.reshape(bsz, seq_len)
+            oy_bt = oy_flat.reshape(bsz, seq_len)
+            q_bt = (q_val.reshape(bsz, seq_len) * 0.85).clamp(8.0, 76.0)
+            ir_bt = ir_mode.reshape(bsz, seq_len)
+            u4_bt = use_dct4_seq
+            rec_prev = x_iframe[:, 0]
+            out_frames = [rec_prev]
+            bx_0 = base_grid[..., 0]
+            by_0 = base_grid[..., 1]
+            for t_i in range(1, seq_len):
+                if (t_i % 8) == 0:
+                    rec_prev = x_iframe[:, t_i]
+                    out_frames.append(rec_prev)
+                    continue
+                drx = (traj.roi_origin_xy[:, t_i, 0] - traj.roi_origin_xy[:, t_i - 1, 0]).clamp(-28.0, 28.0)
+                dry = (traj.roi_origin_xy[:, t_i, 1] - traj.roi_origin_xy[:, t_i - 1, 1]).clamp(-28.0, 28.0)
+                g_mc = torch.stack(
+                    [
+                        bx_0 + drx[:, None, None] * (2.0 / float(w_r)),
+                        by_0 + dry[:, None, None] * (2.0 / float(h_r)),
+                    ],
+                    dim=-1,
+                )
+                pred_t = F.grid_sample(rec_prev, g_mc, mode="bilinear", padding_mode="border", align_corners=False)
+                res_t = x_pre_bt[:, t_i] - pred_t
+                res_rec_t = _dispatch_codec_cuda(
+                    "dct_h264_inter",
+                    _yuv420_h264_mb_deadzone_impl,
+                    res_t,
+                    ox_bt[:, t_i],
+                    oy_bt[:, t_i],
+                    q_bt[:, t_i],
+                    ir_bt[:, t_i],
+                    u4_bt[:, t_i],
+                    dct_m,
+                    dct_mt,
+                    q_luma,
+                    q_chroma,
+                    dct4_m,
+                    dct4_mt,
+                    q4_luma,
+                    q4_chroma,
+                    dz8_intra,
+                    dz4_intra,
+                    True,
+                )
+                p_rec_t = (pred_t + res_rec_t).clamp(0.0, 1.0)
+                can_p = pframe_seq & (traj.camera_ids[:, t_i] == traj.camera_ids[:, t_i - 1])
+                rec_prev = torch.where(can_p[:, None, None, None], p_rec_t, x_iframe[:, t_i])
+                out_frames.append(rec_prev)
+            x_seq = torch.stack(out_frames, dim=1)
+        else:
+            x_seq = x_iframe
 
         # 5. Fused Temporal 3DNR Ghosting + ISP Readability Multiplier
-        x_seq = x.reshape(bsz, seq_len, 3, h_r, w_r)
         r_tdnr = torch.rand((bsz, max(1, seq_len - 1)), generator=gen, device=dev)
         enable_tdnr = 1.0 if (seq_len >= 2 and stage >= 2) else 0.0
         roi_out, isp_mult = _dispatch_codec_cuda(

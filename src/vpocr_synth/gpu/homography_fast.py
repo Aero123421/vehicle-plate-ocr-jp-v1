@@ -44,14 +44,14 @@ REGIME_TO_ID: dict[str, int] = {name: i for i, name in enumerate(REGIME_NAMES)}
 
 # Progressive 4-stage curriculum sampling weights over REGIME_NAMES (length 14)
 STAGE_REGIME_WEIGHTS: dict[int, tuple[float, ...]] = {
-    # Stage 1: Clean/mild geometry + color/glyph/IR basics
-    1: (0.36, 0.08, 0.14, 0.05, 0.12, 0.06, 0.08, 0.02, 0.03, 0.02, 0.02, 0.00, 0.01, 0.01),
-    # Stage 2: Relief parallax, harsh shadows, 850/940nm IR, turn sweep, rejection intro
-    2: (0.18, 0.10, 0.10, 0.08, 0.11, 0.08, 0.07, 0.05, 0.06, 0.05, 0.04, 0.03, 0.025, 0.025),
-    # Stage 3: Heavy rain droplets, steep oblique, multicam, glare, track_mixed
-    3: (0.10, 0.09, 0.07, 0.10, 0.10, 0.09, 0.07, 0.09, 0.08, 0.06, 0.05, 0.04, 0.03, 0.03),
-    # Stage 4: Full hard real-world OOD envelope
-    4: (0.08, 0.08, 0.06, 0.09, 0.10, 0.09, 0.07, 0.09, 0.09, 0.07, 0.06, 0.05, 0.035, 0.035),
+    # Stage 1: Clean/mild geometry + color/glyph/IR basics + 4% negative_garbage
+    1: (0.34, 0.08, 0.14, 0.05, 0.12, 0.06, 0.07, 0.02, 0.03, 0.02, 0.02, 0.00, 0.01, 0.04),
+    # Stage 2: Relief parallax, harsh shadows, 850/940nm IR, turn sweep, 8% negative_garbage
+    2: (0.15, 0.09, 0.09, 0.08, 0.10, 0.08, 0.07, 0.05, 0.06, 0.05, 0.04, 0.03, 0.03, 0.08),
+    # Stage 3: Heavy rain droplets, steep oblique, multicam, glare, track_mixed, 11% negative_garbage
+    3: (0.08, 0.08, 0.06, 0.09, 0.09, 0.08, 0.07, 0.08, 0.07, 0.06, 0.05, 0.04, 0.04, 0.11),
+    # Stage 4: Full hard real-world OOD envelope + 12% negative_garbage
+    4: (0.06, 0.07, 0.06, 0.08, 0.09, 0.08, 0.06, 0.08, 0.08, 0.07, 0.06, 0.05, 0.04, 0.12),
 }
 
 
@@ -82,7 +82,9 @@ class TrajectoryBatch:
     regime_ids: torch.Tensor             # (B,) int64
     regime_tags: list[str]               # length B
     primary_sides_cpu: list[int]         # length B (0=front, 1=rear on final/primary frame, zero GPU sync!)
-    is_approach: torch.Tensor | None = None  # (B,) bool (True on far-blurry -> close-sharp approach trajectories)
+    is_approach: torch.Tensor | None = None   # (B,) bool (True on 13..22px -> 78..138px approach trajectories)
+    is_lowres_sr: torch.Tensor | None = None  # (B,) bool (True on persistent 12..28px multi-frame SR trajectories)
+    w_target_px: torch.Tensor | None = None   # (B, T) float32 projected sensor plate width in pixels
 
 
 _HOMOG_DEV_CACHE: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -162,6 +164,7 @@ def sample_se3_trajectories(
     device: torch.device | str = "cpu",
     seed: int = 0,
     approach_prob: float | None = None,
+    lowres_sr_prob: float | None = None,
 ) -> TrajectoryBatch:
     """Sample vectorized continuous 3D SE(3) trajectories across `T` frames on `device`."""
     dev = torch.device(device)
@@ -237,33 +240,56 @@ def sample_se3_trajectories(
     stay_tilt = (u_rand[:, 10] < 0.20).float() * (5.0 + u_rand[:, 11] * 6.0)
     pitch_eff_deg = (pitch_deg - stay_tilt[:, None]).clamp(-32.0, 55.0)
 
-    # 2. Target sensor plate width scale (24..130 px standard; 14..24 px -> 60..110 px on approach trajectories)
-    min_w_px = {1: 56.0, 2: 38.0, 3: 28.0, 4: 24.0}[stage]
+    # 2. Target sensor plate width scale:
+    #    - 28% persistent `distant_lowres_sr` (LogUniform(12.0, 26.0) -> [12.0, 28.0] across ALL T frames
+    #      with continuous non-integer sub-pixel translation 0.22..1.45 px/frame sweeping [0, 1)^2 phase!)
+    #    - 27% `approach_far_to_near` (13..22 px -> 78..138 px)
+    #    - 45% `standard_multiscale` (28..130 px)
+    min_w_px = {1: 56.0, 2: 38.0, 3: 28.0, 4: 28.0}[stage]
     max_w_px = 130.0
     w_start = min_w_px + u_rand[:, 12] * (max_w_px - min_w_px)
     approaching = torch.where(u_rand[:, 13] < 0.65, 1.0, -1.0)
     w_end = (w_start * (1.0 + approaching * (0.14 + 0.24 * u_rand[:, 14]))).clamp(min_w_px, max_w_px)
     w_target_px = w_start[:, None] + (w_end - w_start)[:, None] * t_norm
 
-    # Distant-blurry-to-closeup-sharp approach curriculum (~30% when seq_len >= 8 & stage >= 2):
-    # first 70% of frames stay at 14..24 px distant low-acuity; final 30% ramp smoothly to 60..110 px crisp close-up!
+    if lowres_sr_prob is not None:
+        eff_lr_p = float(lowres_sr_prob) if seq_len >= 2 else 0.0
+    elif approach_prob is not None and float(approach_prob) <= 0.0:
+        eff_lr_p = 0.0
+    elif stage >= 3 and regime_override is None and seq_len >= 2:
+        eff_lr_p = 0.28
+    elif stage == 2 and regime_override is None and seq_len >= 2:
+        eff_lr_p = 0.16
+    else:
+        eff_lr_p = 0.0
+
     if approach_prob is None:
-        eff_app_p = (0.30 if seq_len >= 8 else 0.20) if (stage >= 2 and regime_override is None and seq_len >= 4) else 0.0
+        eff_app_p = (0.27 if stage >= 3 else 0.24) if (stage >= 2 and regime_override is None and seq_len >= 4) else 0.0
     else:
         eff_app_p = float(approach_prob) if seq_len >= 3 else 0.0
+    eff_app_p = min(eff_app_p, max(0.0, 1.0 - eff_lr_p))
+
     u_app = torch.rand((batch_size, 4), generator=gen, device=cpu_dev)
-    can_app = (
+    u_lr = torch.rand((batch_size, 6), generator=gen, device=cpu_dev)
+    can_scale_spec = (
         (reg_ids_cpu != REGIME_TO_ID["negative_garbage"])
         & (reg_ids_cpu != REGIME_TO_ID["multicam_rgb_ir"])
         & (reg_ids_cpu != REGIME_TO_ID["track_mixed"])
     )
-    is_approach_cpu = can_app & (u_app[:, 0] < eff_app_p)
-    w_far0 = (14.5 + 5.5 * u_app[:, 1])[:, None]
-    w_far1 = w_far0 + (2.0 + 3.5 * u_app[:, 2])[:, None]
+    can_lr_sr = reg_ids_cpu != REGIME_TO_ID["negative_garbage"]
+    is_lowres_sr_cpu = can_lr_sr & (u_app[:, 0] < eff_lr_p)
+    is_approach_cpu = can_scale_spec & (~is_lowres_sr_cpu) & (u_app[:, 0] < (eff_lr_p + eff_app_p))
+
+    # Persistent 12..26px low-res super-resolution trajectory
+    w_lr_start = 12.0 * torch.pow(26.0 / 12.0, u_lr[:, 0:1])
+    w_lr_end = (w_lr_start * (0.94 + 0.16 * u_lr[:, 1:2])).clamp(12.0, 28.0)
+    w_lr_px = w_lr_start + (w_lr_end - w_lr_start) * t_norm
+
+    # Far-to-near approach trajectory (13..22px -> 78..138px)
+    w_far0 = (13.0 + 6.0 * u_app[:, 1])[:, None]
+    w_far1 = (w_far0 + (1.5 + 2.5 * u_app[:, 2])[:, None]).clamp_max(22.0)
     cos_end = torch.cos(yaw_deg[:, -1:] * (math.pi / 180.0)).clamp_min(0.58)
-    w_near = ((80.0 + 44.0 * u_app[:, 3])[:, None] / cos_end).clamp(80.0, 145.0)
-    # >=70% of approach sequences follow a continuous smooth 16px -> 85px+ log-perspective scale ramp;
-    # remaining ~30% retain late-acceleration approach diversity.
+    w_near = ((78.0 + 52.0 * u_app[:, 3])[:, None] / cos_end).clamp(78.0, 138.0)
     use_smooth_ramp = (u_app[:, 2:3] < 0.72)
     s_smooth = torch.pow(t_norm.clamp(0.0, 1.0), 1.48)
     w_app_smooth = w_far0 * torch.pow((w_near / w_far0).clamp_min(1.2), s_smooth)
@@ -274,20 +300,39 @@ def sample_se3_trajectories(
         t_norm < 0.70, w_far0 + (w_far1 - w_far0) * tau_far, w_far1 + (w_near - w_far1) * r_near
     )
     w_app_px = torch.where(use_smooth_ramp, w_app_smooth, w_app_two_stage)
-    w_target_px = torch.where(is_approach_cpu[:, None], w_app_px, w_target_px)
+    w_target_px = torch.where(
+        is_lowres_sr_cpu[:, None],
+        w_lr_px,
+        torch.where(is_approach_cpu[:, None], w_app_px, w_target_px),
+    )
 
     fx = torch.full((batch_size, seq_len), 1400.0, device=cpu_dev, dtype=torch.float32)
     fy = fx
     cx_cam = torch.full_like(fx, 960.0)
     cy_cam = torch.full_like(fx, 540.0)
-    depth_mm = (fx * 330.0 / w_target_px.clamp_min(13.5)).clamp(2400.0, 36000.0)
+    depth_mm = (fx * 330.0 / w_target_px.clamp_min(11.5)).clamp(2400.0, 42000.0)
 
     tx0_mm = (u_rand[:, 14] * 2.0 - 1.0) * 650.0
     ty0_mm = (u_rand[:, 15] * 2.0 - 1.0) * 320.0
     vx_mm = (torch.rand((batch_size,), generator=gen, device=cpu_dev) * 2.0 - 1.0) * (180.0 + 120.0 * stage)
     vy_mm = (torch.rand((batch_size,), generator=gen, device=cpu_dev) * 2.0 - 1.0) * (70.0 + 40.0 * stage)
-    tx_mm = tx0_mm[:, None] + vx_mm[:, None] * t_norm
-    ty_mm = ty0_mm[:, None] + vy_mm[:, None] * t_norm
+    tx_std_mm = tx0_mm[:, None] + vx_mm[:, None] * t_norm
+    ty_std_mm = ty0_mm[:, None] + vy_mm[:, None] * t_norm
+
+    # Genuine sub-pixel inter-frame phase sweep (0.22..1.45 px/frame across [0, 1)^2) for lowres_sr!
+    spd_pf = 0.22 + 1.23 * u_lr[:, 2:3]
+    ang_pf = (0.18 + 0.64 * u_lr[:, 3:4]) * (0.5 * math.pi)
+    sgn_x = torch.where(u_lr[:, 4:5] < 0.5, -1.0, 1.0)
+    sgn_y = torch.where(u_lr[:, 5:6] < 0.5, -1.0, 1.0)
+    t_steps = torch.arange(seq_len, device=cpu_dev, dtype=torch.float32)[None, :]
+    phi_sub = u_lr[:, 0:1] * (2.0 * math.pi)
+    du_sub_px = u_lr[:, 4:5] + sgn_x * spd_pf * torch.cos(ang_pf) * t_steps + 0.19 * torch.sin(t_steps * 1.618034 + phi_sub)
+    dv_sub_px = u_lr[:, 5:6] + sgn_y * spd_pf * torch.sin(ang_pf) * t_steps + 0.17 * torch.cos(t_steps * 2.236068 + phi_sub)
+    mm_per_px = depth_mm / fx
+    tx_lr_mm = tx0_mm[:, None] * 0.35 + du_sub_px * mm_per_px
+    ty_lr_mm = ty0_mm[:, None] * 0.35 + dv_sub_px * mm_per_px
+    tx_mm = torch.where(is_lowres_sr_cpu[:, None], tx_lr_mm, tx_std_mm)
+    ty_mm = torch.where(is_lowres_sr_cpu[:, None], ty_lr_mm, ty_std_mm)
 
     # 3. Multi-camera & Track-mixed frame scheduling
     fps = 10.0 + torch.rand((batch_size, 1), generator=gen, device=cpu_dev) * 20.0
@@ -402,19 +447,24 @@ def sample_se3_trajectories(
     motion_vec_px = (vel_px * shutter_frac.unsqueeze(-1)).clamp(-9.0, 9.0)
     if stage >= 2:
         # Simulate 1/15s..1/30s long-shutter directional smear on ~24% of RGB sequences & far approach phase
+        # (Keep persistent `distant_lowres_sr` on its genuine sub-pixel exposure blur so phase shifts survive!)
         u_shut = torch.rand((batch_size, 3), generator=gen, device=cpu_dev)
         ang_sh = u_shut[:, 1] * (2.0 * math.pi)
         dir_sh = torch.stack([torch.cos(ang_sh), 0.45 * torch.sin(ang_sh)], dim=-1)[:, None, :]
-        has_long_sh = (~is_ir) & (
+        has_long_sh = (~is_ir) & (~is_lowres_sr_cpu[:, None]) & (
             (is_approach_cpu[:, None] & (t_norm < 0.70))
             | ((~is_approach_cpu[:, None]) & (u_shut[:, 0:1] < 0.24))
         )
         mag_sh = (1.8 + 3.4 * torch.rand((batch_size, seq_len, 1), generator=gen, device=cpu_dev))
         near_sharp = is_approach_cpu[:, None] & (t_norm >= 0.74)
         motion_vec_px = torch.where(
-            near_sharp[:, :, None],
-            motion_vec_px * 0.28,
-            torch.where(has_long_sh[:, :, None], (motion_vec_px * 0.45 + dir_sh * mag_sh).clamp(-9.0, 9.0), motion_vec_px),
+            is_lowres_sr_cpu[:, None, None],
+            motion_vec_px.clamp(-1.4, 1.4),
+            torch.where(
+                near_sharp[:, :, None],
+                motion_vec_px * 0.28,
+                torch.where(has_long_sh[:, :, None], (motion_vec_px * 0.45 + dir_sh * mag_sh).clamp(-9.0, 9.0), motion_vec_px),
+            ),
         )
     rs_gain = 0.06 + 0.12 * torch.rand((batch_size, seq_len, 1), generator=gen, device=cpu_dev)
     rolling_shutter_px = (vel_px * rs_gain).clamp(-4.5, 4.5)
@@ -448,6 +498,7 @@ def sample_se3_trajectories(
                 yaw_deg.unsqueeze(-1),
                 pitch_eff_deg.unsqueeze(-1),
                 roll_deg.unsqueeze(-1),
+                w_target_px.unsqueeze(-1),
             ],
             dim=-1,
         ).to(dev)
@@ -465,6 +516,7 @@ def sample_se3_trajectories(
         yaw_deg = f_pack[..., 44]
         pitch_eff_deg = f_pack[..., 45]
         roll_deg = f_pack[..., 46]
+        w_target_out = f_pack[..., 47]
 
         i_pack = torch.stack(
             [camera_ids, plate_sides, ir_mode, is_night.long(), splice_mask.long()],
@@ -476,14 +528,20 @@ def sample_se3_trajectories(
         is_night = i_pack[..., 3].bool()
         splice_mask = i_pack[..., 4].bool()
 
-        b_pack = torch.stack([reg_ids_cpu, mc_front_rear_cpu.long(), is_approach_cpu.long()], dim=-1).to(dev)
+        b_pack = torch.stack(
+            [reg_ids_cpu, mc_front_rear_cpu.long(), is_approach_cpu.long(), is_lowres_sr_cpu.long()],
+            dim=-1,
+        ).to(dev)
         reg_ids = b_pack[:, 0]
         mc_front_rear = b_pack[:, 1].bool()
         is_approach = b_pack[:, 2].bool()
+        is_lowres_sr = b_pack[:, 3].bool()
     else:
         reg_ids = reg_ids_cpu
         mc_front_rear = mc_front_rear_cpu
         is_approach = is_approach_cpu
+        is_lowres_sr = is_lowres_sr_cpu
+        w_target_out = w_target_px
 
     return TrajectoryBatch(
         R_c2p=R_c2p,
@@ -510,6 +568,8 @@ def sample_se3_trajectories(
         regime_tags=tags,
         primary_sides_cpu=primary_sides_cpu,
         is_approach=is_approach,
+        is_lowres_sr=is_lowres_sr,
+        w_target_px=w_target_out,
     )
 
 

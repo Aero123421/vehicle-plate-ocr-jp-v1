@@ -98,35 +98,83 @@ def _perturb_corners_core_impl(
     plate_sides: torch.Tensor,
     l_ar: torch.Tensor,
     eps_unit: torch.Tensor,
+    dof_seq_u: torch.Tensor,
+    dof_bt_n: torch.Tensor,
     top_recess_u: torch.Tensor,
     sigma_mult: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    bsz, t_len, _, _ = gt_roi.shape
-    w_top = torch.linalg.norm(gt_roi[:, :, 1] - gt_roi[:, :, 0], dim=-1)
-    w_bot = torch.linalg.norm(gt_roi[:, :, 2] - gt_roi[:, :, 3], dim=-1)
-    h_left = torch.linalg.norm(gt_roi[:, :, 3] - gt_roi[:, :, 0], dim=-1)
-    h_right = torch.linalg.norm(gt_roi[:, :, 2] - gt_roi[:, :, 1], dim=-1)
-    w_px = (0.5 * (w_top + w_bot)).clamp_min(8.0)
-    h_px = (0.5 * (h_left + h_right)).clamp_min(4.0)
-    sigma = (w_px * sigma_mult).clamp(0.18, 2.2)[:, :, None, None]
+    stage_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Structured 8-DOF Stage-2 quad homography perturbation in normalized `(u, v)` + ROI space.
 
-    eps_flat = (eps_unit * sigma).reshape(bsz, t_len, 8)
-    ar_noise = torch.matmul(l_ar, eps_flat).reshape(bsz, t_len, 4, 2)
+    Combines:
+      1. Global canonical translation jitter (`±6.5px` X, `±5.0px` Y in `160x80` space),
+      2. Independent 4-edge margins `[m_left, m_right, m_top, m_bot]` in `[-0.03, +0.12]`,
+      3. Residual horizontal/vertical keystone (trapezoid) + parallelogram shear skew,
+      4. Temporal AR(1) per-corner sub-pixel drift + rear-seal / recessed top-lip bias.
+    """
+    bsz, t_len, _, _ = gt_roi.shape
+    u_top = gt_roi[:, :, 1] - gt_roi[:, :, 0]
+    u_bot = gt_roi[:, :, 2] - gt_roi[:, :, 3]
+    v_left = gt_roi[:, :, 3] - gt_roi[:, :, 0]
+    v_right = gt_roi[:, :, 2] - gt_roi[:, :, 1]
+    u_vec = 0.5 * (u_top + u_bot)
+    v_vec = 0.5 * (v_left + v_right)
+    w_px = (0.5 * (torch.linalg.norm(u_top, dim=-1) + torch.linalg.norm(u_bot, dim=-1))).clamp_min(8.0)
+
+    # 1. Temporal AR(1) correlated 8-DOF noise + per-corner sub-pixel jitter
+    dof_ar = torch.matmul(l_ar, dof_bt_n) * (0.34 * stage_scale)  # (B, T, 9)
+
+    # Global translation jitter: ±6.5px / 160 in X, ±5.0px / 80 in Y
+    tx_seq = ((dof_seq_u[:, 0:1] * 2.0 - 1.0) * (6.5 / 160.0)) * stage_scale
+    ty_seq = ((dof_seq_u[:, 1:2] * 2.0 - 1.0) * (5.0 / 80.0)) * stage_scale
+    tx_bt = (tx_seq + dof_ar[:, :, 0] * (3.2 / 160.0)).clamp(-7.5 / 160.0, 7.5 / 160.0)
+    ty_bt = (ty_seq + dof_ar[:, :, 1] * (2.6 / 80.0)).clamp(-6.0 / 80.0, 6.0 / 80.0)
+
+    # Independent 4-edge margins relative to base margin_ratio=0.05:
+    # 55% full wide [-0.03, +0.12], 45% tight [0.025, 0.075]
+    use_wide = (dof_seq_u[:, 2:3] < 0.55) & (stage_scale > 0.6)
+    m_wide = -0.03 + 0.15 * dof_seq_u[:, 3:7]   # (B, 4) in [-0.03, +0.12]
+    m_tight = 0.025 + 0.050 * dof_seq_u[:, 3:7]  # (B, 4) in [0.025, 0.075]
+    m_edges = torch.where(use_wide, m_wide, m_tight)
+    dm_seq = (m_edges - 0.05) * stage_scale  # (B, 4): [left, right, top, bot]
+    dm_l = (dm_seq[:, 0:1] + dof_ar[:, :, 2] * 0.018).clamp(-0.082, 0.075)
+    dm_r = (dm_seq[:, 1:2] + dof_ar[:, :, 3] * 0.018).clamp(-0.082, 0.075)
+    dm_t = (dm_seq[:, 2:3] + dof_ar[:, :, 4] * 0.020).clamp(-0.082, 0.075)
+    dm_b = (dm_seq[:, 3:4] + dof_ar[:, :, 5] * 0.020).clamp(-0.082, 0.075)
+
+    # Residual keystone / trapezoid & shear skew
+    kh = (((dof_seq_u[:, 7:8] * 2.0 - 1.0) * 0.026) * stage_scale + dof_ar[:, :, 6] * 0.014).clamp(-0.036, 0.036)
+    kv = (((dof_seq_u[:, 8:9] * 2.0 - 1.0) * 0.032) * stage_scale + dof_ar[:, :, 7] * 0.016).clamp(-0.042, 0.042)
+    sh = (((dof_seq_u[:, 9:10] * 2.0 - 1.0) * 0.020) * stage_scale + dof_ar[:, :, 8] * 0.010).clamp(-0.028, 0.028)
+
+    # Per-corner independent AR(1) sub-pixel residual normalized to plate width
+    sigma_u = (sigma_mult * (w_px / w_px.clamp_min(12.0))).clamp(0.004, 0.022)[:, :, None, None]
+    ar_c = torch.matmul(l_ar, (eps_unit * sigma_u).reshape(bsz, t_len, 8)).reshape(bsz, t_len, 4, 2)
 
     has_rear_seal = (has_seal[:, None] & (plate_sides == 1)).float()
-    seal_pull = torch.zeros_like(ar_noise)
-    seal_pull[:, :, 0, 0] = has_rear_seal * (0.012 * w_px)
-    seal_pull[:, :, 0, 1] = has_rear_seal * (0.008 * w_px)
+    recess_frac = ((top_recess_u - 0.82) / 0.18).clamp(0.0, 1.0) * 0.082 * stage_scale
 
-    # Simulate recessed dump-truck / rear-gate top bumper lip pulling TL/TR downward on ~18% of sequences
-    recess_frac = ((top_recess_u - 0.82) / 0.18).clamp(0.0, 1.0) * 0.082  # (B, 1) in [0, 0.082]
-    recess_dy = recess_frac * h_px
-    seal_pull[:, :, 0, 1] = seal_pull[:, :, 0, 1] + recess_dy
-    seal_pull[:, :, 1, 1] = seal_pull[:, :, 1, 1] + recess_dy
+    # Assemble [TL, TR, BR, BL] normalized (du, dv)
+    du_tl = tx_bt - dm_l - kh - 0.5 * sh + has_rear_seal * 0.012
+    du_tr = tx_bt + dm_r + kh - 0.5 * sh
+    du_br = tx_bt + dm_r - kh + 0.5 * sh
+    du_bl = tx_bt - dm_l + kh + 0.5 * sh
 
-    noisy_roi = gt_roi + ar_noise + seal_pull
+    dv_tl = ty_bt - dm_t - kv + has_rear_seal * 0.016 + recess_frac
+    dv_tr = ty_bt - dm_t + kv + recess_frac
+    dv_br = ty_bt + dm_b - kv
+    dv_bl = ty_bt + dm_b + kv
+
+    du_struct = torch.stack([du_tl, du_tr, du_br, du_bl], dim=-1)
+    dv_struct = torch.stack([dv_tl, dv_tr, dv_br, dv_bl], dim=-1)
+    uv_delta = torch.stack([du_struct, dv_struct], dim=-1) + torch.stack(
+        [ar_c[..., 0], ar_c[..., 1] * 1.4], dim=-1
+    )
+
+    delta_roi = uv_delta[..., 0:1] * u_vec[:, :, None, :] + uv_delta[..., 1:2] * v_vec[:, :, None, :]
+    noisy_roi = gt_roi + delta_roi
     noisy_full = noisy_roi + roi_origin_xy[:, :, None, :]
-    return noisy_roi, noisy_full
+    return noisy_roi, noisy_full, uv_delta
 
 
 def _overhang_umbra_roi_impl(
@@ -200,9 +248,13 @@ def _assemble_targets_tail_impl(
     valid_seq = (~is_temp_seq) & (~is_garb_seq)
     frame_valid_mask = valid_seq[:, None].expand(bsz, t_len).float()
 
-    # Attenuate optical readability on distant sub-Nyquist approach frames (`g0 < +0.15` for 40mm Kanji)
-    res_upper = ((geom_g0 + 0.92) / 1.07).clamp(0.08, 1.0).unsqueeze(-1)
-    res_lower = ((geom_g0 + 1.15) / 0.45).clamp(0.32, 1.0).unsqueeze(-1)
+    # Attenuate single-frame optical readability on distant sub-Nyquist frames (`0.06` floor when `g0 < -0.75`)
+    res_upper = ((geom_g0 + 0.78) / 0.93).clamp(0.05, 1.0).unsqueeze(-1)
+    res_lower = torch.where(
+        geom_g0 < -0.75,
+        0.06 + 0.08 * ((geom_g0 + 1.25) / 0.50).clamp(0.0, 1.0),
+        ((geom_g0 + 0.83) / 0.58).clamp(0.14, 1.0),
+    ).clamp(0.06, 1.0).unsqueeze(-1)
     res_mult = torch.cat([res_upper.expand(bsz, t_len, 7), res_lower.expand(bsz, t_len, 5)], dim=-1)
 
     raw_read = ((1.0 - occ_total) * contrast_survival * isp_readability_mult * res_mult).clamp(0.0, 1.0)
@@ -214,7 +266,9 @@ def _assemble_targets_tail_impl(
     slot_readability = (raw_propagated * frame_valid_mask[:, :, None]).clamp(0.0, 1.0)
     slot_glare = (shaded_slot_glare * frame_valid_mask[:, :, None]).clamp(0.0, 1.0)
 
-    wiped_out = slot_readability.amax(dim=(1, 2)) < 0.18
+    # Multi-frame L2 SNR integration so persistent 12..26px SR bursts (`T >= 4`) stay READABLE (`status = 0`)
+    # while genuinely wiped-out or single-frame sub-Nyquist crops become UNREADABLE (`status = 1`).
+    wiped_out = torch.linalg.vector_norm(slot_readability, ord=2, dim=1).amax(dim=-1) < 0.095
     target_status = torch.zeros_like(regime_ids)
     target_status = torch.where(is_temp_seq | is_garb_seq | wiped_out, torch.ones_like(target_status), target_status)
     target_status = torch.where(is_mixed_seq, torch.full_like(target_status, 2), target_status)
@@ -224,66 +278,38 @@ def _assemble_targets_tail_impl(
 def _livecam_multiscale_tone_impl(
     crops_flat: torch.Tensor,
     noisy_full_corners: torch.Tensor,
-    crisp_base: torch.Tensor,
+    c_crisp: torch.Tensor,
     is_monochrome_ir: torch.Tensor,
     regime_ids: torch.Tensor,
     is_approach: torch.Tensor,
+    is_lowres_sr: torch.Tensor,
     has_overhang: torch.Tensor,
     wb_b: torch.Tensor,
-    illum_coefs: torch.Tensor,
-    usm_hi_b: torch.Tensor,
-    sigma_hi: torch.Tensor,
-    hi_noise: torch.Tensor,
     u_seq: torch.Tensor,
     tone_rands: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Photometric RGB white-balance `[0.72, 1.28]` + tone/shadow curves + close-up `c_crisp` branch.
+
+    NOTE: All optical resolution bottlenecking (`12..32px`) now runs BEFORE `SensorCodecGPU`
+    so H.264 `8x8`/`4x4` DCT blocks, P-frame residuals, `YUV420` chroma bleed, USM halos,
+    and sensor shot/read noise survive intact into the rectified canonical crop!
+    """
     bsz, t_len = is_monochrome_ir.shape
     n_bt, _, h_t, w_t = crops_flat.shape
     dev = crops_flat.device
+    del h_t, w_t
 
-    c_xfar = F.interpolate(
-        F.interpolate(crops_flat, size=(18, 34), mode="bilinear", align_corners=False),
-        size=(h_t, w_t),
-        mode="bilinear",
-        align_corners=False,
-    )
-    c_far = F.interpolate(
-        F.interpolate(crops_flat, size=(22, 42), mode="bilinear", align_corners=False),
-        size=(h_t, w_t),
-        mode="bilinear",
-        align_corners=False,
-    )
-    c_mid = F.interpolate(
-        F.interpolate(crops_flat, size=(28, 54), mode="bilinear", align_corners=False),
-        size=(h_t, w_t),
-        mode="bilinear",
-        align_corners=False,
-    )
-    c_semi = F.interpolate(
-        F.interpolate(crops_flat, size=(38, 72), mode="bilinear", align_corners=False),
-        size=(h_t, w_t),
-        mode="bilinear",
-        align_corners=False,
-    )
-
-    wb_norm = wb_b / wb_b.mean(dim=1, keepdim=True).clamp_min(1e-4)
-    gx = torch.linspace(-0.5, 0.5, w_t, device=dev, dtype=torch.float32).view(1, 1, 1, w_t)
-    gy = torch.linspace(-0.5, 0.5, h_t, device=dev, dtype=torch.float32).view(1, 1, h_t, 1)
-    illum_b = (
-        (0.94 + 0.12 * illum_coefs[:, 0:1])
-        + (-0.08 + 0.16 * illum_coefs[:, 1:2]) * gx
-        + (-0.08 + 0.16 * illum_coefs[:, 2:3]) * gy
-    )
-    crisp_wb_b = (crisp_base * wb_norm * illum_b).clamp(0.0, 1.0)
-    blur3_b = F.avg_pool2d(F.pad(crisp_wb_b, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
-    crisp_sharp_b = (crisp_wb_b + usm_hi_b * (crisp_wb_b - blur3_b)).clamp(0.0, 1.0)
-    crisp_bt = crisp_sharp_b[:, None, :, :, :].expand(bsz, t_len, 3, h_t, w_t).reshape(n_bt, 3, h_t, w_t)
-    c_crisp = (crisp_bt + (hi_noise * sigma_hi).float()).clamp(0.0, 1.0)
+    is_mono_flat = (is_monochrome_ir > 0.5).reshape(n_bt, 1, 1, 1)
+    wb_norm_b = wb_b / wb_b.mean(dim=1, keepdim=True).clamp_min(1e-4)
+    wb_bt = wb_norm_b[:, None].expand(bsz, t_len, 3, 1, 1).reshape(n_bt, 3, 1, 1)
+    do_wb = (u_seq < 0.68).expand(bsz, t_len).reshape(n_bt, 1, 1, 1) & (~is_mono_flat)
+    crops_wb = torch.where(do_wb, (crops_flat * wb_bt).clamp(0.0, 1.0), crops_flat)
 
     t_idx = torch.arange(t_len, device=dev).unsqueeze(0)
     half_t = max(1, t_len // 2)
     reg_2d = regime_ids[:, None].expand(bsz, t_len)
     not_app_bt = (~is_approach)[:, None].expand(bsz, t_len)
+    not_lr_bt = (~is_lowres_sr)[:, None].expand(bsz, t_len)
     not_ovh_bt = (~has_overhang)[:, None].expand(bsz, t_len)
     can_crisp_bt = (
         (is_monochrome_ir < 0.5)
@@ -292,69 +318,151 @@ def _livecam_multiscale_tone_impl(
         & (reg_2d != 11)
         & (reg_2d != 13)
         & not_app_bt
+        & not_lr_bt
         & not_ovh_bt
     )
-    use_xfar_bt = not_app_bt & (u_seq < 0.08) & (t_idx < half_t)
-    use_far_bt = not_app_bt & (((u_seq < 0.08) & (t_idx >= half_t)) | ((u_seq >= 0.08) & (u_seq < 0.19) & (t_idx < half_t)))
-    use_mid_bt = not_app_bt & (((u_seq >= 0.08) & (u_seq < 0.19) & (t_idx >= half_t)) | ((u_seq >= 0.19) & (u_seq < 0.34)))
-    use_semi_bt = not_app_bt & (u_seq >= 0.34) & (u_seq < 0.48)
     use_crisp_bt = can_crisp_bt & (
-        ((u_seq >= 0.74) & (u_seq < 0.86) & (t_idx >= half_t)) | (u_seq >= 0.86)
+        ((u_seq >= 0.78) & (u_seq < 0.88) & (t_idx >= half_t)) | (u_seq >= 0.88)
     )
-
-    use_xfar_flat = use_xfar_bt.reshape(n_bt, 1, 1, 1)
-    use_far_flat = use_far_bt.reshape(n_bt, 1, 1, 1)
-    use_mid_flat = use_mid_bt.reshape(n_bt, 1, 1, 1)
-    use_semi_flat = use_semi_bt.reshape(n_bt, 1, 1, 1)
     use_crisp_flat = use_crisp_bt.reshape(n_bt, 1, 1, 1)
-    crops_lr = torch.where(
-        use_crisp_flat,
-        c_crisp,
-        torch.where(
-            use_xfar_flat,
-            c_xfar,
-            torch.where(
-                use_far_flat,
-                c_far,
-                torch.where(use_mid_flat, c_mid, torch.where(use_semi_flat, c_semi, crops_flat)),
-            ),
-        ),
-    )
+    crops_sel = torch.where(use_crisp_flat, c_crisp, crops_wb)
 
     ones_bt = torch.ones((bsz, t_len), device=dev, dtype=noisy_full_corners.dtype)
-    scale_bt = torch.where(
-        use_crisp_bt,
-        torch.full_like(ones_bt, 2.15),
-        torch.where(
-            use_xfar_bt,
-            torch.full_like(ones_bt, 0.24),
-            torch.where(
-                use_far_bt,
-                torch.full_like(ones_bt, 0.30),
-                torch.where(
-                    use_mid_bt,
-                    torch.full_like(ones_bt, 0.41),
-                    torch.where(use_semi_bt, torch.full_like(ones_bt, 0.56), ones_bt),
-                ),
-            ),
-        ),
-    )
+    scale_bt = torch.where(use_crisp_bt, torch.full_like(ones_bt, 2.15), ones_bt)
     c_center = noisy_full_corners.mean(dim=(1, 2), keepdim=True)
     scaled_corners = c_center + (noisy_full_corners - c_center) * scale_bt[:, :, None, None]
 
     do_tone = tone_rands[:, 0:1] < 0.40
-    do_shadow = (tone_rands[:, 0:1] >= 0.40) & (tone_rands[:, 0:1] < 0.54) & (is_monochrome_ir.reshape(n_bt, 1, 1, 1) < 0.5)
+    do_shadow = (tone_rands[:, 0:1] >= 0.40) & (tone_rands[:, 0:1] < 0.54) & (~is_mono_flat)
     gamma = 0.78 + 0.46 * tone_rands[:, 1:2]
     gain = 0.78 + 0.38 * tone_rands[:, 2:3]
     pedestal = -0.03 + 0.10 * tone_rands[:, 3:4]
-    c_gam = crops_lr.clamp(1e-4, 1.0).pow(gamma)
+    c_gam = crops_sel.clamp(1e-4, 1.0).pow(gamma)
     toned = (0.5 + gain * (c_gam - 0.5) + pedestal).clamp(0.0, 1.0)
     # Daytime shadowed rear-door exposure mode (e.g. shadowed microbus/truck plate in bright outdoor scene)
     sh_gain = 0.26 + 0.26 * tone_rands[:, 2:3]
     sh_tint = torch.tensor([0.93, 0.98, 1.07], device=dev, dtype=torch.float32).view(1, 3, 1, 1)
-    shadowed = (crops_lr.clamp(1e-4, 1.0).pow(1.12 + 0.28 * tone_rands[:, 1:2]) * sh_gain * sh_tint + 0.015 * tone_rands[:, 3:4]).clamp(0.0, 1.0)
-    crops_out = torch.where(do_tone, toned, torch.where(do_shadow, shadowed, crops_lr))
+    shadowed = (
+        crops_sel.clamp(1e-4, 1.0).pow(1.12 + 0.28 * tone_rands[:, 1:2]) * sh_gain * sh_tint
+        + 0.015 * tone_rands[:, 3:4]
+    ).clamp(0.0, 1.0)
+    crops_out = torch.where(do_tone, toned, torch.where(do_shadow, shadowed, crops_sel))
     return crops_out, scaled_corners
+
+
+_DRIZZLE_TABLES_CACHE: dict[tuple[torch.device, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_drizzle_tables(dev: torch.device, h_c: int, w_c: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    key = (dev, h_c, w_c)
+    cached = _DRIZZLE_TABLES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    yy = (torch.arange(h_c, device=dev, dtype=torch.float32) + 0.5) * (2.0 / float(h_c)) - 1.0
+    xx = (torch.arange(w_c, device=dev, dtype=torch.float32) + 0.5) * (2.0 / float(w_c)) - 1.0
+    gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+    base_grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)  # (1, H, W, 2)
+    dx_list: list[float] = []
+    dy_list: list[float] = []
+    for dy_i in (-1, 0, 1):
+        for dx_i in (-2, -1, 0, 1, 2):
+            dx_list.append(float(dx_i))
+            dy_list.append(float(dy_i))
+    dx_tab = torch.tensor(dx_list, device=dev, dtype=torch.float32).view(1, 15)
+    dy_tab = torch.tensor(dy_list, device=dev, dtype=torch.float32).view(1, 15)
+    _DRIZZLE_TABLES_CACHE[key] = (base_grid, dx_tab, dy_tab)
+    return base_grid, dx_tab, dy_tab
+
+
+def _rolling_canonical_drizzle_impl(
+    crops: torch.Tensor,
+    noisy_full_corners: torch.Tensor,
+    camera_ids: torch.Tensor,
+    enable_seq: torch.Tensor,
+) -> torch.Tensor:
+    """Rolling multi-frame sub-pixel canonical Drizzle super-resolution accumulator (`w_t < 54px`).
+
+    Gates accumulation by inner-plate luminance `zncc >= 0.56` + same-camera check, and decays
+    stale low-res history by `(w_ema / w_t)^3` during rapid far-to-near vehicle approaches.
+    """
+    bsz, t_len, _, h_c, w_c = crops.shape
+    if t_len < 2 or h_c < 32 or w_c < 64:
+        return crops
+    dev = crops.device
+    base_grid, dx_tab, dy_tab = _get_drizzle_tables(dev, h_c, w_c)
+
+    w_top = torch.linalg.norm(noisy_full_corners[:, :, 1] - noisy_full_corners[:, :, 0], dim=-1)
+    w_bot = torch.linalg.norm(noisy_full_corners[:, :, 2] - noisy_full_corners[:, :, 3], dim=-1)
+    w_t = (0.5 * (w_top + w_bot)).clamp_min(4.0)
+
+    y0 = max(2, int(round(0.125 * h_c)))
+    y1 = min(h_c - 2, int(round(0.875 * h_c)))
+    x0 = max(3, int(round(0.10 * w_c)))
+    x1 = min(w_c - 3, int(round(0.90 * w_c)))
+
+    driz_img = crops[:, 0]
+    driz_wt = torch.ones((bsz,), device=dev, dtype=torch.float32)
+    w_ema = w_t[:, 0]
+    out_frames = [driz_img]
+    bx0 = base_grid[..., 0]
+    by0 = base_grid[..., 1]
+
+    for t_i in range(1, t_len):
+        cur = crops[:, t_i]
+        wt_cur = w_t[:, t_i]
+        do_driz = enable_seq & (wt_cur < 54.0) & (camera_ids[:, t_i] == camera_ids[:, t_i - 1])
+
+        lum_cur = (0.299 * cur[:, 0] + 0.587 * cur[:, 1] + 0.114 * cur[:, 2])[:, y0:y1:2, x0:x1:2]
+        lc_flat = lum_cur.reshape(bsz, 1, -1)
+        lc_zm = lc_flat - lc_flat.mean(dim=-1, keepdim=True)
+        lc_u = lc_zm / lc_zm.norm(dim=-1, keepdim=True).clamp_min(1e-4)
+
+        lum_prev = 0.299 * driz_img[:, 0] + 0.587 * driz_img[:, 1] + 0.114 * driz_img[:, 2]
+        lp_pad = F.pad(lum_prev.unsqueeze(1), (2, 2, 1, 1), mode="replicate").squeeze(1)
+        cand_patches: list[torch.Tensor] = []
+        for dy_i in (-1, 0, 1):
+            sy0 = y0 + 1 - dy_i
+            sy1 = y1 + 1 - dy_i
+            for dx_i in (-2, -1, 0, 1, 2):
+                sx0 = x0 + 2 - dx_i
+                sx1 = x1 + 2 - dx_i
+                cand_patches.append(lp_pad[:, sy0:sy1:2, sx0:sx1:2].reshape(bsz, -1))
+        lp_stack = torch.stack(cand_patches, dim=1)  # (B, 15, P)
+        lp_zm = lp_stack - lp_stack.mean(dim=-1, keepdim=True)
+        lp_u = lp_zm / lp_zm.norm(dim=-1, keepdim=True).clamp_min(1e-4)
+
+        zncc_all = (lc_u * lp_u).sum(dim=-1)  # (B, 15)
+        best_zncc = zncc_all.amax(dim=-1)
+        w_soft = F.softmax((zncc_all - best_zncc[:, None]) * 28.0, dim=-1)
+        dx_sub = (w_soft * dx_tab).sum(dim=-1)
+        dy_sub = (w_soft * dy_tab).sum(dim=-1)
+
+        g_shift = torch.stack(
+            [
+                bx0 - dx_sub[:, None, None] * (2.0 / float(w_c)),
+                by0 - dy_sub[:, None, None] * (2.0 / float(h_c)),
+            ],
+            dim=-1,
+        )
+        driz_aligned = F.grid_sample(
+            driz_img, g_shift, mode="bilinear", padding_mode="border", align_corners=False
+        )
+
+        gate_ok = do_driz & (best_zncc >= 0.56)
+        decay = ((w_ema / wt_cur).clamp(0.0, 1.15) ** 3) * 0.88
+        w_prior = (driz_wt * decay).clamp(0.0, 4.5)
+        new_wt = w_prior + 1.0
+        blended = (w_prior[:, None, None, None] * driz_aligned + cur) / new_wt[:, None, None, None]
+        blur3 = F.avg_pool2d(F.pad(blended, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+        sr_gain = (0.16 * (w_prior / new_wt))[:, None, None, None]
+        blended_sr = (blended + sr_gain * (blended - blur3)).clamp(0.0, 1.0)
+
+        driz_img = torch.where(gate_ok[:, None, None, None], blended_sr, cur)
+        driz_wt = torch.where(gate_ok, new_wt, torch.ones_like(driz_wt))
+        w_ema = torch.where(gate_ok, (w_prior * w_ema + wt_cur) / new_wt, wt_cur)
+        out_frames.append(torch.where(do_driz[:, None, None, None], driz_img, cur))
+
+    return torch.stack(out_frames, dim=1)
 
 
 def _compute_geom_photo_core_impl(
@@ -627,6 +735,7 @@ class GPUSynthSequenceEngine:
         halation_boost_override: float | None = None,
         include_stroke_mask: bool | None = None,
         approach_prob: float | None = None,
+        lowres_sr_prob: float | None = None,
     ) -> dict[str, Any]:
         """Synthesize a multi-frame batch conforming 100% to `v2_shared_contract.md`."""
         bsz = int(batch_size)
@@ -652,6 +761,7 @@ class GPUSynthSequenceEngine:
             device=dev,
             seed=step_seed + 11,
             approach_prob=approach_prob if approach_prob is not None else (None if self.train_mode else 0.0),
+            lowres_sr_prob=lowres_sr_prob if lowres_sr_prob is not None else (None if self.train_mode else 0.0),
         )
 
         # 2. Sample primary (and sparse secondary ONLY for track_mixed) PlateText + PlateConfig
@@ -691,7 +801,11 @@ class GPUSynthSequenceEngine:
                 cfg.is_temporary_plate = True
                 cfg.is_illuminated = False
                 cfg.with_seal = False
-            elif tag in ("heavy_rain_droplets", "steep_oblique", "daylight_clean", "distant_tiny") and stage >= 3 and plate_overrides is None:
+            elif (
+                tag in ("heavy_rain_droplets", "steep_oblique", "day_clear", "day_harsh_shadow", "dusk_wdr", "turn_in_sweep")
+                and stage >= 3
+                and plate_overrides is None
+            ):
                 p_mud = 0.34 if tag in ("heavy_rain_droplets", "steep_oblique") else 0.16
                 if rng.random() < p_mud:
                     cfg.mud_level = rng.uniform(0.10, 0.52)
@@ -769,7 +883,7 @@ class GPUSynthSequenceEngine:
         else:
             has_overhang = torch.zeros((bsz,), dtype=torch.bool, device=dev)
 
-        # 5. Sensor Optics, Rain Droplets, NIR Noise, USM, YUV420 & Exact 8x8 DCT in (96, 160)
+        # 5. Sensor Optics (9-tap motion blur + defocus), Rain, NIR Noise, USM, YUV420 & H.264 8x8/4x4 DCT
         degraded = self.codec.process_rois(
             shaded=shaded,
             traj=traj,
@@ -779,8 +893,8 @@ class GPUSynthSequenceEngine:
             halation_boost_override=halation_boost_override,
         )
 
-        # 6. Noisy PlateQuadNet 4-Corner Perturbation + Closed-Form O(1) Rectification to out_hw
-        noisy_roi_corners, noisy_full_corners = self._perturb_quad_corners(
+        # 6. Structured 8-DOF Stage-2 Perturbation + Closed-Form O(1) Rectification to out_hw
+        noisy_roi_corners, noisy_full_corners, uv_delta = self._perturb_quad_corners(
             traj=traj,
             surface=surface_pri,
             stage=stage,
@@ -788,16 +902,7 @@ class GPUSynthSequenceEngine:
         )
 
         n_bt = bsz * t_len
-        if self.train_mode:
-            mr_narrow = 0.038 + (0.065 - 0.038) * torch.rand((n_bt,), generator=gen, device=dev)
-            if stage >= 2:
-                mr_wide = -0.010 + (0.095 - (-0.010)) * torch.rand((n_bt,), generator=gen, device=dev)
-                use_wide = torch.rand((n_bt,), generator=gen, device=dev) < 0.42
-                mr = torch.where(use_wide, mr_wide, mr_narrow)
-            else:
-                mr = mr_narrow
-        else:
-            mr = self.margin_ratio
+        mr = self.margin_ratio
 
         crops_flat = warp_quad_to_canonical_gpu(
             src_imgs=degraded.roi_rgb.reshape(n_bt, 3, degraded.roi_rgb.shape[-2], degraded.roi_rgb.shape[-1]),
@@ -806,24 +911,35 @@ class GPUSynthSequenceEngine:
             margin_ratio=mr,
         ).clamp(0.0, 1.0)
 
-        # 6b. Multi-scale distant livecam resolution bottleneck + crisp close-up ISP + tone jitter
-        # (Bridges Sim-to-Real across BOTH 22-48px YouTube livecams AND crisp close-up gate/handheld
-        # cutouts [sharp_g6 0.75..1.0], including blurry->crisp approach transitions & legible 仮ナンバー!)
+        ext_corners_base = self._get_ext_plate_corners(bsz, dev)
+        ext_corners_bt = ext_corners_base[:, None, :, :] + torch.stack(
+            [uv_delta[..., 0] * 352.0, uv_delta[..., 1] * 176.0], dim=-1
+        )
+
+        # 6b. Photometric RGB WB [0.72, 1.28] + tone/shadow curves + 8-DOF-jittered `c_crisp` with light DCT
         if self.train_mode and stage >= 2:
             is_app_t = (
                 traj.is_approach
                 if traj.is_approach is not None
                 else torch.zeros((bsz,), dtype=torch.bool, device=dev)
             )
+            is_lr_t = (
+                traj.is_lowres_sr
+                if traj.is_lowres_sr is not None
+                else torch.zeros((bsz,), dtype=torch.bool, device=dev)
+            )
             crops_flat, noisy_full_corners = self._apply_livecam_multiscale_and_tone_jitter(
                 crops_flat=crops_flat,
                 noisy_full_corners=noisy_full_corners,
                 lit_ext=lit_ext,
-                ext_corners=self._get_ext_plate_corners(bsz, dev),
-                mr_flat=mr,
+                ext_corners_bt=ext_corners_bt,
+                mr_val=mr,
+                codec=self.codec,
+                ir_mode=traj.sensor_ir_mode,
                 is_monochrome_ir=shaded.is_monochrome_ir,
                 regime_ids=traj.regime_ids,
                 is_approach=is_app_t,
+                is_lowres_sr=is_lr_t,
                 has_overhang=has_overhang,
                 bsz=bsz,
                 t_len=t_len,
@@ -859,6 +975,16 @@ class GPUSynthSequenceEngine:
 
         crops = crops_flat.reshape(bsz, t_len, 3, target_hw[0], target_hw[1])
 
+        # 7c. Rolling multi-frame sub-pixel canonical Drizzle super-resolution on `w_t < 54px` sequences
+        if self.train_mode and stage >= 2 and t_len >= 2:
+            enable_drizzle = torch.rand((bsz,), generator=gen, device=dev) < 0.75
+            crops = _rolling_canonical_drizzle_impl(
+                crops=crops,
+                noisy_full_corners=noisy_full_corners,
+                camera_ids=traj.camera_ids,
+                enable_seq=enable_drizzle,
+            )
+
         # 8. Exact GPU 10-D Geometric & Photometric Metadata `geom_meta` (B, T, 10)
         geom_meta = compute_geom_meta_gpu(
             corners_xy=noisy_full_corners,
@@ -892,13 +1018,26 @@ class GPUSynthSequenceEngine:
             int(self.vocab.pad_id),
         )
 
+        # Train 30% of valid positive plates with `plate_sides = 2` (unknown side) so `plate_sides = 2`
+        # is never learned as a spurious non-plate shortcut!
+        out_plate_sides = traj.plate_sides
+        if self.train_mode and plate_side_override is None:
+            unk_side_seq = (torch.rand((bsz, 1), generator=gen, device=dev) < 0.30) & (
+                (target_status != 1)[:, None]
+            )
+            out_plate_sides = torch.where(
+                unk_side_seq.expand(bsz, t_len),
+                torch.full_like(out_plate_sides, 2),
+                out_plate_sides,
+            )
+
         out_dict: dict[str, Any] = {
             "crops": crops,
             "canon_clean_crop": canon_clean,
             "geom_meta": geom_meta,
             "timestamps_s": traj.timestamps_s,
             "camera_ids": traj.camera_ids,
-            "plate_sides": traj.plate_sides,
+            "plate_sides": out_plate_sides,
             "frame_valid_mask": frame_valid_mask,
             "slot_readability": slot_readability,
             "slot_glare": slot_glare,
@@ -912,8 +1051,10 @@ class GPUSynthSequenceEngine:
         }
         want_sm = self.include_stroke_mask if include_stroke_mask is None else bool(include_stroke_mask)
         if want_sm:
-            ext_c_bt = self._get_ext_plate_corners(bsz, dev)[:, None, :, :].expand(bsz, t_len, 4, 2).reshape(n_bt, 4, 2)
-            sm_src = surface_pri.stroke_mask[:, None, :, :, :].expand(bsz, t_len, 1, surface_pri.stroke_mask.shape[-2], surface_pri.stroke_mask.shape[-1]).reshape(
+            ext_c_bt = ext_corners_bt.reshape(n_bt, 4, 2)
+            sm_src = surface_pri.stroke_mask[:, None, :, :, :].expand(
+                bsz, t_len, 1, surface_pri.stroke_mask.shape[-2], surface_pri.stroke_mask.shape[-1]
+            ).reshape(
                 n_bt, 1, surface_pri.stroke_mask.shape[-2], surface_pri.stroke_mask.shape[-1]
             )
             sm_warped = warp_quad_to_canonical_gpu(
@@ -962,24 +1103,27 @@ class GPUSynthSequenceEngine:
         surface: PlateSurface25DPacket,
         stage: int,
         gen: torch.Generator,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Simulate `PlateQuadNet` AR(1) sub-pixel corner jitter + `封印`/frame bias + coasting drift."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Simulate structured 8-DOF Stage-2 quad homography jitter + AR(1) drift + coasting."""
         gt_roi = traj.corners_roi_gt
-        if not self.train_mode:
-            return gt_roi, traj.corners_full_gt
-
         bsz, t_len, _, _ = gt_roi.shape
         dev = gt_roi.device
+        if not self.train_mode:
+            return gt_roi, traj.corners_full_gt, torch.zeros((bsz, t_len, 4, 2), device=dev, dtype=gt_roi.dtype)
+
         l_ar = _get_ar1_matrix(dev, t_len)
         eps_unit = torch.randn((bsz, t_len, 4, 2), generator=gen, device=dev)
+        dof_seq_u = torch.rand((bsz, 10), generator=gen, device=dev)
+        dof_bt_n = torch.randn((bsz, t_len, 9), generator=gen, device=dev)
         top_recess_u = (
             torch.rand((bsz, 1), generator=gen, device=dev)
             if stage >= 2
             else torch.zeros((bsz, 1), device=dev)
         )
-        sigma_mult = float(0.005 + 0.0035 * stage)
+        sigma_mult = float(0.004 + 0.003 * stage)
+        stage_scale = 1.0 if stage >= 2 else 0.35
 
-        noisy_roi, noisy_full = _dispatch_seq_cuda(
+        noisy_roi, noisy_full, uv_delta = _dispatch_seq_cuda(
             f"perturb_q_{stage}",
             _perturb_corners_core_impl,
             gt_roi,
@@ -988,8 +1132,11 @@ class GPUSynthSequenceEngine:
             traj.plate_sides,
             l_ar,
             eps_unit,
+            dof_seq_u,
+            dof_bt_n,
             top_recess_u,
             sigma_mult,
+            stage_scale,
         )
 
         if t_len >= 2 and stage >= 2:
@@ -1011,45 +1158,75 @@ class GPUSynthSequenceEngine:
             noisy_roi = torch.cat([noisy_roi[:, 0:1], torch.where(coast, coasted, noisy_roi[:, 1:])], dim=1)
             noisy_full = noisy_roi + traj.roi_origin_xy[:, :, None, :]
 
-        return noisy_roi, noisy_full
+        return noisy_roi, noisy_full, uv_delta
 
     @staticmethod
     def _apply_livecam_multiscale_and_tone_jitter(
         crops_flat: torch.Tensor,
         noisy_full_corners: torch.Tensor,
         lit_ext: torch.Tensor,
-        ext_corners: torch.Tensor,
-        mr_flat: torch.Tensor | float,
+        ext_corners_bt: torch.Tensor,
+        mr_val: float,
+        codec: SensorCodecGPU,
+        ir_mode: torch.Tensor,
         is_monochrome_ir: torch.Tensor,
         regime_ids: torch.Tensor,
         is_approach: torch.Tensor,
+        is_lowres_sr: torch.Tensor,
         has_overhang: torch.Tensor,
         bsz: int,
         t_len: int,
         target_hw: tuple[int, int],
         gen: torch.Generator,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Multi-scale livecam low-res + coupled crisp close-up ISP + monochrome-safe tone jitter."""
-        del ext_corners, mr_flat
+        """8-DOF-perturbed close-up `c_crisp` + light H.264/DCT + RGB WB `[0.72, 1.28]` + tone curves."""
         dev = crops_flat.device
         n_bt = bsz * t_len
         h_t, w_t = target_hw
 
-        jx = int(torch.randint(-2, 3, (1,), generator=gen, device=dev).item()) if dev.type != "cuda" else 0
-        jy = int(torch.randint(-1, 2, (1,), generator=gen, device=dev).item()) if dev.type != "cuda" else 0
-        crisp_base = F.interpolate(
-            lit_ext[:, :, 7 + jy : 185 + jy, 14 + jx : 370 + jx],
-            size=(h_t, w_t),
-            mode="area",
+        # Warp `lit_ext` across ALL (B, T) frames using exact structured 8-DOF homography jitter
+        # (zero GPU-CPU `.item()` sync, identical jitter richness on both CPU and CUDA!).
+        lit_bt = lit_ext[:, None].expand(bsz, t_len, 3, lit_ext.shape[-2], lit_ext.shape[-1]).reshape(
+            n_bt, 3, lit_ext.shape[-2], lit_ext.shape[-1]
         )
+        crisp_warped = warp_quad_to_canonical_gpu(
+            src_imgs=lit_bt,
+            quad_xy=ext_corners_bt.reshape(n_bt, 4, 2),
+            out_hw=(h_t, w_t),
+            margin_ratio=mr_val,
+        ).clamp(0.0, 1.0)
 
-        wb_b = 0.93 + 0.14 * torch.rand((bsz, 3, 1, 1), generator=gen, device=dev)
-        illum_coefs = torch.rand((bsz, 3, 1, 1), generator=gen, device=dev)
-        usm_hi_b = 0.25 + 0.65 * torch.rand((bsz, 1, 1, 1), generator=gen, device=dev)
-
+        wb_b = 0.72 + 0.56 * torch.rand((bsz, 3, 1, 1), generator=gen, device=dev)
+        wb_norm_bt = (wb_b / wb_b.mean(dim=1, keepdim=True).clamp_min(1e-4))[:, None].expand(
+            bsz, t_len, 3, 1, 1
+        ).reshape(n_bt, 3, 1, 1)
+        illum_coefs = torch.rand((bsz, 3, 1, 1), generator=gen, device=dev)[:, None].expand(
+            bsz, t_len, 3, 1, 1
+        ).reshape(n_bt, 3, 1, 1)
+        gx = torch.linspace(-0.5, 0.5, w_t, device=dev, dtype=torch.float32).view(1, 1, 1, w_t)
+        gy = torch.linspace(-0.5, 0.5, h_t, device=dev, dtype=torch.float32).view(1, 1, h_t, 1)
+        illum_bt = (
+            (0.94 + 0.12 * illum_coefs[:, 0:1])
+            + (-0.08 + 0.16 * illum_coefs[:, 1:2]) * gx
+            + (-0.08 + 0.16 * illum_coefs[:, 2:3]) * gy
+        )
+        usm_hi_bt = (0.20 + 0.65 * torch.rand((bsz, 1, 1, 1), generator=gen, device=dev))[:, None].expand(
+            bsz, t_len, 1, 1, 1
+        ).reshape(n_bt, 1, 1, 1)
         n_dt = torch.float16 if dev.type == "cuda" else torch.float32
         sigma_hi = (0.006 + 0.018 * torch.rand((n_bt, 1, 1, 1), generator=gen, device=dev)).to(dtype=n_dt)
         hi_noise = torch.empty((n_bt, 3, h_t, w_t), device=dev, dtype=n_dt).normal_(generator=gen)
+
+        crisp_wb = (crisp_warped * wb_norm_bt * illum_bt).clamp(0.0, 1.0)
+        blur3 = F.avg_pool2d(F.pad(crisp_wb, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+        crisp_pre = (crisp_wb + usm_hi_bt * (crisp_wb - blur3) + (hi_noise * sigma_hi).float()).clamp(0.0, 1.0)
+        if (h_t % 16) == 0 and (w_t % 16) == 0:
+            c_crisp = codec.apply_light_dct_crops(
+                crisp_pre, ir_mode.reshape(n_bt), gen=gen, q_lo=42.0, q_hi=84.0
+            )
+        else:
+            c_crisp = crisp_pre
+
         u_seq = torch.rand((bsz, 1), generator=gen, device=dev)
         tone_rands = torch.rand((n_bt, 4, 1, 1), generator=gen, device=dev)
 
@@ -1058,16 +1235,13 @@ class GPUSynthSequenceEngine:
             _livecam_multiscale_tone_impl,
             crops_flat,
             noisy_full_corners,
-            crisp_base,
+            c_crisp,
             is_monochrome_ir,
             regime_ids,
             is_approach,
+            is_lowres_sr,
             has_overhang,
             wb_b,
-            illum_coefs,
-            usm_hi_b,
-            sigma_hi,
-            hi_noise,
             u_seq,
             tone_rands,
         )

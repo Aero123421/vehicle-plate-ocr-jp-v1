@@ -696,7 +696,7 @@ class PlateQuadTrackNet(nn.Module):
             "blur_vec_norm": meta[:, 7:9], "is_plate_logit": meta[:, 0], "plate_null_llr": llr,
             "side_logits": meta[:, 1:4], "quality_logit": meta[:, 4], "topology_logit": meta[:, 5], "is_large_logit": meta[:, 6],
             "reid_emb": F.normalize(self.reid_head(torch.cat([f.mean((2, 3)), s], -1)), dim=-1),
-            "support_nonconformity": ((joint-self.support_mean)/self.support_scale.clamp_min(1e-6)).square().mean(-1).sqrt(),
+            "support_nonconformity": ((joint - self.support_mean) / self.support_scale.clamp_min(0.08)).square().mean(-1).sqrt(),
             "canonical_support": pick(support.reshape(b, 2, 1, 20, 40)),
             "corner_log_probs": cell_logp.mean(1, keepdim=True).expand(-1, 4, -1), "grid_hw": (hh, ww),
         }
@@ -859,7 +859,15 @@ class PlateQuadTrackLoss(nn.Module):
                 aux_warmup_scale: float = 1.0) -> dict[str, torch.Tensor]:
         logit, target = out["is_plate_logit"].float(), is_plate_gt.float()
         zero = logit.sum()*0
-        loss_cls = F.binary_cross_entropy_with_logits(logit, target)
+        bce_vec = F.binary_cross_entropy_with_logits(logit, target, reduction="none")
+        cls_weights = torch.ones_like(bce_vec)
+        neg_mask = target <= 0.5
+        if neg_mask.any():
+            neg_idx = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
+            k_hard = max(1, int(math.ceil(0.15 * int(neg_idx.numel()))))
+            hard_neg_idx = neg_idx[logit.detach()[neg_idx].topk(k_hard).indices]
+            cls_weights[hard_neg_idx] = 1.5
+        loss_cls = (bce_vec * cls_weights).mean()
         loss_topo = F.binary_cross_entropy_with_logits(out["topology_logit"], target if topology_gt is None else topology_gt.float())
         loss_layout = zero
         if "layout_logits" in out:
@@ -891,11 +899,19 @@ class PlateQuadTrackLoss(nn.Module):
             ic_next = torch.roll(ic_edges, -1, dims=-2)
             ic_cross = ic_edges[..., 0] * ic_next[..., 1] - ic_edges[..., 1] * ic_next[..., 0]
             loss_convex = 6.0 * (F.relu(1e-3 - ic_cross).mean(dim=(1, 3)) * responsibilities).sum(-1).mean()
+            # Outward unit vectors u_hat_k = (c*_k - c_bar*) / (||c*_k - c_bar*|| + 1e-6):
+            # penalize inward corner shrinkage (delta_k < 0, which clips Kanji/Class digits) 2.25x vs 1.0x outward.
+            c_bar = truth.mean(dim=-2, keepdim=True)
+            rad_vec = truth - c_bar
+            u_hat_m = (rad_vec / (torch.linalg.vector_norm(rad_vec, dim=-1, keepdim=True) + 1e-6))[:, None].expand_as(tgt_m)
             step_err = torch.zeros_like(distance)
             for k, weight in enumerate((0.25, 0.40, 0.70, 1.00)):
-                wing = _wing_loss(ic[:, k], tgt_m, w=0.04, eps=0.006, reduction="none").mean((-1, -2))
-                l2 = torch.linalg.vector_norm(ic[:, k] - tgt_m, dim=-1).mean(-1)
-                step_err = step_err + weight * (wing + l2)
+                diff_k = ic[:, k] - tgt_m
+                delta_rad = (diff_k * u_hat_m).sum(dim=-1)
+                asym_w = torch.where(delta_rad < 0.0, torch.full_like(delta_rad, 1.30), torch.ones_like(delta_rad))
+                wing_c = _wing_loss(ic[:, k], tgt_m, w=0.04, eps=0.006, reduction="none").mean(dim=-1)
+                l2_c = torch.linalg.vector_norm(diff_k, dim=-1)
+                step_err = step_err + weight * (asym_w * (wing_c + l2_c)).mean(dim=-1)
             target_probs = (-distance.detach() / 0.008).softmax(dim=-1)
             loss_mode_sel = -(target_probs * F.log_softmax(out["mode_logits"][pos].float(), dim=-1)).sum(dim=-1).mean()
             loss_coord = (0.02 * loss_nll + 24.0 * (step_err * responsibilities).sum(-1).mean()

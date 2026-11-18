@@ -20,11 +20,13 @@ DEFAULT_MODELS_DIR = REPO_ROOT / "out/models"
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Run 4-step smoke test into --out-dir")
+    parser.add_argument("--nano-only", action="store_true", help="Train Nano KD from an existing verified Base checkpoint")
+    parser.add_argument("--base-ckpt", type=Path, default=None, help="Existing Base checkpoint for --nano-only")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_MODELS_DIR)
-    parser.add_argument("--base-steps", type=int, default=5200)
-    parser.add_argument("--nano-steps", type=int, default=5800)
-    parser.add_argument("--batch-size", type=int, default=36)
-    parser.add_argument("--seq-len", type=int, default=8)
+    parser.add_argument("--base-steps", type=int, default=6400)
+    parser.add_argument("--nano-steps", type=int, default=7200)
+    parser.add_argument("--batch-size", type=int, default=48)
+    parser.add_argument("--seq-len", type=int, default=12)
     parser.add_argument("--base-init-seed", type=int, default=20260411)
     parser.add_argument("--nano-init-seed", type=int, default=20260412)
     return parser.parse_args(argv)
@@ -72,7 +74,8 @@ from vpocr_ocr.trainer_v2 import (
 )
 from vpocr_ocr.vocab import NUM_SLOTS, PlateVocab
 from vpocr_synth.gpu.homography_fast import REGIME_NAMES
-from vpocr_synth.gpu.sequence_engine import GPUSynthSequenceEngine
+from vpocr_synth.gpu.sequence_engine import GPUSynthSequenceEngine, compute_geom_meta_gpu
+from vpocr_synth.plate.surface_25d import get_default_nonplate_stencil_atlas
 
 
 TRAINING_SCRIPT_REL = "tools/train_ocr.py"
@@ -106,21 +109,39 @@ def build_synthetic_hard_negative_bank(
     device: torch.device,
     seed: int = 999_111,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Synthesize `(N, 3, H, W)` non-plate procedural barrier/placard/sign/grille crops."""
+    """Synthesize `(N, 3, H, W)` non-plate stencils (`319`, `スケルトン車`, `最大積載量`) + barriers/grilles."""
     qsynth = QuadCropSynthesizer(QuadCropSynthConfig(p_positive=0.0, domain_split="train"))
+    n_quad = max(1, int(round(0.45 * float(num_samples))))
+    n_stencil = max(0, int(num_samples) - n_quad)
+
     crops_list: list[np.ndarray] = []
     geoms_list: list[np.ndarray] = []
     h_out, w_out = out_hw
-    for i in range(num_samples):
+    for i in range(n_quad):
         sample = qsynth.synthesize_sample(seed=seed + i)
         assert sample.is_plate == 0.0
         resized = cv2.resize(sample.roi_rgb, (w_out, h_out), interpolation=cv2.INTER_AREA)
         gm = extract_quad_geometry_meta(None, resized)
         crops_list.append(resized.transpose(2, 0, 1).astype(np.float32) / 255.0)
         geoms_list.append(gm.astype(np.float32))
-    crops_t = torch.from_numpy(np.stack(crops_list, axis=0)).to(device)
-    geoms_t = torch.from_numpy(np.stack(geoms_list, axis=0)).to(device)
-    return crops_t, geoms_t
+
+    crops_q = torch.from_numpy(np.stack(crops_list, axis=0)).to(device)
+    geoms_q = torch.from_numpy(np.stack(geoms_list, axis=0)).to(device)
+    if n_stencil <= 0:
+        return crops_q, geoms_q
+
+    st_gen = torch.Generator(device="cpu")
+    st_gen.manual_seed((seed * 31 + 17) & 0x7FFFFFFF)
+    crops_st = get_default_nonplate_stencil_atlas().sample_crops(
+        n_stencil, out_hw, device=device, gen=st_gen
+    )
+    geoms_st = compute_geom_meta_gpu(corners_xy=None, crops=crops_st)
+    # Randomize apparent detector quad scale across distant & close-up non-plate text signs
+    g_u = torch.rand((n_stencil, 2), generator=st_gen).to(device)
+    geoms_st = geoms_st.clone()
+    geoms_st[:, 0] = -0.80 + 1.45 * g_u[:, 0]
+    geoms_st[:, 1] = torch.clamp(geoms_st[:, 0] + 0.12 * (g_u[:, 1] - 0.5), -1.0, 1.0)
+    return torch.cat([crops_q, crops_st], dim=0), torch.cat([geoms_q, geoms_st], dim=0)
 
 
 def compute_hard_negative_aux_loss(
@@ -130,18 +151,40 @@ def compute_hard_negative_aux_loss(
     gen: torch.Generator,
     batch_n: int = 16,
     use_amp: bool = False,
+    pad_id: int = 0,
 ) -> torch.Tensor:
-    """Supervise `frame_valid_gate -> 0`, `status -> UNREADABLE`, `readability -> 0` on non-plates."""
+    """Supervise `frame_valid_gate -> 0`, `status -> UNREADABLE`, `readability -> 0`, & 50% vault `<PAD>`."""
     dev = neg_crops_bank.device
     total_bank = neg_crops_bank.shape[0]
     idx = torch.randint(0, total_bank, (batch_n,), generator=gen).to(dev)
     c_neg = neg_crops_bank.index_select(0, idx)
     g_neg = neg_geoms_bank.index_select(0, idx)
-    s_neg = torch.full((batch_n,), 2, dtype=torch.long, device=dev)
+    # Mix plate_sides across {0, 1, 2} so `plate_sides == 2` is NOT a non-plate shortcut
+    side_u = torch.rand((batch_n,), generator=gen).to(dev)
+    s_neg = torch.where(
+        side_u < 0.50,
+        torch.full((batch_n,), 2, dtype=torch.long, device=dev),
+        torch.where(
+            side_u < 0.75,
+            torch.zeros((batch_n,), dtype=torch.long, device=dev),
+            torch.ones((batch_n,), dtype=torch.long, device=dev),
+        ),
+    )
+    vault_byp = (torch.rand((batch_n,), generator=gen) < 0.50).to(dev)
 
     with _freeze_bn_running_stats(model):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             enc = model.encode_frames(c_neg, s_neg, g_neg)
+        lam_step = torch.where(
+            vault_byp[:, None, None],
+            torch.clamp(enc.lambda_prec.float(), min=0.25),
+            enc.lambda_prec.float(),
+        )
+        polp_step = torch.where(
+            vault_byp,
+            torch.clamp(enc.pol_prec.float(), min=0.15),
+            enc.pol_prec.float(),
+        )
         st0 = model.init_memory(batch_size=batch_n, device=dev, dtype=torch.float32)
         st1 = model.step_memory(
             mem_h=st0.mem_h,
@@ -154,11 +197,11 @@ def compute_hard_negative_aux_loss(
             pose_ema=st0.pose_ema,
             last_timestamp_s=st0.last_timestamp_s,
             z=enc.z.float(),
-            lambda_prec=enc.lambda_prec.float(),
+            lambda_prec=lam_step,
             z_color=enc.z_color.float(),
             lambda_color=enc.lambda_color.float(),
             pol_logit=enc.pol_logit.float(),
-            pol_prec=enc.pol_prec.float(),
+            pol_prec=polp_step,
             geom_meta=g_neg.float(),
             timestamp_s=torch.zeros((batch_n,), dtype=torch.float32, device=dev),
         )
@@ -183,7 +226,16 @@ def compute_hard_negative_aux_loss(
         ro.slot_readability_pred.float(),
         torch.zeros_like(ro.slot_readability_pred.float()),
     ).mean()
-    return fv_bce + gate_pen + 0.5 * stat_ce + 0.5 * read_bce
+    if bool(vault_byp.any()):
+        n_vb = int(vault_byp.sum().item())
+        pad_tgt = torch.full((n_vb * NUM_SLOTS,), int(pad_id), dtype=torch.long, device=dev)
+        pad_ce = F.cross_entropy(
+            ro.slot_logits[vault_byp].float().reshape(-1, ro.slot_logits.shape[-1]),
+            pad_tgt,
+        )
+    else:
+        pad_ce = stat_ce * 0.0
+    return fv_bce + gate_pen + 0.55 * stat_ce + 0.50 * read_bce + 0.30 * pad_ce
 
 
 def compute_crisp_dwell_splice_aux_loss(
@@ -673,8 +725,14 @@ def _compute_synthetic_kd_loss(
 
     valid_f = (~pad_mask_bool) & (batch["frame_valid_mask"].float() > 0.5)
     same_as_primary = (frame_slot_targets == target_slots.unsqueeze(1)).all(dim=-1)
-    primary_read = eff_read * (valid_f & same_as_primary).unsqueeze(-1).float()
+    is_prim_f = valid_f & same_as_primary
+    primary_read = eff_read * is_prim_f.unsqueeze(-1).float()
     seq_max_read = primary_read.max(dim=1).values  # (B, 12)
+    sr_gain = 1.85 if seq_len >= 4 else (1.35 if seq_len >= 2 else 1.0)
+    seq_int_read = torch.maximum(
+        seq_max_read,
+        (sr_gain * torch.linalg.vector_norm(primary_read, ord=2, dim=1)).clamp(0.0, 1.0),
+    )
 
     t2 = temp * temp
     slot_kd_w = torch.tensor(
@@ -686,19 +744,22 @@ def _compute_synthetic_kd_loss(
     non_mixed = batch["target_status"] != 2
     zero_kd = s_out.slot_logits.float().sum() * 0.0
 
-    # Sequence-level distillation only when teacher & student share identical initial state
-    seq_mask = (seq_max_read >= 0.30) & non_mixed.unsqueeze(1)
+    # Sequence-level distillation across BOTH multiscale & multi-frame low-res SR sequences
+    seq_mask = (
+        ((seq_int_read >= 0.16) & (batch["target_status"] == 0).unsqueeze(1))
+        | ((seq_int_read >= 0.28) & non_mixed.unsqueeze(1))
+    )
     if (not has_prefill) and bool(seq_mask.any()):
         s_logp = F.log_softmax(s_out.slot_logits.float() / temp, dim=-1)
         t_prob = F.softmax(t_out.slot_logits.float() / temp, dim=-1)
         kl_per_slot = F.kl_div(s_logp, t_prob, reduction="none").sum(dim=-1)  # (B, 12)
-        seq_w = seq_max_read * seq_mask.float() * slot_kd_w.unsqueeze(0)
+        seq_w = seq_int_read.clamp_min(0.20) * seq_mask.float() * slot_kd_w.unsqueeze(0)
         kd_seq = ((kl_per_slot * seq_w).sum() / seq_w.sum().clamp_min(1e-6)) * t2
     else:
         kd_seq = zero_kd
 
-    # Per-frame encoder slot distillation strictly on optically resolved slots (eff_read >= 0.28)
-    aux_mask = valid_f.unsqueeze(-1) & (eff_read >= 0.28)
+    # Per-frame encoder slot distillation strictly on optically resolved slots (eff_read >= 0.25)
+    aux_mask = valid_f.unsqueeze(-1) & (eff_read >= 0.25)
     if bool(aux_mask.any()):
         sf_logp = F.log_softmax(s_frame_logits.float() / temp, dim=-1)
         tf_prob = F.softmax(t_frame_logits.float() / temp, dim=-1)
@@ -727,6 +788,45 @@ def _compute_synthetic_kd_loss(
         torch.sigmoid(s_out.slot_quality_logits.float()),
         torch.sigmoid(t_out.slot_quality_logits.float()),
     )
+
+    # Temporal Precision-Selection KD + Sharp-Frame Dominance Margin Loss
+    s_lam_slot = s_out.frame_lambda_prec.float().mean(dim=-1).clamp_min(1e-4)  # (B, T, 12)
+    t_lam_slot = t_out.frame_lambda_prec.float().mean(dim=-1).clamp_min(1e-4)  # (B, T, 12)
+    if bool(valid_f.any()):
+        kd_prec_mag = F.smooth_l1_loss(
+            torch.log1p(s_lam_slot[valid_f]),
+            torch.log1p(t_lam_slot[valid_f]),
+            beta=0.15,
+        )
+    else:
+        kd_prec_mag = zero_kd
+
+    multi_prim = (is_prim_f.sum(dim=1) >= 2) & non_mixed
+    if seq_len >= 2 and bool(multi_prim.any()):
+        pm = is_prim_f[multi_prim].unsqueeze(-1)  # (B_m, T, 1)
+        neg_inf = torch.tensor(-1e4, device=dev, dtype=torch.float32)
+        s_lp_t = F.log_softmax(
+            torch.where(pm, torch.log(s_lam_slot[multi_prim]) / 0.70, neg_inf), dim=1
+        )
+        t_pr_t = F.softmax(
+            torch.where(pm, torch.log(t_lam_slot[multi_prim]) / 0.70, neg_inf), dim=1
+        )
+        kd_prec_sel = F.kl_div(s_lp_t, t_pr_t, reduction="none").sum(dim=1).mean() * 0.49
+    else:
+        kd_prec_sel = zero_kd
+
+    sharp_m = is_prim_f.unsqueeze(-1) & (primary_read >= 0.58)
+    blur_m = is_prim_f.unsqueeze(-1) & (primary_read <= 0.26)
+    both_sb = sharp_m.any(dim=1) & blur_m.any(dim=1)
+    if bool(both_sb.any()):
+        log_s = torch.log(s_lam_slot)
+        l_hi = torch.where(sharp_m, log_s, torch.full_like(log_s, -20.0)).amax(dim=1)
+        l_lo = torch.where(blur_m, log_s, torch.full_like(log_s, -20.0)).amax(dim=1)
+        kd_dom = F.relu(math.log(18.0) - (l_hi[both_sb] - l_lo[both_sb])).mean()
+    else:
+        kd_dom = zero_kd
+    kd_prec = kd_prec_mag + kd_prec_sel + 0.35 * kd_dom
+
     s_rl = getattr(s_out, "reg_len_logits", None)
     t_rl = getattr(t_out, "reg_len_logits", None)
     s_cl = getattr(s_out, "cls_len_logits", None)
@@ -746,8 +846,16 @@ def _compute_synthetic_kd_loss(
     else:
         kd_len = zero_kd
     if has_prefill:
-        return 0.70 * kd_aux + 0.25 * kd_qual + 0.15 * kd_len
-    return 0.55 * kd_seq + 0.40 * kd_aux + 0.18 * kd_col + 0.12 * kd_st + 0.20 * kd_qual + 0.15 * kd_len
+        return 0.65 * kd_aux + 0.22 * kd_qual + 0.25 * kd_prec + 0.15 * kd_len
+    return (
+        0.55 * kd_seq
+        + 0.38 * kd_aux
+        + 0.18 * kd_col
+        + 0.12 * kd_st
+        + 0.18 * kd_qual
+        + 0.25 * kd_prec
+        + 0.15 * kd_len
+    )
 
 
 @torch.no_grad()
@@ -775,7 +883,8 @@ def evaluate_synthetic_val(
             seed=seed,
         )
 
-    bsz_std = 32 if num_batches >= 2 else 8
+    bsz_std = 16 if num_batches >= 2 else 8
+    n_std_batches = (num_batches * 2) if num_batches >= 2 else num_batches
     tot_read_seq = 0
     exact_4f = 0
     reg_ok = 0
@@ -789,19 +898,21 @@ def evaluate_synthetic_val(
     kl_surprise_sum = torch.zeros(vocab.size, dtype=torch.float32, device=device)
     tok_occ_counts = torch.zeros(vocab.size, dtype=torch.float32, device=device)
 
-    for bi_std in range(num_batches):
+    val_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    for bi_std in range(n_std_batches):
         b = _move_batch_v2_to_device(
             val_engine.sample_batch(bsz_std, seq_len=8, approach_prob=0.25, seed=seed + bi_std), device
         )
-        out = model.forward_sequence(
-            crops=b["crops"],
-            timestamps_s=b["timestamps_s"],
-            plate_sides=b.get("plate_sides"),
-            geom_meta=b.get("geom_meta"),
-            frame_pad_mask=b.get("frame_pad_mask"),
-            compute_prefix_readout=False,
-            compute_stroke_mask=False,
-        )
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=val_amp):
+            out = model.forward_sequence(
+                crops=b["crops"],
+                timestamps_s=b["timestamps_s"],
+                plate_sides=b.get("plate_sides"),
+                geom_meta=b.get("geom_meta"),
+                frame_pad_mask=b.get("frame_pad_mask"),
+                compute_prefix_readout=False,
+                compute_stroke_mask=False,
+            )
         pred_status = out.status_logits.argmax(dim=-1)
         tgt_status = b["target_status"]
         status_ok += int((pred_status == tgt_status).sum().item())
@@ -838,8 +949,8 @@ def evaluate_synthetic_val(
     app_4f = 0
     app_ser = 0
     app_clean_conflict = 0
-    n_app_batches = 4 if num_batches >= 2 else 1
-    bsz_app = 16 if num_batches >= 2 else 4
+    n_app_batches = 8 if num_batches >= 2 else 1
+    bsz_app = 8 if num_batches >= 2 else 4
     t_app_eval = 32 if num_batches >= 2 else 12
     for bi_app in range(n_app_batches):
         ba = _move_batch_v2_to_device(
@@ -852,15 +963,16 @@ def evaluate_synthetic_val(
             ),
             device,
         )
-        out_a = model.forward_sequence(
-            crops=ba["crops"],
-            timestamps_s=ba["timestamps_s"],
-            plate_sides=ba.get("plate_sides"),
-            geom_meta=ba.get("geom_meta"),
-            frame_pad_mask=ba.get("frame_pad_mask"),
-            compute_prefix_readout=False,
-            compute_stroke_mask=False,
-        )
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=val_amp):
+            out_a = model.forward_sequence(
+                crops=ba["crops"],
+                timestamps_s=ba["timestamps_s"],
+                plate_sides=ba.get("plate_sides"),
+                geom_meta=ba.get("geom_meta"),
+                frame_pad_mask=ba.get("frame_pad_mask"),
+                compute_prefix_readout=False,
+                compute_stroke_mask=False,
+            )
         rd = ba["target_status"] == 0
         if rd.any():
             psa = out_a.slot_logits[rd].argmax(dim=-1)
@@ -871,6 +983,42 @@ def evaluate_synthetic_val(
             app_ser += int(eqa[:, 8:12].all(dim=-1).sum().item())
             max_conf = out_a.memory.mem_conflict[rd].max(dim=-1).values
             app_clean_conflict += int((max_conf < 0.95).sum().item())
+
+    lr_tot = 0
+    lr_4f = 0
+    lr_ser = 0
+    n_lr_batches = 4 if num_batches >= 2 else 1
+    bsz_lr = 8 if num_batches >= 2 else 4
+    for bi_lr in range(n_lr_batches):
+        blr = _move_batch_v2_to_device(
+            val_engine.sample_batch(
+                bsz_lr,
+                seq_len=12,
+                approach_prob=0.0,
+                lowres_sr_prob=1.0,
+                regime_override=REGIME_NAMES[0],
+                seed=seed + 2000 + bi_lr,
+            ),
+            device,
+        )
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=val_amp):
+            out_lr = model.forward_sequence(
+                crops=blr["crops"],
+                timestamps_s=blr["timestamps_s"],
+                plate_sides=blr.get("plate_sides"),
+                geom_meta=blr.get("geom_meta"),
+                frame_pad_mask=blr.get("frame_pad_mask"),
+                compute_prefix_readout=False,
+                compute_stroke_mask=False,
+            )
+        rd_lr = blr["target_status"] == 0
+        if rd_lr.any():
+            ps_lr = out_lr.slot_logits[rd_lr].argmax(dim=-1)
+            ts_lr = blr["target_slots"][rd_lr]
+            eq_lr = ps_lr == ts_lr
+            lr_tot += int(rd_lr.sum().item())
+            lr_4f += int(eq_lr.all(dim=-1).sum().item())
+            lr_ser += int(eq_lr[:, 8:12].all(dim=-1).sum().item())
 
     err_counts = kl_surprise_sum / (tok_occ_counts + 1.5)
     err_counts[0] = 0.0
@@ -887,6 +1035,8 @@ def evaluate_synthetic_val(
         "val_approach_4field": round(app_4f / max(1, app_tot), 4),
         "val_approach_serial": round(app_ser / max(1, app_tot), 4),
         "val_approach_no_false_conflict": round(app_clean_conflict / max(1, app_tot), 4),
+        "val_lowres_sr_4field": round(lr_4f / max(1, lr_tot), 4),
+        "val_lowres_sr_serial": round(lr_ser / max(1, lr_tot), 4),
     }
     return metrics, err_counts.detach().cpu()
 
@@ -992,7 +1142,6 @@ def train_preset_from_scratch(
     t0 = time.perf_counter()
     val_snapshots: list[dict[str, Any]] = []
     skipped_nan = 0
-    cached_raw_batch: dict[str, Any] | None = None
     seq_time_keys = (
         "crops",
         "geom_meta",
@@ -1003,6 +1152,7 @@ def train_preset_from_scratch(
         "slot_glare",
         "frame_slot_targets",
         "is_monochrome_ir",
+        "polarity_target",
         "stroke_mask_gt",
     )
 
@@ -1010,32 +1160,77 @@ def train_preset_from_scratch(
         stage = _stage_for_step(step, total_steps, fracs)
         if engine.curriculum_stage != stage:
             engine.set_curriculum_stage(stage)
-            cached_raw_batch = None
+
+        step_frac = float(step) / float(max(1, total_steps - 1))
+        criterion.label_smoothing = float(0.006 + (0.001 - 0.006) * step_frac)
 
         lr_now = _cosine_lr(step, total_steps, warmup=warmup_steps, max_lr=max_lr, min_lr=2.0e-5)
         for pg in optimizer.param_groups:
             pg["lr"] = lr_now
 
+        # 100% fresh GPU synthetic batches every step (zero cached_raw_batch reuse!)
         u_mode = float(torch.rand((), generator=lh_rng).item())
         init_state: MemoryStateV2 | None = None
-        if step % 4 != 3 or cached_raw_batch is None:
-            if stage >= 2 and total_steps >= 40 and u_mode < 0.24:
-                t_app = int(torch.randint(24, 41, (), generator=lh_rng).item())
-                bsz_cur = max(6, (batch_size * seq_len) // t_app)
+        if stage >= 2 and total_steps >= 40 and u_mode < 0.30:
+            # 30% Differentiable Long-Horizon T=20..24 sequences across 4 temporal regimes:
+            # (1) pure 12..26px low-res SR, (2) far->near approach, (3) near->far receding, (4) bell-curve!
+            t_lh = int(torch.randint(20, 25, (), generator=lh_rng).item())
+            bsz_lh = max(2, min(batch_size, (batch_size * seq_len) // t_lh))
+            u_sub = float(torch.rand((), generator=lh_rng).item())
+            if u_sub < 0.28:
                 raw_batch = _move_batch_v2_to_device(
-                    engine.sample_batch(bsz_cur, seq_len=t_app, approach_prob=0.85), device
+                    engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.0, lowres_sr_prob=1.0),
+                    device,
                 )
+                batch = dict(raw_batch)
+            elif u_sub < 0.56:
+                raw_batch = _move_batch_v2_to_device(
+                    engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.90, lowres_sr_prob=0.0),
+                    device,
+                )
+                batch = dict(raw_batch)
+            elif u_sub < 0.80:
+                raw_batch = _move_batch_v2_to_device(
+                    engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.90, lowres_sr_prob=0.0),
+                    device,
+                )
+                batch = dict(raw_batch)
+                rev_mask = batch["target_status"] != 2
+                if bool(rev_mask.any()):
+                    for tk in seq_time_keys:
+                        tv = batch.get(tk)
+                        if isinstance(tv, torch.Tensor) and tv.ndim >= 2 and tv.shape[1] == t_lh:
+                            m_shape = (-1,) + (1,) * (tv.ndim - 1)
+                            batch[tk] = torch.where(rev_mask.view(m_shape), torch.flip(tv, dims=[1]), tv)
             else:
-                raw_batch = _move_batch_v2_to_device(engine.sample_batch(batch_size, seq_len=seq_len), device)
-            cached_raw_batch = dict(raw_batch)
+                t_half = max(6, (t_lh + 1) // 2)
+                b_half = _move_batch_v2_to_device(
+                    engine.sample_batch(bsz_lh, seq_len=t_half, approach_prob=0.92, lowres_sr_prob=0.0),
+                    device,
+                )
+                t_rem = max(2, t_lh - t_half)
+                batch = dict(b_half)
+                for tk in seq_time_keys:
+                    tv = b_half.get(tk)
+                    if isinstance(tv, torch.Tensor) and tv.ndim >= 2 and tv.shape[1] == t_half:
+                        tail = torch.flip(tv, dims=[1])[:, :t_rem]
+                        batch[tk] = torch.cat([tv, tail], dim=1)
+                dt_s = (b_half["timestamps_s"][:, -1:] - b_half["timestamps_s"][:, -2:-1]).clamp_min(0.04)
+                extra_ts = b_half["timestamps_s"][:, -1:] + dt_s * torch.arange(
+                    1, t_rem + 1, device=device, dtype=torch.float32
+                ).unsqueeze(0)
+                batch["timestamps_s"] = torch.cat([b_half["timestamps_s"], extra_ts], dim=1)
+            ts_in = batch["timestamps_s"]
+        else:
+            raw_batch = _move_batch_v2_to_device(engine.sample_batch(batch_size, seq_len=seq_len), device)
             batch = dict(raw_batch)
             ts_in = batch["timestamps_s"]
-            if batch["crops"].shape[1] == seq_len and stage >= 2 and total_steps >= 40 and 0.24 <= u_mode < 0.46:
+            if batch["crops"].shape[1] == seq_len and stage >= 2 and total_steps >= 40 and 0.30 <= u_mode < 0.50:
                 init_state, ts_in = _build_approach_or_dwell_prefix_state(
                     model, batch, lh_rng, use_amp=use_amp
                 )
-            elif stage >= 2 and total_steps >= 40 and batch["crops"].shape[1] >= 4 and u_mode >= 0.84:
-                # Calibrate K=1..5 single-frame & short-burst passes on fresh plates too
+            elif stage >= 2 and total_steps >= 40 and batch["crops"].shape[1] >= 4 and u_mode >= 0.88:
+                # Calibrate K=1..5 single-frame & short-burst passes on fresh plates
                 bsz_f, seq_f = batch["crops"].shape[:2]
                 t_eff = torch.randint(1, min(6, seq_f + 1), (bsz_f, 1), generator=lh_rng).to(device)
                 t_grid = torch.arange(seq_f, device=device).unsqueeze(0)
@@ -1043,50 +1238,13 @@ def train_preset_from_scratch(
                 is_mix_b = batch["target_status"] == 2
                 short_pad = torch.where(is_mix_b.unsqueeze(1), torch.zeros_like(short_pad), short_pad)
                 act_read = batch["slot_readability"] * (~short_pad).unsqueeze(-1).float()
-                wiped_short = act_read.amax(dim=(1, 2)) < 0.18
+                wiped_short = torch.linalg.vector_norm(act_read, ord=2, dim=1).amax(dim=-1) < 0.095
                 orig_st = batch["target_status"]
                 batch["target_status"] = torch.where(
                     is_mix_b,
                     orig_st,
                     torch.where((orig_st == 1) | wiped_short, torch.ones_like(orig_st), torch.zeros_like(orig_st)),
                 )
-                batch["frame_pad_mask"] = short_pad
-        else:
-            batch = dict(cached_raw_batch)
-            ts_in = batch["timestamps_s"]
-            bsz_cur, seq_cur = batch["crops"].shape[:2]
-            if u_mode < 0.65 and seq_cur >= 2:
-                # Reverse non-mixed sequences along time (`near -> far` receding pass supervision!)
-                rev_mask = batch["target_status"] != 2
-                if bool(rev_mask.any()):
-                    for tk in seq_time_keys:
-                        tv = batch.get(tk)
-                        if isinstance(tv, torch.Tensor) and tv.ndim >= 2 and tv.shape[1] == seq_cur:
-                            flipped = torch.flip(tv, dims=[1])
-                            m_shape = (-1,) + (1,) * (tv.ndim - 1)
-                            batch[tk] = torch.where(rev_mask.view(m_shape), flipped, tv)
-            elif stage >= 2 and total_steps >= 40 and seq_cur >= 4:
-                # Calibrate K=1..5 single-frame & short-burst passes explicitly
-                t_eff = torch.randint(
-                    1, min(6, seq_cur + 1), (bsz_cur, 1), generator=lh_rng
-                ).to(device)
-                t_grid = torch.arange(seq_cur, device=device).unsqueeze(0)
-                short_pad = t_grid >= t_eff
-                is_mix_b = batch["target_status"] == 2
-                short_pad = torch.where(is_mix_b.unsqueeze(1), torch.zeros_like(short_pad), short_pad)
-                act_read = batch["slot_readability"] * (~short_pad).unsqueeze(-1).float()
-                wiped_short = act_read.amax(dim=(1, 2)) < 0.18
-                orig_st = batch["target_status"]
-                recomp_st = torch.where(
-                    is_mix_b,
-                    orig_st,
-                    torch.where(
-                        (orig_st == 1) | wiped_short,
-                        torch.ones_like(orig_st),
-                        torch.zeros_like(orig_st),
-                    ),
-                )
-                batch["target_status"] = recomp_st
                 batch["frame_pad_mask"] = short_pad
 
         want_stroke = bool("stroke_mask_gt" in batch and batch["stroke_mask_gt"] is not None)
@@ -1104,6 +1262,7 @@ def train_preset_from_scratch(
                 compute_prefix_readout=True,
                 compute_stroke_mask=want_stroke,
                 init_state=init_state,
+                target_status=batch.get("target_status"),
             )
 
         loss, metrics = criterion(model, seq_out, batch, compute_garbage_invariance=do_aux_pair)
@@ -1116,6 +1275,7 @@ def train_preset_from_scratch(
                 gen=lh_rng,
                 batch_n=min(16, batch_size),
                 use_amp=use_amp,
+                pad_id=vocab.pad_id,
             )
             loss = loss + 0.35 * loss_hn
             if stage >= 2:
@@ -1159,7 +1319,12 @@ def train_preset_from_scratch(
                 flush=True,
             )
 
+        seq_out = None
+        loss = None
+        batch = None
         if (step + 1) % eval_every == 0 or (step + 1) == total_steps:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             val_m, err_vec = evaluate_synthetic_val(
                 ema.ema_model,
                 vocab=vocab,
@@ -1184,9 +1349,9 @@ def train_preset_from_scratch(
         warmup_steps=warmup_steps,
         max_lr=max_lr,
         min_lr=2.0e-5,
-        long_horizon_prob=0.24,
-        approach_batch_prob=0.28,
-        approach_seq_len_range=(24, 40),
+        long_horizon_prob=0.20,
+        approach_batch_prob=0.30,
+        approach_seq_len_range=(20, 24),
         curriculum_fractions=fracs,
         seed=data_seed,
     )
@@ -1252,7 +1417,7 @@ def train_preset_from_scratch(
     graph_names = ("frame_encoder", "memory_step", "memory_readout", "stopping_risk")
     artifact_sizes = {f"{name}.int8.onnx": (onnx_dir / f"{name}.int8.onnx").stat().st_size for name in graph_names}
     if preset == "nano":
-        assert sum(artifact_sizes.values()) <= 4 * 1024**2, artifact_sizes
+        assert sum(artifact_sizes.values()) <= 6 * 1024**2, artifact_sizes
     meta_summary["int8_bytes"] = artifact_sizes
     meta_summary["checkpoint_sha256"] = compute_file_sha256(ckpt_path)
     meta_summary["provenance_verification"] = prov_report
@@ -1299,21 +1464,80 @@ def main() -> None:
     eval_ev = 4 if args.dry_run else 600
     val_b = 1 if args.dry_run else 6
 
-    base_ema, base_ckpt, base_summary = train_preset_from_scratch(
-        preset="base",
-        total_steps=base_steps,
-        batch_size=bsz,
-        seq_len=seq_l,
-        max_lr=1.75e-3,
-        init_seed=args.base_init_seed,
-        data_seed=BASE_DATA_SEED,
-        out_models_dir=out_dir,
-        device=device,
-        teacher_model=None,
-        teacher_ckpt_path=None,
-        eval_every=eval_ev,
-        val_batches=val_b,
-    )
+    if args.nano_only:
+        src_base_ckpt = (args.base_ckpt or (out_dir / "mf_plate_ocr_v2_base.pt")).resolve()
+        if not src_base_ckpt.is_file():
+            raise FileNotFoundError(f"--base-ckpt not found: {src_base_ckpt}")
+        verify_checkpoint_provenance(src_base_ckpt, repo_root=REPO_ROOT, verify_source_hashes=False)
+        raw_ckpt = torch.load(src_base_ckpt, map_location="cpu", weights_only=False)
+        vocab = PlateVocab()
+        base_cfg = ModelConfigV2.from_preset("base", vocab_size=vocab.size)
+        base_raw, init_sha = instantiate_deterministic_scratch_model(base_cfg, init_seed=int(raw_ckpt["provenance"]["init_seed"]))
+        assert init_sha == raw_ckpt["provenance"]["init_state_sha256"]
+        base_raw.load_state_dict(raw_ckpt["model_state_dict"], strict=True)
+        base_ema = MFJPPlateOCRV2(base_cfg)
+        base_ema.load_state_dict(raw_ckpt.get("ema_state_dict", raw_ckpt["model_state_dict"]), strict=True)
+        base_ema.eval()
+        base_ckpt = out_dir / "mf_plate_ocr_v2_base.pt"
+        base_summary = dict(raw_ckpt.get("metrics") or {})
+        base_summary["checkpoint"] = str(base_ckpt)
+        tc_dict = dict(raw_ckpt.get("train_config") or {})
+        tc_rec = TrainConfigV2(**{k: v for k, v in tc_dict.items() if k in TrainConfigV2.__dataclass_fields__})
+        prov_manifest = build_synthetic_provenance_manifest(
+            init_mode="random_scratch",
+            init_seed=int(raw_ckpt["provenance"]["init_seed"]),
+            init_state_sha256=init_sha,
+            repo_root=REPO_ROOT,
+            training_script=TRAINING_SCRIPT_REL,
+            parent_checkpoint=None,
+            teacher_checkpoint=None,
+        )
+        save_checkpoint_v2(
+            base_ckpt,
+            model=base_raw,
+            ema_model=base_ema,
+            train_config=tc_rec,
+            metrics=base_summary,
+            provenance=prov_manifest,
+        )
+        del base_raw
+        prov_report = verify_checkpoint_provenance(base_ckpt, repo_root=REPO_ROOT, verify_source_hashes=True)
+        assert prov_report["verified"] is True
+        onnx_base_dir = out_dir / "onnx_v2_base"
+        export_ocr_v2_to_onnx(base_ema, onnx_base_dir)
+        quantize_onnx_v2_for_cpu(onnx_base_dir)
+        hyg_fp32 = verify_onnx_patent_hygiene(onnx_base_dir, use_int8=False)
+        hyg_int8 = verify_onnx_patent_hygiene(onnx_base_dir, use_int8=True)
+        assert hyg_fp32["patent_clean"] is True and hyg_int8["patent_clean"] is True
+        parity = verify_onnx_v2_parity(base_ema, onnx_base_dir, providers=["CPUExecutionProvider"], atol=2.5e-4)
+        assert parity["max_abs_diff"] < 2.5e-4, parity
+        base_summary["checkpoint_sha256"] = compute_file_sha256(base_ckpt)
+        base_summary["provenance_verification"] = prov_report
+        base_summary["onnx_dir"] = str(onnx_base_dir)
+        base_summary["onnx_patent_clean_fp32"] = True
+        base_summary["onnx_patent_clean_int8"] = True
+        base_summary["onnx_max_abs_diff"] = parity["max_abs_diff"]
+        print(
+            f"=== [BASE LOADED, EXPORTED & PROVENANCE-VERIFIED] max_abs_diff={parity['max_abs_diff']:.2e} ===",
+            flush=True,
+        )
+        base_ema = base_ema.to(device).eval()
+    else:
+        base_ema, base_ckpt, base_summary = train_preset_from_scratch(
+            preset="base",
+            total_steps=base_steps,
+            batch_size=bsz,
+            seq_len=seq_l,
+            max_lr=1.75e-3,
+            init_seed=args.base_init_seed,
+            data_seed=BASE_DATA_SEED,
+            out_models_dir=out_dir,
+            device=device,
+            teacher_model=None,
+            teacher_ckpt_path=None,
+            eval_every=eval_ev,
+            val_batches=val_b,
+        )
 
     nano_ema, _, nano_summary = train_preset_from_scratch(
         preset="nano",

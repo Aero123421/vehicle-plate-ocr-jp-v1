@@ -17,7 +17,7 @@ from vpocr_ocr.vocab import NUM_SLOTS
 
 @dataclass
 class ModelConfigV2:
-    """Architecture configuration for `MFJPPlateOCRV2` ('base' ~1.45M, 'nano' ~1.02M)."""
+    """Architecture configuration for `MFJPPlateOCRV2` ('base' Teacher & 'nano' Stage-3 Nano-Plus)."""
 
     vocab_size: int = 254
     num_plate_types: int = 5
@@ -26,25 +26,26 @@ class ModelConfigV2:
     canonical_margin: float = 0.05
     is_v2: bool = True
     gen5_arch: bool = True
-    d_model: int = 128
-    c1: int = 44
-    c2: int = 88
-    c3: int = 112
-    blocks: tuple[int, int, int] = (2, 4, 2)
-    d_color: int = 32
-    num_heads: int = 4
+    d_model: int = 192
+    c0: int = 0
+    c1: int = 64
+    c2: int = 128
+    c3: int = 192
+    blocks: tuple[int, int, int] = (3, 6, 3)
+    d_color: int = 48
+    num_heads: int = 6
     mlp_ratio: float = 2.0
     conv_expansion: int = 2
     geom_dim: int = 10
     dropout: float = 0.0
     deployed: bool = False
     latent_prior_variance: float = 100.0
-    nuisance_variance_init: float = 1.0
+    nuisance_variance_init: float = 0.025
     nuisance_time_constant_s_init: float = 1.0
 
     @classmethod
     def from_preset(cls, preset: str = "base", vocab_size: int = 254) -> ModelConfigV2:
-        """Create validated Gen-5 preset ('base' or 'nano')."""
+        """Create validated Stage-3 preset ('base' teacher or 'nano' Nano-Plus)."""
         p = preset.lower().strip()
         if p == "base":
             return cls(
@@ -53,15 +54,17 @@ class ModelConfigV2:
                 canonical_margin=0.05,
                 is_v2=True,
                 gen5_arch=True,
-                d_model=128,
-                c1=44,
-                c2=88,
-                c3=112,
-                blocks=(2, 4, 2),
-                d_color=32,
-                num_heads=4,
+                d_model=192,
+                c0=48,
+                c1=64,
+                c2=128,
+                c3=192,
+                blocks=(3, 6, 3),
+                d_color=48,
+                num_heads=6,
                 mlp_ratio=2.0,
                 conv_expansion=2,
+                nuisance_variance_init=0.025,
             )
         if p == "nano":
             return cls(
@@ -71,14 +74,16 @@ class ModelConfigV2:
                 is_v2=True,
                 gen5_arch=True,
                 d_model=112,
-                c1=36,
-                c2=72,
-                c3=96,
-                blocks=(2, 4, 2),
+                c0=32,
+                c1=48,
+                c2=96,
+                c3=128,
+                blocks=(3, 5, 3),
                 d_color=32,
                 num_heads=4,
                 mlp_ratio=2.0,
                 conv_expansion=2,
+                nuisance_variance_init=0.025,
             )
         raise ValueError(f"Unknown ModelConfigV2 preset: {preset!r} (expected 'base' or 'nano')")
 
@@ -167,6 +172,7 @@ class SequenceOutputV2(NamedTuple):
     next_prefix_readout: MemoryReadoutV2 | None = None
     prefix_next_risk: torch.Tensor | None = None
     innovation_nll: torch.Tensor | None = None
+    vault_bypass_mask: torch.Tensor | None = None
 
 
 def _fuse_conv_bn_double(
@@ -485,10 +491,10 @@ def _build_statutory_length_anchor_tables(
         [(0.2757, 0.030), (0.3403, 0.030), (0.4048, 0.030), (0.4694, 0.030)],
     ]
     cls_u0_su0 = [
-        # L_cls = 1 (1-digit class): Slot 4 centered; Slots 5..6 in right blank margin
-        [(0.6006, 0.042), (0.6920, 0.024), (0.7480, 0.022)],
-        # L_cls = 2 (2-digit class e.g. 54, 33): Slots 4..5 active; Slot 6 in right blank margin
-        [(0.5775, 0.040), (0.6612, 0.040), (0.7480, 0.022)],
+        # L_cls = 1 (1-digit class, widened right-field gap): Slot 4 centered; Slots 5..6 in right blank margin
+        [(0.6220, 0.052), (0.7180, 0.022), (0.7580, 0.020)],
+        # L_cls = 2 (2-digit class e.g. 54, 33, widened gap): Slots 4..5 active; Slot 6 in right blank margin
+        [(0.5860, 0.046), (0.6720, 0.046), (0.7540, 0.020)],
         # L_cls = 3 (3-char class e.g. 330, 580, 35A): Slots 4..6 active
         [(0.5549, 0.036), (0.6296, 0.036), (0.7045, 0.036)],
     ]
@@ -519,27 +525,29 @@ def _build_statutory_length_anchor_tables(
 
 
 class PatchTopologyMixer(nn.Module):
-    """Nonlinear `3x3` spatial-channel mixer preserving 2D stroke crossings & enclosed counters.
+    """Nonlinear `5x5` (`25`-point) spatial-channel mixer preserving fine 2D stroke corridors & loops.
 
     Uses strictly ONNX-whitelisted `MatMul`, `Add`, `Reshape`, `Sigmoid`, and `Mul` ops with
-    hidden dimensions guaranteed `!= vocab_size`.
+    hidden dimensions guaranteed `!= vocab_size` (`25 * d_bot != 254`).
     """
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, num_points: int = 25) -> None:
         super().__init__()
         d_bot = max(16, d_model // 4)
-        if 9 * d_bot == 254:
+        if d_bot == 254 or (num_points * d_bot) == 254:
             d_bot += 4
+        assert (num_points * d_bot) != 254 and d_bot != 254
+        self.num_points = int(num_points)
         self.d_bot = d_bot
         self.down = nn.Linear(d_model, d_bot)
-        self.mix = nn.Linear(9 * d_bot, d_model)
+        self.mix = nn.Linear(self.num_points * d_bot, d_model)
         self.up = nn.Linear(d_model, d_model)
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, v_combined: torch.Tensor) -> torch.Tensor:
-        v_b = self.down(v_combined)  # (N, 12, 9, d_bot)
-        v_flat = v_b.reshape(-1, NUM_SLOTS, 9 * self.d_bot)  # (N, 12, 9 * d_bot)
+        v_b = self.down(v_combined)  # (N, 12, P, d_bot)
+        v_flat = v_b.reshape(-1, NUM_SLOTS, self.num_points * self.d_bot)  # (N, 12, P * d_bot)
         return self.up(F.silu(self.mix(v_flat)))  # (N, 12, D)
 
 
@@ -739,8 +747,10 @@ class EvidenceMemoryV2(nn.Module):
             pose_ema = torch.zeros(h.shape[0], self.state_dim, device=h.device)
         packed = pose_ema.float()
         mb, vb, cross = packed[:, 4:4+n], packed[:, 4+n:4+2*n], packed[:, 4+2*n:4+3*n]
-        nv = self._expand_channels(torch.exp(self.log_nuisance_variance.clamp(-10, 10)))[None]
-        tau = self._expand_channels(torch.exp(self.log_time_constant.clamp(-10, 10)))[None]
+        nv = self._expand_channels(
+            torch.exp(self.log_nuisance_variance.clamp(math.log(0.015), math.log(0.08)))
+        )[None]
+        tau = self._expand_channels(torch.exp(self.log_time_constant.clamp(-6.0, 6.0)))[None]
         ts = torch.where((timestamp_s > -1e9) & (timestamp_s < 1e9), timestamp_s, last_timestamp_s)
         dt = torch.clamp(ts - last_timestamp_s, min=0)[:, None]
         a = torch.exp(-dt / tau)
@@ -800,7 +810,7 @@ def noncharacter_quality_features(state, support, geometry_variance):
 
 
 class MFJPPlateOCRV2(nn.Module):
-    """Gen-2 Multi-Frame Japanese License Plate OCR (`v2-Base` ~1.09M / `v2-Nano` ~0.41M)."""
+    """Stage-3 Multi-Frame Japanese License Plate OCR (`Base` Teacher & `Nano-Plus` Student)."""
 
     is_v2: bool = True
 
@@ -819,16 +829,21 @@ class MFJPPlateOCRV2(nn.Module):
         h4, w4 = h_in // 4, w_in // 4
         h8, w8 = h_in // 8, w_in // 8
 
-        # 1. Photometric stem + RepMobile backbone (zero runtime BN after reparameterize())
+        # 1. Photometric stem + Full-Res F1 stage + RepMobile backbone (zero runtime BN after reparameterize())
         self.photo_stem = PhotometricStem()
         if self.config.gen5_arch:
-            c0 = max(16, c1 // 2)
+            c0 = self.config.c0 if self.config.c0 > 0 else max(16, c1 // 2)
             self.pre_s1: RepConv3x3 | None = RepConv3x3(
                 4, c0, stride=1, groups=1, act=True, deployed=dep
             )
+            self.stage0: RepMobileBlock | None = RepMobileBlock(
+                c0, expansion=exp, deployed=dep
+            )
             self.ds1 = RepConv3x3(c0, c1, stride=2, groups=1, act=True, deployed=dep)
         else:
+            c0 = 0
             self.pre_s1 = None
+            self.stage0 = None
             self.ds1 = RepConv3x3(4, c1, stride=2, groups=1, act=True, deployed=dep)
         self.stage1 = nn.Sequential(
             *[RepMobileBlock(c1, expansion=exp, deployed=dep) for _ in range(b1)]
@@ -842,16 +857,28 @@ class MFJPPlateOCRV2(nn.Module):
             *[RepMobileBlock(c3, expansion=exp, deployed=dep) for _ in range(b3)]
         )
 
-        # 2. Asymmetric Multi-Scale FPN (F2: stride 2 upper-row high-acuity, F4: stride 4, F8: stride 8)
+        # 2. 4-Level Asymmetric Multi-Scale FPN (F1: 80x160 full-res, F2: 40x80, F4: 20x40, F8: 10x20)
         self.f2_lat = RepConv1x1(c1, d, act=False, use_identity=False, deployed=dep)
         self.f4_lat = RepConv1x1(c2, d, act=False, use_identity=False, deployed=dep)
         self.f8_lat = RepConv1x1(c3, d, act=False, use_identity=False, deployed=dep)
         if self.config.gen5_arch:
+            self.f1_lat: RepConv1x1 | None = RepConv1x1(
+                c0, d, act=False, use_identity=False, deployed=dep
+            )
+            self.f1_refine: nn.Sequential | None = nn.Sequential(
+                RepConv3x3(d, d, stride=1, groups=d, act=True, deployed=dep),
+                RepConv1x1(d, d, act=True, use_identity=True, deployed=dep),
+            )
             self.f2_refine: nn.Sequential | None = nn.Sequential(
                 RepConv3x3(d, d, stride=1, groups=d, act=True, deployed=dep),
                 RepConv1x1(d, d, act=True, use_identity=True, deployed=dep),
             )
+            p1_y, p1_x = _build_1d_sincos_pos_pair_v2(d, h_in, w_in)
+            self.register_buffer("pos_f1_y", p1_y)
+            self.register_buffer("pos_f1_x", p1_x)
         else:
+            self.f1_lat = None
+            self.f1_refine = None
             self.f2_refine = None
         self.f4_refine = nn.Sequential(
             RepConv3x3(d, d, stride=1, groups=d, act=True, deployed=dep),
@@ -872,7 +899,6 @@ class MFJPPlateOCRV2(nn.Module):
         self.register_buffer("pos_f8_x", p8_x)
 
         # 3. Row-strip alignment vector a_t + plate_side + 10-D geom_meta conditioning
-        # Horizontal 8-bin normalized Gaussian projection for resolution-agnostic row profiles
         xs_w4 = (torch.arange(w4, dtype=torch.float32) + 0.5) / float(w4)
         bin_centers = (torch.arange(8, dtype=torch.float32) + 0.5) / 8.0
         gx = torch.exp(-0.5 * ((xs_w4[:, None] - bin_centers[None, :]) / 0.085).pow(2))
@@ -901,7 +927,7 @@ class MFJPPlateOCRV2(nn.Module):
             nn.Linear(d, d),
         )
 
-        # 4. 2-Pass Local Deformable Slot Sampler + Depthwise 3x3 Point Weights + 12x12 SA
+        # 4. 2-Pass Local 5x5 (25-point) Deformable Slot Sampler + 3-Scale Gated FPN Routing
         anchors, steps = _build_canonical_slot_anchors(self.config.canonical_margin)
         self.register_buffer("slot_anchors_uv", anchors)  # (12, 2)
         self.register_buffer("slot_steps_uv", steps)      # (12, 2)
@@ -927,24 +953,30 @@ class MFJPPlateOCRV2(nn.Module):
             self.reg_len_head = None
             self.cls_len_head = None
 
-        grid_1d = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
-        gy, gx_3 = torch.meshgrid(grid_1d, grid_1d, indexing="ij")
-        grid_3x3 = torch.stack([gx_3.reshape(-1), gy.reshape(-1)], dim=-1)  # (9, 2)
-        self.register_buffer("local_grid_3x3", grid_3x3)
+        grid_1d_5 = torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=torch.float32)
+        gy5, gx5 = torch.meshgrid(grid_1d_5, grid_1d_5, indexing="ij")
+        grid_5x5 = torch.stack([gx5.reshape(-1), gy5.reshape(-1)], dim=-1)  # (25, 2)
+        self.register_buffer("local_grid_5x5", grid_5x5)
 
         self.slot_embed = nn.Parameter(torch.randn(1, NUM_SLOTS, d) * 0.02)
-        # Learned per-slot F2 vs F4 high-acuity gate for upper-row 40mm Kanji/Class slots 0..6
-        self.upper_scale_gate = nn.Parameter(torch.full((1, 7, 1, d), 0.7, dtype=torch.float32))
-        # Learned per-slot F4 vs F8 scale gate for lower-row slots 7..11 (init +0.6 -> favors F4 detail)
-        self.lower_scale_gate = nn.Parameter(torch.full((1, 5, 1, d), 0.6, dtype=torch.float32))
+        # Slots 0..7 (Region + Classification + Hiragana) -> 3-scale softmax gate over (F1, F2, F4)
+        u_init = torch.tensor([0.55, 0.50, 0.0], dtype=torch.float32).view(1, 1, 3, 1).expand(1, 8, 3, d).clone()
+        self.upper_scale_gate = nn.Parameter(u_init)
+        # Slots 8..11 (4-digit Serial) -> 3-scale softmax gate over (F2, F4, F8)
+        l_init = torch.tensor([0.35, 0.55, 0.0], dtype=torch.float32).view(1, 1, 3, 1).expand(1, 4, 3, d).clone()
+        self.lower_scale_gate = nn.Parameter(l_init)
+        self.scale_geom_proj = nn.Linear(d // 2, 6)
+        nn.init.zeros_(self.scale_geom_proj.weight)
+        nn.init.zeros_(self.scale_geom_proj.bias)
 
         # Pass 1 deformable offset/scale head from (slot_embed + a_t)
         self.offset_head_1 = nn.Linear(d, 4)
         nn.init.zeros_(self.offset_head_1.weight)
         nn.init.zeros_(self.offset_head_1.bias)
-        self.point_weights_1 = nn.Parameter(torch.full((1, NUM_SLOTS, 9, d), 1.0 / 9.0))
+        self.point_weights_1 = nn.Parameter(torch.full((1, NUM_SLOTS, 25, 1), 1.0 / 25.0))
+        self.point_ch_scale_1 = nn.Parameter(torch.ones((1, NUM_SLOTS, d)))
         self.patch_mixer_1: PatchTopologyMixer | None = (
-            PatchTopologyMixer(d) if self.config.gen5_arch else None
+            PatchTopologyMixer(d, num_points=25) if self.config.gen5_arch else None
         )
         self.sample_proj_1 = nn.Linear(d, d)
         self.intra_sa_1 = IntraSlotAttention(
@@ -955,9 +987,10 @@ class MFJPPlateOCRV2(nn.Module):
         self.offset_head_2 = nn.Linear(d, 4)
         nn.init.zeros_(self.offset_head_2.weight)
         nn.init.zeros_(self.offset_head_2.bias)
-        self.point_weights_2 = nn.Parameter(torch.full((1, NUM_SLOTS, 9, d), 1.0 / 9.0))
+        self.point_weights_2 = nn.Parameter(torch.full((1, NUM_SLOTS, 25, 1), 1.0 / 25.0))
+        self.point_ch_scale_2 = nn.Parameter(torch.ones((1, NUM_SLOTS, d)))
         self.patch_mixer_2: PatchTopologyMixer | None = (
-            PatchTopologyMixer(d) if self.config.gen5_arch else None
+            PatchTopologyMixer(d, num_points=25) if self.config.gen5_arch else None
         )
         self.sample_proj_2 = nn.Linear(d, d)
         self.intra_sa_2 = IntraSlotAttention(
@@ -1023,8 +1056,6 @@ class MFJPPlateOCRV2(nn.Module):
             nn.SiLU(),
             nn.Linear(dc, 2),  # [pol_logit, raw_pol_prec]
         )
-        # rim_feat(c1) + mid_feat(c1) + chr_feat(c1) + rim_rgb(3) + mid_rgb(3) + chr_rgb(3)
-        # + [y_mid, y_chr, y_mid - y_chr, tanh(0.25 * pol_logit)] (4) = c1 * 3 + 13
         color_in_dim = c1 * 3 + 13
         self.color_feat_head = nn.Sequential(
             nn.Linear(color_in_dim, dc * 2),
@@ -1046,12 +1077,17 @@ class MFJPPlateOCRV2(nn.Module):
         )
         self.register_buffer("laplacian_kernel", lap_k)
 
-        # 6. Anisotropic EvidenceMemoryV2 + Single Final Readout Heads
-        self.memory_filter = EvidenceMemoryV2(d_model=d, d_color=dc,
+        # 6. Anisotropic EvidenceMemoryV2 + Single Final Readout Heads (2-layer SA + polarity/color context)
+        self.memory_filter = EvidenceMemoryV2(
+            d_model=d,
+            d_color=dc,
             prior_variance=self.config.latent_prior_variance,
             nuisance_variance_init=self.config.nuisance_variance_init,
-            time_constant_s_init=self.config.nuisance_time_constant_s_init)
-        self.stopping_risk_head = nn.Sequential(nn.Linear(10, 16), nn.SiLU(), nn.Linear(16, 2), nn.Sigmoid())
+            time_constant_s_init=self.config.nuisance_time_constant_s_init,
+        )
+        self.stopping_risk_head = nn.Sequential(
+            nn.Linear(10, 16), nn.SiLU(), nn.Linear(16, 2), nn.Sigmoid()
+        )
 
         self.readout_slot_embed = nn.Parameter(torch.randn(1, NUM_SLOTS, d) * 0.02)
         ro_hidden = int(round(d * 1.5))
@@ -1066,11 +1102,20 @@ class MFJPPlateOCRV2(nn.Module):
             self.readout_color_proj: nn.Linear | None = nn.Linear(dc, d)
             nn.init.zeros_(self.readout_color_proj.weight)
             nn.init.zeros_(self.readout_color_proj.bias)
-            self.readout_sa: IntraSlotAttention | None = IntraSlotAttention(
-                d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
+            self.readout_pol_proj: nn.Linear | None = nn.Linear(2, d)
+            nn.init.zeros_(self.readout_pol_proj.weight)
+            nn.init.zeros_(self.readout_pol_proj.bias)
+            self.readout_sa: nn.Module | None = nn.Sequential(
+                IntraSlotAttention(
+                    d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
+                ),
+                IntraSlotAttention(
+                    d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
+                ),
             )
         else:
             self.readout_color_proj = None
+            self.readout_pol_proj = None
             self.readout_sa = None
         self.slot_classifier = nn.Linear(d, self.config.vocab_size)
 
@@ -1161,17 +1206,23 @@ class MFJPPlateOCRV2(nn.Module):
 
     def _gather_asymmetric_slots(
         self,
+        f1: torch.Tensor | None,
         f2: torch.Tensor,
         f4: torch.Tensor,
         f8: torch.Tensor,
         centers_uv: torch.Tensor,
         scales_uv: torch.Tensor,
         point_weights: torch.Tensor,
+        point_ch_scale: torch.Tensor,
         proj: nn.Linear,
+        geom_emb: torch.Tensor,
         base_steps_uv: torch.Tensor | None = None,
         patch_mixer: PatchTopologyMixer | None = None,
     ) -> torch.Tensor:
-        """Sample `3x3` local grids: slots `0..6` from gated `(F2, F4)`, slots `7..11` from gated `(F4, F8)`."""
+        """Sample `5x5` (`25`-point) local grids:
+        - Slots `0..7` (Region + Classification + Hiragana) from 3-scale gated `(F1, F2, F4)`.
+        - Slots `8..11` (Serial) from 3-scale gated `(F2, F4, F8)`.
+        """
         n, d, _, _ = f4.shape
         ref_steps = (
             base_steps_uv
@@ -1179,26 +1230,43 @@ class MFJPPlateOCRV2(nn.Module):
             else self.slot_steps_uv.to(dtype=f4.dtype).unsqueeze(0)
         )
         steps = ref_steps * scales_uv  # (N, 12, 2)
-        grid = self.local_grid_3x3.to(dtype=f4.dtype).reshape(1, 1, 9, 2)
-        coords = centers_uv.unsqueeze(2) + grid * steps.unsqueeze(2)  # (N, 12, 9, 2)
+        grid = self.local_grid_5x5.to(dtype=f4.dtype).reshape(1, 1, 25, 2)
+        coords = centers_uv.unsqueeze(2) + grid * steps.unsqueeze(2)  # (N, 12, 25, 2)
 
-        flat_all = coords.reshape(n, NUM_SLOTS * 9, 2)
-        v_f4 = contiguous_bilinear_gather(f4, flat_all).reshape(n, NUM_SLOTS, 9, d)
+        flat_all = coords.reshape(n, NUM_SLOTS * 25, 2)  # 300 != 254
+        v_f2 = contiguous_bilinear_gather(f2, flat_all).reshape(n, NUM_SLOTS, 25, d)
+        v_f4 = contiguous_bilinear_gather(f4, flat_all).reshape(n, NUM_SLOTS, 25, d)
 
-        flat_upper = coords[:, 0:7].reshape(n, 7 * 9, 2)
-        v_f2_upper = contiguous_bilinear_gather(f2, flat_upper).reshape(n, 7, 9, d)
-        u_gate = torch.sigmoid(self.upper_scale_gate.to(dtype=f4.dtype))  # (1, 7, 1, D)
-        v_upper = u_gate * v_f2_upper + (1.0 - u_gate) * v_f4[:, 0:7]
+        if f1 is not None:
+            flat_f1 = coords[:, 0:8].reshape(n, 8 * 25, 2)  # 200 != 254
+            v_f1_up = contiguous_bilinear_gather(f1, flat_f1).reshape(n, 8, 25, d)
+        else:
+            v_f1_up = v_f2[:, 0:8]
 
-        flat_lower = coords[:, 7:12].reshape(n, 5 * 9, 2)
-        v_f8_lower = contiguous_bilinear_gather(f8, flat_lower).reshape(n, 5, 9, d)
+        flat_f8 = coords[:, 8:12].reshape(n, 4 * 25, 2)  # 100 != 254
+        v_f8_lo = contiguous_bilinear_gather(f8, flat_f8).reshape(n, 4, 25, d)
 
-        gate = torch.sigmoid(self.lower_scale_gate.to(dtype=f4.dtype))  # (1, 5, 1, D)
-        v_lower = gate * v_f4[:, 7:12] + (1.0 - gate) * v_f8_lower
-        v_combined = torch.cat([v_upper, v_lower], dim=1)  # (N, 12, 9, D)
+        sg = self.scale_geom_proj(geom_emb)  # (N, 6)
+        u_logits = self.upper_scale_gate.to(dtype=f4.dtype) + sg[:, 0:3].reshape(-1, 1, 3, 1)
+        u_w = F.softmax(u_logits, dim=2)  # (N, 8, 3, D)
+        v_upper = (
+            u_w[:, :, 0:1] * v_f1_up
+            + u_w[:, :, 1:2] * v_f2[:, 0:8]
+            + u_w[:, :, 2:3] * v_f4[:, 0:8]
+        )  # (N, 8, 25, D)
 
-        pw = point_weights.to(dtype=f4.dtype)  # (1, 12, 9, D)
-        weighted = (v_combined * pw).sum(dim=2)  # (N, 12, D)
+        l_logits = self.lower_scale_gate.to(dtype=f4.dtype) + sg[:, 3:6].reshape(-1, 1, 3, 1)
+        l_w = F.softmax(l_logits, dim=2)  # (N, 4, 3, D)
+        v_lower = (
+            l_w[:, :, 0:1] * v_f2[:, 8:12]
+            + l_w[:, :, 1:2] * v_f4[:, 8:12]
+            + l_w[:, :, 2:3] * v_f8_lo
+        )  # (N, 4, 25, D)
+
+        v_combined = torch.cat([v_upper, v_lower], dim=1)  # (N, 12, 25, D)
+        pw = point_weights.to(dtype=f4.dtype)  # (1, 12, 25, 1)
+        cs = point_ch_scale.to(dtype=f4.dtype)  # (1, 12, D)
+        weighted = (v_combined * pw).sum(dim=2) * cs  # (N, 12, D)
         if patch_mixer is not None:
             weighted = weighted + patch_mixer(v_combined)
         return proj(weighted)
@@ -1219,23 +1287,86 @@ class MFJPPlateOCRV2(nn.Module):
         geom_meta: torch.Tensor | None = None,
         return_f4: bool = False,
         return_len_logits: bool = False,
-    ) -> tuple[FrameEncodingV2, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Internal encoder returning `(FrameEncodingV2, optional_f4, reg_len, cls_len)` cleanly."""
-        n, _, h_img, w_img = crops.shape
+        return_ungated_prec: bool = False,
+    ) -> tuple[
+        FrameEncodingV2,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ]:
+        """Internal encoder returning `(FrameEncodingV2, optional_f4, reg_len, cls_len, optional_ungated)`."""
+        n = crops.shape[0]
         if plate_sides is None:
             plate_sides = torch.zeros(n, dtype=torch.long, device=crops.device)
         if geom_meta is None:
             geom_meta = self._default_geom_meta_from_crops(crops)
+        if (
+            not torch.jit.is_tracing()
+            and not torch.onnx.is_in_onnx_export()
+            and not torch.is_grad_enabled()
+            and n > 48
+        ):
+            encs, f4s, rls, cls_ls, ugs = [], [], [], [], []
+            for i in range(0, n, 48):
+                j = min(n, i + 48)
+                e_i, f4_i, rl_i, cl_i, ug_i = self._encode_frames_impl(
+                    crops[i:j],
+                    plate_sides[i:j],
+                    geom_meta[i:j],
+                    return_f4=return_f4,
+                    return_len_logits=return_len_logits,
+                    return_ungated_prec=return_ungated_prec,
+                )
+                encs.append(e_i)
+                if f4_i is not None:
+                    f4s.append(f4_i)
+                if rl_i is not None:
+                    rls.append(rl_i)
+                if cl_i is not None:
+                    cls_ls.append(cl_i)
+                if ug_i is not None:
+                    ugs.append(ug_i)
+            enc_cat = FrameEncodingV2(
+                z=torch.cat([e.z for e in encs], dim=0),
+                lambda_prec=torch.cat([e.lambda_prec for e in encs], dim=0),
+                z_color=torch.cat([e.z_color for e in encs], dim=0),
+                lambda_color=torch.cat([e.lambda_color for e in encs], dim=0),
+                pol_logit=torch.cat([e.pol_logit for e in encs], dim=0),
+                pol_prec=torch.cat([e.pol_prec for e in encs], dim=0),
+                frame_valid_logit=torch.cat([e.frame_valid_logit for e in encs], dim=0),
+                slot_quality_logits=torch.cat([e.slot_quality_logits for e in encs], dim=0),
+                frame_valid_gate=torch.cat([e.frame_valid_gate for e in encs], dim=0),
+            )
+            ug_cat = (
+                (
+                    torch.cat([u[0] for u in ugs], dim=0),
+                    torch.cat([u[1] for u in ugs], dim=0),
+                    torch.cat([u[2] for u in ugs], dim=0),
+                )
+                if ugs
+                else None
+            )
+            return (
+                enc_cat,
+                (torch.cat(f4s, dim=0) if f4s else None),
+                (torch.cat(rls, dim=0) if rls else None),
+                (torch.cat(cls_ls, dim=0) if cls_ls else None),
+                ug_cat,
+            )
 
-        # 1. Stem + Full-Res Stride-1 Pre-Stem + RepMobile Backbone
+        # 1. Stem + Full-Res Stride-1 Stage (`80x160`) + RepMobile Backbone
         x0 = self.photo_stem(crops)           # (N, 4, H, W)
-        if self.pre_s1 is not None:
-            x0 = self.pre_s1(x0)              # (N, c0, H, W) resolves 7.8px Kanji at 1.0px/cell!
-        x2 = self.stage1(self.ds1(x0))        # (N, c1, H/2, W/2)
+        if self.pre_s1 is not None and self.stage0 is not None:
+            x1: torch.Tensor | None = self.stage0(self.pre_s1(x0))  # (N, c0, H, W)
+            x2 = self.stage1(self.ds1(x1))    # (N, c1, H/2, W/2)
+        else:
+            x1 = None
+            x2 = self.stage1(self.ds1(x0))    # (N, c1, H/2, W/2)
         x4 = self.stage2(self.ds2(x2))        # (N, c2, H/4, W/4)
         x8 = self.stage3(self.ds3(x4))        # (N, c3, H/8, W/8)
 
-        # 2. Asymmetric Multi-Scale FPN (F2: stride 2, F4: stride 4, F8: stride 8)
+        # 2. 4-Level Asymmetric Multi-Scale FPN (F1: 80x160, F2: 40x80, F4: 20x40, F8: 10x20)
         l8 = self.f8_lat(x8)
         l8_up = F.interpolate(l8, scale_factor=2.0, mode="bilinear", align_corners=False)
         f4_feat = self.f4_refine(self.f4_lat(x4) + l8_up)
@@ -1243,6 +1374,13 @@ class MFJPPlateOCRV2(nn.Module):
         f4_up = F.interpolate(f4_feat, scale_factor=2.0, mode="bilinear", align_corners=False)
         f2_raw = self.f2_lat(x2) + f4_up
         f2_feat = self.f2_refine(f2_raw) if self.f2_refine is not None else f2_raw
+
+        if x1 is not None and self.f1_lat is not None and self.f1_refine is not None:
+            f2_up = F.interpolate(f2_feat, scale_factor=2.0, mode="bilinear", align_corners=False)
+            f1_feat = self.f1_refine(self.f1_lat(x1) + f2_up)
+            f1: torch.Tensor | None = _add_separable_2d_pos_v2(f1_feat, self.pos_f1_y, self.pos_f1_x)
+        else:
+            f1 = None
 
         f2 = _add_separable_2d_pos_v2(f2_feat, self.pos_f2_y, self.pos_f2_x)
         f4 = _add_separable_2d_pos_v2(f4_feat, self.pos_f4_y, self.pos_f4_x)
@@ -1271,7 +1409,7 @@ class MFJPPlateOCRV2(nn.Module):
         geom_emb = self.geom_mlp(geom_in)
         a_t = self.align_mlp(torch.cat([up_feat, lo_feat, side_emb, geom_emb], dim=-1))  # (N, D)
 
-        # 4. Statutory Length-Conditioned Slot Anchor Mixing + 2-Pass Local Deformable Sampler
+        # 4. Statutory Length-Conditioned Slot Anchor Mixing + 2-Pass 5x5 Deformable Sampler
         reg_len_logits: torch.Tensor | None = None
         cls_len_logits: torch.Tensor | None = None
         if self.reg_len_head is not None and self.cls_len_head is not None:
@@ -1302,20 +1440,22 @@ class MFJPPlateOCRV2(nn.Module):
 
         slot_q0 = self.slot_embed.to(dtype=f4.dtype) + a_t.unsqueeze(1)  # (N, 12, D)
         raw_off1 = self.offset_head_1(slot_q0)  # (N, 12, 4)
-        # +/-0.18 horizontal == +/-28.8 px on W=160; +/-0.10 vertical == +/-8 px on H=80 (recessed bumper resilience)
         dc1_x = 0.18 * torch.tanh(raw_off1[:, :, 0])
         dc1_y = 0.10 * torch.tanh(raw_off1[:, :, 1])
         ds1 = 1.0 + 0.25 * torch.tanh(raw_off1[:, :, 2:4])
         c1_uv = base_anchors_uv + torch.stack([dc1_x, dc1_y], dim=-1)
 
         s1_sampled = self._gather_asymmetric_slots(
+            f1,
             f2,
             f4,
             f8,
             c1_uv,
             ds1,
             self.point_weights_1,
+            self.point_ch_scale_1,
             self.sample_proj_1,
+            geom_emb,
             base_steps_uv=base_steps_uv,
             patch_mixer=self.patch_mixer_1,
         )
@@ -1328,19 +1468,22 @@ class MFJPPlateOCRV2(nn.Module):
         c2_uv = base_anchors_uv + torch.stack([tot_dx, tot_dy], dim=-1)
 
         s2_sampled = self._gather_asymmetric_slots(
+            f1,
             f2,
             f4,
             f8,
             c2_uv,
             ds2,
             self.point_weights_2,
+            self.point_ch_scale_2,
             self.sample_proj_2,
+            geom_emb,
             base_steps_uv=base_steps_uv,
             patch_mixer=self.patch_mixer_2,
         )
         slot_feat = self.intra_sa_2(h_pass1 + s2_sampled)  # (N, 12, D)
 
-        # 5. Decoupled latent measurements and learned anisotropic measurement precision
+        # 5. Decoupled latent measurements and learned anisotropic measurement precision (cap=24.0)
         z = self.evidence_norm(slot_feat + self.evidence_mlp(slot_feat))  # (N, 12, D)
 
         f4_mean = f4.mean(dim=(2, 3))
@@ -1391,25 +1534,22 @@ class MFJPPlateOCRV2(nn.Module):
         g_exp = geom_emb.unsqueeze(1).expand(-1, NUM_SLOTS, -1)
         raw_prec = torch.clamp(
             F.softplus(self.prec_head(torch.cat([slot_feat, a_exp, g_exp], dim=-1))),
-            max=6.0,
+            max=24.0,
         )
+        ungated_slot_prec = raw_prec.float() * noise_scale_slots.float()[:, :, None]
         lambda_prec = (
-            raw_prec.float()
-            * noise_scale_slots.float()[:, :, None]
+            ungated_slot_prec
             * frame_valid_gate.float()[:, None, None]
             * slot_q_gate.float()[:, :, None]
         )  # (N, 12, D)
 
-        # Polarity-first extraction so color_feat_head & color_prec_head see stroke vs background
-        # luminance contrast + polarity sign (separating dark commercial green + white strokes from
-        # cool-lit white/pastel graphic plates with dark green strokes!).
         cmasks = self.color_masks_s1.to(dtype=x2.dtype)
         if not torch.jit.is_tracing() and x2.shape[-2:] != cmasks.shape[-2:]:
             cmasks = F.interpolate(cmasks, size=x2.shape[-2:], mode="bilinear", align_corners=False)
             cmasks = cmasks / torch.clamp(cmasks.sum(dim=(2, 3), keepdim=True), min=1e-6)
 
         rgb_s1 = F.avg_pool2d(crops.to(dtype=x2.dtype), kernel_size=2, stride=2)
-        rim_m = cmasks[:, 0:1]   # (1, 1, H2, W2)
+        rim_m = cmasks[:, 0:1]
         mid_m = cmasks[:, 1:2]
         chr_m = cmasks[:, 2:3]
 
@@ -1431,16 +1571,15 @@ class MFJPPlateOCRV2(nn.Module):
             [y_mid, y_chr, y_diff, r_clip.to(dtype=x2.dtype)], dim=-1
         )
         pol_out = self.polarity_head(torch.cat([mid_feat, chr_feat, pol_stats], dim=-1))
-        # Physical luminance difference residual anchors polarity sign; clamp to [-8, 8] (sigmoid=0.9997) for bounded FP32/INT8 state
         color_noise_scale = noise_scale_group[:, 3].float()
         pol_logit = torch.clamp(pol_out[:, 0].float() + 2.5 * y_diff.float(), -8.0, 8.0)
-        raw_pol_prec = torch.clamp(F.softplus(pol_out[:, 1].float()), max=4.0)
-        pol_prec = (
+        raw_pol_prec = torch.clamp(F.softplus(pol_out[:, 1].float()), max=6.0)
+        ungated_pol_prec = (
             raw_pol_prec
             * color_noise_scale
-            * frame_valid_gate.float()
             * torch.clamp(1.0 - r_clip, 0.0, 1.0).pow(2)
         )
+        pol_prec = ungated_pol_prec * frame_valid_gate.float()
 
         pol_hint = torch.tanh(0.25 * pol_logit).to(dtype=x2.dtype)
         col_pol_stats = torch.stack([y_mid, y_chr, y_diff, pol_hint], dim=-1)
@@ -1451,16 +1590,16 @@ class MFJPPlateOCRV2(nn.Module):
         z_color = self.color_feat_head(col_in)  # (N, Dc)
         raw_col_prec = torch.clamp(
             F.softplus(self.color_prec_head(torch.cat([col_in, geom_emb], dim=-1))),
-            max=6.0,
+            max=8.0,
         )
 
         w_chroma = self.compute_chroma_gate(s_chroma, r_clip)  # == 0.0 on 850/940nm IR!
-        lambda_color = (
+        ungated_col_prec = (
             raw_col_prec.float()
             * color_noise_scale[:, None]
             * w_chroma[:, None]
-            * frame_valid_gate.float()[:, None]
-        )  # (N, Dc)
+        )
+        lambda_color = ungated_col_prec * frame_valid_gate.float()[:, None]  # (N, Dc)
 
         enc_out = FrameEncodingV2(
             z=z.float(),
@@ -1473,11 +1612,17 @@ class MFJPPlateOCRV2(nn.Module):
             slot_quality_logits=slot_quality_logits.float(),
             frame_valid_gate=frame_valid_gate.float(),
         )
+        ungated_tuple = (
+            (ungated_slot_prec, ungated_col_prec, ungated_pol_prec)
+            if return_ungated_prec
+            else None
+        )
         return (
             enc_out,
             (f4_feat if return_f4 else None),
             (reg_len_logits.float() if (return_len_logits and reg_len_logits is not None) else None),
             (cls_len_logits.float() if (return_len_logits and cls_len_logits is not None) else None),
+            ungated_tuple,
         )
 
     def encode_frames(
@@ -1487,8 +1632,13 @@ class MFJPPlateOCRV2(nn.Module):
         geom_meta: torch.Tensor | None = None,
     ) -> FrameEncodingV2:
         """Encode `(N, 3, H, W)` canonical crops into decoupled latent & precision observations."""
-        enc_out, _, _, _ = self._encode_frames_impl(
-            crops, plate_sides, geom_meta, return_f4=False, return_len_logits=False
+        enc_out, _, _, _, _ = self._encode_frames_impl(
+            crops,
+            plate_sides,
+            geom_meta,
+            return_f4=False,
+            return_len_logits=False,
+            return_ungated_prec=False,
         )
         return enc_out
 
@@ -1575,19 +1725,26 @@ class MFJPPlateOCRV2(nn.Module):
         mc = torch.clamp(mem_conflict.float(), min=0.0)
         ch = color_h.float()
         cp = torch.clamp(color_P.float(), min=0.0)
+        pp = torch.clamp(pol_P.float(), min=0.0)
 
         color_mu = ch / (cp + 1e-5)
         color_obs = cp / (cp + 0.05)
         color_vec = (color_mu * color_obs).to(dtype=self.readout_slot_embed.dtype)
         plate_type_logits = self.color_classifier(color_vec)
-        polarity_logit = pol_h.float() / (torch.clamp(pol_P.float(), min=0.0) + 1e-5)
+        polarity_logit = pol_h.float() / (pp + 1e-5)
+        pol_obs = pp / (pp + 0.05)
+        pol_feat = torch.stack(
+            [torch.tanh(0.25 * polarity_logit) * pol_obs, pol_obs], dim=-1
+        ).to(dtype=self.readout_slot_embed.dtype)
 
         mu = mh / (mp + 1e-5)
         obs_gate = mp / (mp + 0.05)
         slot_in = (mu * obs_gate).to(dtype=self.readout_slot_embed.dtype)
         if self.readout_color_proj is not None and self.readout_sa is not None:
-            color_ctx = self.readout_color_proj(color_vec).unsqueeze(1)  # (B, 1, D)
-            h = self.readout_sa(self.refine_slot_features(slot_in + color_ctx))
+            ctx_ro = self.readout_color_proj(color_vec)
+            if self.readout_pol_proj is not None:
+                ctx_ro = ctx_ro + self.readout_pol_proj(pol_feat)
+            h = self.readout_sa(self.refine_slot_features(slot_in + ctx_ro.unsqueeze(1)))
         else:
             h = self.refine_slot_features(slot_in)
         slot_logits = self.slot_classifier(h)  # (B, 12, V)
@@ -1598,8 +1755,8 @@ class MFJPPlateOCRV2(nn.Module):
         log_v = math.log(float(self.config.vocab_size))
         norm_entropy = -(probs * torch.log(torch.clamp(probs, min=1e-8))).sum(dim=-1) / log_v
 
-        slot_mass = torch.clamp(mp.mean(dim=-1), 0.0, 6.0)
-        slot_p_std = torch.clamp(mp.std(dim=-1, unbiased=False), 0.0, 4.0)
+        slot_mass = torch.clamp(mp.mean(dim=-1), 0.0, 24.0)
+        slot_p_std = torch.clamp(mp.std(dim=-1, unbiased=False), 0.0, 12.0)
         log_mass = torch.log1p(slot_mass)
         clamped_conf = torch.clamp(mc, 0.0, 6.0)
 
@@ -1623,7 +1780,7 @@ class MFJPPlateOCRV2(nn.Module):
         inactive_boost = (pad_prob > 0.65).float()
         eff_slot_read = torch.clamp(slot_readability_pred.float() + inactive_boost, 0.0, 1.0)
         min_active_read = eff_slot_read.min(dim=-1, keepdim=True).values
-        eff_slot_mass = slot_mass + inactive_boost * 6.0
+        eff_slot_mass = slot_mass + inactive_boost * 24.0
         min_active_mass = eff_slot_mass.min(dim=-1, keepdim=True).values
         max_conflict = clamped_conf.max(dim=-1, keepdim=True).values
         mean_conflict = clamped_conf.mean(dim=-1, keepdim=True)
@@ -1655,11 +1812,7 @@ class MFJPPlateOCRV2(nn.Module):
 
     @torch.no_grad()
     def reset_canonical_slot_anchors(self, reset_offset_heads: bool = True) -> None:
-        """Refresh `slot_anchors_uv` and `slot_steps_uv` buffers to calibrated MLIT anchors.
-
-        Call after warm-starting from an older checkpoint so `load_state_dict` does not leave stale
-        anchor buffers or stale Pass-1/Pass-2 offset biases in place.
-        """
+        """Refresh `slot_anchors_uv` and `slot_steps_uv` buffers to calibrated MLIT anchors."""
         anchors, steps = _build_canonical_slot_anchors(self.config.canonical_margin)
         self.slot_anchors_uv.copy_(anchors.to(device=self.slot_anchors_uv.device, dtype=self.slot_anchors_uv.dtype))
         self.slot_steps_uv.copy_(steps.to(device=self.slot_steps_uv.device, dtype=self.slot_steps_uv.dtype))
@@ -1690,6 +1843,7 @@ class MFJPPlateOCRV2(nn.Module):
         prefix_len: int | None = None,
         compute_stroke_mask: bool = False,
         init_state: MemoryStateV2 | None = None,
+        target_status: torch.Tensor | None = None,
     ) -> SequenceOutputV2:
         """Run frame encoding across `(B, T, 3, H, W)` and O(1) natural-parameter rollout."""
         bsz, seq_len, ch, h, w = crops.shape
@@ -1704,12 +1858,14 @@ class MFJPPlateOCRV2(nn.Module):
         else:
             flat_geom = geom_meta.reshape(bsz * seq_len, self.config.geom_dim)
 
-        enc, f4_raw, flat_reg_len, flat_cls_len = self._encode_frames_impl(
+        do_vault_bypass = bool(self.training and target_status is not None)
+        enc, f4_raw, flat_reg_len, flat_cls_len, ungated_prec = self._encode_frames_impl(
             flat_crops,
             flat_sides,
             flat_geom,
             return_f4=bool(compute_stroke_mask),
             return_len_logits=True,
+            return_ungated_prec=do_vault_bypass,
         )
         stroke_mask_logits: torch.Tensor | None = None
         if compute_stroke_mask and f4_raw is not None:
@@ -1734,6 +1890,31 @@ class MFJPPlateOCRV2(nn.Module):
         frame_q_log = enc.slot_quality_logits.reshape(bsz, seq_len, NUM_SLOTS)
         frame_v_gate = enc.frame_valid_gate.reshape(bsz, seq_len)
 
+        # Training-only Vault-Door Bypass on 50% of `target_status == 1` (`UNREADABLE`) sequences:
+        # `frame_valid_logit` is STILL supervised toward `0`, while the gate entering `memory_step`
+        # is clamped to `g_eff = max(g_valid, 0.35)` so `memory_readout.status_head` and `<PAD>`
+        # logits learn to reject sharp non-plate text (`319`, `スケルトン車`) if leaked!
+        vault_bypass_mask: torch.Tensor | None = None
+        step_lam = frame_lam
+        step_lam_c = frame_lam_c
+        step_pol_p = frame_pol_p
+        if do_vault_bypass and target_status is not None and ungated_prec is not None:
+            is_unread = target_status.reshape(bsz) == 1
+            vault_bypass_mask = is_unread & (torch.rand((bsz,), device=crops.device) < 0.50)
+            if bool(vault_bypass_mask.any()):
+                ug_slot, ug_col, ug_pol = ungated_prec
+                ug_slot_bt = ug_slot.reshape(bsz, seq_len, NUM_SLOTS, d)
+                ug_col_bt = ug_col.reshape(bsz, seq_len, dc)
+                ug_pol_bt = ug_pol.reshape(bsz, seq_len)
+                g_eff = torch.clamp(frame_v_gate, min=0.35)
+                q_eff = torch.clamp(torch.sigmoid(frame_q_log), min=0.35)
+                lam_byp = torch.clamp(ug_slot_bt, min=0.60) * g_eff[:, :, None, None] * q_eff[:, :, :, None]
+                lam_c_byp = ug_col_bt * g_eff[:, :, None]  # preserves w_chroma == 0 on monochrome IR!
+                pol_p_byp = torch.clamp(ug_pol_bt, min=0.25) * g_eff
+                step_lam = torch.where(vault_bypass_mask[:, None, None, None], lam_byp, frame_lam)
+                step_lam_c = torch.where(vault_bypass_mask[:, None, None], lam_c_byp, frame_lam_c)
+                step_pol_p = torch.where(vault_bypass_mask[:, None], pol_p_byp, frame_pol_p)
+
         if frame_pad_mask is not None:
             step_valid = (~frame_pad_mask).float()
         else:
@@ -1747,8 +1928,6 @@ class MFJPPlateOCRV2(nn.Module):
         if prefix_len is not None:
             t_prefix = max(1, min(int(prefix_len), max(1, seq_len - 1)))
         elif compute_prefix_readout and self.training and seq_len >= 2:
-            # Sample K in {1 .. seq_len - 1} with strong K=1..2 emphasis so status_head and
-            # slot_readability_pred are calibrated across single-photo and short-track regimes.
             u_rnd = float(torch.rand((), device="cpu").item())
             if u_rnd < 0.40:
                 t_prefix = 1
@@ -1778,22 +1957,26 @@ class MFJPPlateOCRV2(nn.Module):
                 pose_ema=state.pose_ema,
                 last_timestamp_s=state.last_timestamp_s,
                 z=frame_z[:, t],
-                lambda_prec=frame_lam[:, t],
+                lambda_prec=step_lam[:, t],
                 z_color=frame_zc[:, t],
-                lambda_color=frame_lam_c[:, t],
+                lambda_color=step_lam_c[:, t],
                 pol_logit=frame_pol[:, t],
-                pol_prec=frame_pol_p[:, t],
+                pol_prec=step_pol_p[:, t],
                 geom_meta=geom_meta[:, t],
                 timestamp_s=timestamps_s[:, t],
                 step_mask=step_valid[:, t],
             )
             innovation_losses.append(nll.sum() / active.float().sum().clamp_min(1))
             if compute_prefix_readout and (t + 1) == t_prefix:
-                q = noncharacter_quality_features(state, (frame_lam[:, :t+1].mean((2, 3)) > 0).float().mean(1), geom_meta[:, :t+1, :6].float().var(1, unbiased=False).mean(-1))
+                q = noncharacter_quality_features(
+                    state,
+                    (step_lam[:, : t + 1].mean((2, 3)) > 0).float().mean(1),
+                    geom_meta[:, : t + 1, :6].float().var(1, unbiased=False).mean(-1),
+                )
                 prefix_memory = state
                 risks = self.stopping_risk_head(q)
                 prefix_risk, prefix_next_risk = risks[:, 0], risks[:, 1]
-            if compute_prefix_readout and seq_len >= 2 and (t + 1) == t_prefix+1:
+            if compute_prefix_readout and seq_len >= 2 and (t + 1) == t_prefix + 1:
                 next_prefix_memory = state
                 next_prefix_readout = self.decode_memory(*state[:7])
             if compute_prefix_readout and (t + 1) == t_prefix:
@@ -1840,10 +2023,13 @@ class MFJPPlateOCRV2(nn.Module):
             stroke_mask_logits=stroke_mask_logits,
             reg_len_logits=reg_len_seq,
             cls_len_logits=cls_len_seq,
-            prefix_memory=prefix_memory, next_prefix_memory=next_prefix_memory,
-            prefix_risk=prefix_risk, prefix_next_risk=prefix_next_risk,
+            prefix_memory=prefix_memory,
+            next_prefix_memory=next_prefix_memory,
+            prefix_risk=prefix_risk,
+            prefix_next_risk=prefix_next_risk,
             next_prefix_readout=next_prefix_readout,
             innovation_nll=torch.stack(innovation_losses).mean(),
+            vault_bypass_mask=vault_bypass_mask,
         )
 
     def forward(

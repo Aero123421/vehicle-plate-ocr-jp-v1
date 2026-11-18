@@ -143,6 +143,7 @@ class SessionConfigV2:
     risk_upper_margin: float = 0.0
     expected_interval_s: float = 0.1
     max_evidence_bytes: int = 8 * 1024 * 1024
+    support_nonconformity_quantile: float = 1.65
     constrained_decoding: bool = True
     registered_plates: Sequence[str | PlateText] | None = None  # API compatibility; no fleet boost
 
@@ -154,6 +155,8 @@ class SessionConfigV2:
                  *self.field_abstain_costs.values()]
         if any(not math.isfinite(x) or x < 0 for x in costs):
             raise ValueError("Decision costs must be finite and nonnegative")
+        if not math.isfinite(self.support_nonconformity_quantile) or self.support_nonconformity_quantile < 0:
+            raise ValueError("Nonconformity quantile must be finite and nonnegative")
         if self.max_evidence_bytes <= 0 or self.expected_interval_s < 0 or not 0 <= self.risk_upper_margin <= 1:
             raise ValueError("Invalid evidence budget or stopping parameters")
 
@@ -302,12 +305,13 @@ def build_decision_v2_from_arrays(slot_logits, plate_type_logits, polarity_logit
         joint_p = 0.0
     fields = tuple(f for f, p in confs.items() if config.field_wrong_costs.get(f, config.C_wrong)*(1-p) < config.field_abstain_costs.get(f, config.C_abstain))
     full = config.C_wrong_full*(1-joint_p) < config.C_abstain_full
-    accepted = plate is not None and ("serial" in fields or full)
+    upper_ok = max(confs["region"], confs["classification"], confs["hiragana"]) >= 0.05
+    accepted = plate is not None and (full or ("serial" in fields and upper_ok))
     tp = np.exp(joint_ck[:, ic, ik] - _logsumexp(joint_ck[:, ic, ik]))
     type_index = int(tp.argmax())
     type_probs = {p.value: float(tp[i]) for i, p in enumerate(vocab.plate_types)}
     p_unreadable = 1 - p_mixed - p_event
-    status = "ACCEPTED" if accepted else "TRACK_MIXED" if p_mixed > p_unreadable else "UNREADABLE"
+    status = "ACCEPTED" if accepted else "TRACK_MIXED" if p_mixed > max(p_unreadable, 0.35) else "UNREADABLE"
     return OCRDecisionV2(status=status,
         plate_text=plate if accepted else None,
         formatted_text=plate.full_text if accepted else None,
@@ -450,6 +454,7 @@ class _TrackQualityAccumulator:
         self.n = 0
         self.support_sum = 0.0
         self.plate_log_odds = 0.0
+        self.max_llr = -math.inf
         self._first_raw_support = 0.0
         self._last_support_ts: float | None = None
         self.stage2_sum = np.zeros(3, dtype=np.float64)
@@ -462,15 +467,21 @@ class _TrackQualityAccumulator:
         q_raw = float(np.clip(support if raw_support is None else raw_support, 0.0, 1.0))
         q_c = min(1.0 - 1e-6, max(1e-6, q_raw))
         llr_step = math.log(q_c) - math.log1p(-q_c)
+        vis_mean = float(np.clip(stage2[1], 0.0, 1.0))
+        was_confirmed = self.max_llr >= 1.1
+        self.max_llr = max(self.max_llr, llr_step)
         if self.n == 1:
             self._first_raw_support = q_raw
-            self.plate_log_odds = llr_step
+            pos_boost = 1.0 + 0.60 * min(1.6, llr_step - 1.5) if llr_step > 1.5 else 1.0
+            self.plate_log_odds = float(
+                np.clip(0.85 * (0.25 + 0.75 * vis_mean) * llr_step * pos_boost, -30.0, 30.0)
+            )
         else:
-            dt = (0.5 if (timestamp_s is None or self._last_support_ts is None)
-                  else max(0.0, float(timestamp_s) - self._last_support_ts))
-            vis_mean = float(np.clip(stage2[1], 0.0, 1.0))
-            w_innov = min(1.0, max(0.05, dt / 0.5)) * (0.05 + 0.95 * vis_mean)
-            self.plate_log_odds = float(np.clip(self.plate_log_odds + w_innov * llr_step, -30.0, 30.0))
+            dt = (0.20 if (timestamp_s is None or self._last_support_ts is None)
+                  else max(0.03, float(timestamp_s) - self._last_support_ts))
+            w_innov = min(0.85, max(0.26, dt / 0.20)) * (0.20 + 0.80 * vis_mean)
+            eff_inc = max(-0.18, llr_step) if (was_confirmed or self.max_llr >= 1.1) else llr_step
+            self.plate_log_odds = float(np.clip(self.plate_log_odds + w_innov * eff_inc, -30.0, 30.0))
         if timestamp_s is not None and math.isfinite(float(timestamp_s)):
             self._last_support_ts = float(timestamp_s)
         self.stage2_sum += stage2
@@ -483,6 +494,9 @@ class _TrackQualityAccumulator:
         if self.n == 0:
             return 0.0
         if self.n == 1:
+            if self.max_llr >= 2.2:
+                cal_p = float(math.exp(-np.logaddexp(0.0, -1.35 * self.plate_log_odds)))
+                return max(float(self._first_raw_support), cal_p)
             return float(self._first_raw_support)
         return float(math.exp(-np.logaddexp(0.0, -self.plate_log_odds)))
     @property
@@ -655,9 +669,12 @@ class _SealedSessionV2:
                 or vis.shape != (4,) or not np.all(np.isfinite(vis))
                 or np.any((vis < 0) | (vis > 1))):
             raise ValueError('Invalid Stage-2 uncertainty evidence')
-        # Smooth, strictly positive damping: weak containment, occlusion, and
-        # null evidence reduce precision without vetoing a character or string.
-        damping = math.exp(-min(30.0, nc + max(0.0, -llr))) * (0.05 + 0.95 * float(vis.mean()))
+        # Hinged conformal excess damping: real/low-res plates within calibrated
+        # quantile retain precision while out-of-support non-plates are crushed.
+        tau_nc = float(getattr(self.config, "support_nonconformity_quantile", 1.65))
+        nc_excess = max(0.0, nc - tau_nc)
+        neg_llr = max(0.0, -llr - 0.25)
+        damping = math.exp(-min(20.0, 0.55 * nc_excess + 0.75 * neg_llr)) * (0.15 + 0.85 * float(vis.mean()))
         stage2 = np.asarray([nc, vis.mean(), llr], dtype=np.float64)
         return frame_key, float(timestamp_s), crops, geom, sides, support, damping, stage2
 
@@ -784,16 +801,22 @@ class _SealedSessionV2:
         self.num_readout_calls += 1
         # A failed decoder also consumes the one terminal capability.
         try:
+            raw_mp_mean = float(np.maximum(self._state_arrays()[1][0], 0.0).mean())
             self._active_state = _apply_sealed_precision_ceiling(
                 self._active_state, float(self.config.calibration.readout_precision_ceiling))
             ro = self._readout()
             _, p, c, _, cp, _, pp, _, _ = self._state_arrays()
+            quad_p = (
+                float(self._qual_acc._first_raw_support)
+                if (self.num_frames_seen == 1 and raw_mp_mean < 0.45)
+                else self._qual_acc.episode_plate_prob
+            )
             self._cached_decision = build_decision_v2_from_arrays(*ro[:2],
                 polarity_logit=float(ro[2]), slot_readability_pred=ro[3], status_logits=ro[4],
                 mem_P=p[0], mem_conflict=c[0], color_P=cp[0], pol_P=float(pp[0]),
                 num_frames_seen=self.num_frames_seen, vocab=self.vocab, config=self.config,
                 grammar=self.grammar, grammar_checker=self.grammar_checker,
-                quad_prob=self._qual_acc.episode_plate_prob)
+                quad_prob=quad_p)
         finally:
             self._state = SessionStateV2.FINALIZED
         return self._cached_decision

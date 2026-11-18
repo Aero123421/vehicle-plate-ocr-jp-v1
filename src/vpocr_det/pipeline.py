@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import math
 import time
 from typing import Any
 import cv2
@@ -172,6 +173,9 @@ def _relink_sessions(owner: Any, pairs: list[tuple[int, int]]) -> None:
             owner._prev_corners[restored_id] = owner._prev_corners.pop(old_id)
         if hasattr(owner, "_opt_refs") and old_id in owner._opt_refs:
             owner._opt_refs[restored_id] = owner._opt_refs.pop(old_id)
+        if hasattr(owner, "_sr_states") and old_id in owner._sr_states:
+            owner._sr_states.setdefault(restored_id, owner._sr_states.pop(old_id))
+            owner._sr_states.pop(old_id, None)
 
 
 def _search_inputs(
@@ -244,6 +248,7 @@ def _apply_optical_refinement_and_template_update(
 ) -> None:
     """Fuse sub-pixel IC-LK optical corners on observed tracks and maintain crisp optical templates."""
     h_f, w_f = frame_rgb.shape[:2]
+    frame_textured: bool | None = None
     for p in plates:
         tid = p.track_id
         if tid is None:
@@ -253,8 +258,9 @@ def _apply_optical_refinement_and_template_update(
             # Update visual coasted overlay geometry with sub-pixel lock while keeping ocr_crop_rgb=None
             if ref is not None:
                 init_q = prev_corners.get(tid, p.corners_xy)
+                c_min_z = 0.50 if ref.basis.width < 36.0 else 0.62
                 ok_c, _, opt_q = track_plate_optical(
-                    ref, frame_rgb, init_q, search_radius_px=28.0, allow_scale_search=True, min_zncc=0.62
+                    ref, frame_rgb, init_q, search_radius_px=28.0, allow_scale_search=True, min_zncc=c_min_z
                 )
                 if ok_c and opt_q is not None:
                     p.corners_xy = opt_q
@@ -269,15 +275,28 @@ def _apply_optical_refinement_and_template_update(
 
         q_cnn = p.raw_corners_xy if p.raw_corners_xy is not None else p.corners_xy
         if ref is not None and not p.quad_edge_touch:
+            low_res_ref = ref.basis.width < 36.0
+            q_init = p.corners_xy if low_res_ref else q_cnn
             ok_f, zncc_f, opt_q = track_plate_optical(
-                ref, frame_rgb, q_cnn, search_radius_px=12.0, search_radius_y=8.0, min_zncc=0.72, max_iter=5
+                ref,
+                frame_rgb,
+                q_init,
+                search_radius_px=9.0 if low_res_ref else 12.0,
+                search_radius_y=6.0 if low_res_ref else 8.0,
+                min_zncc=0.48 if low_res_ref else 0.72,
+                max_iter=5,
             )
             if ok_f and opt_q is not None:
-                b_cnn = quad_basis(q_cnn)
-                corner_diff = float(np.linalg.norm(opt_q - q_cnn, axis=-1).mean())
-                if corner_diff <= max(2.5, 0.22 * b_cnn.width):
-                    w_opt = min(0.35, max(0.15, (zncc_f - 0.70) * 1.15))
-                    q_fused = ((1.0 - w_opt) * q_cnn + w_opt * opt_q).astype(np.float32)
+                b_base = quad_basis(q_init)
+                corner_diff = float(np.linalg.norm(opt_q - q_init, axis=-1).mean())
+                if corner_diff <= max(2.5, 0.24 * b_base.width):
+                    w_opt = (
+                        min(0.55, max(0.22, (zncc_f - 0.45) * 1.10))
+                        if low_res_ref
+                        else min(0.35, max(0.15, (zncc_f - 0.70) * 1.15))
+                    )
+                    q_anchor = (0.65 * p.corners_xy + 0.35 * q_cnn).astype(np.float32) if low_res_ref else q_cnn
+                    q_fused = ((1.0 - w_opt) * q_anchor + w_opt * opt_q).astype(np.float32)
                     if is_valid_plate_quad(q_fused):
                         p.corners_xy = q_fused
                         p.raw_corners_xy = q_fused.copy()
@@ -290,12 +309,267 @@ def _apply_optical_refinement_and_template_update(
                         p.ocr_crop_rgb = None
                         p.tight_crop_rgb = None
                         q_cnn = q_fused
+            elif low_res_ref:
+                if frame_textured is None:
+                    frame_textured = float(frame_rgb[::4, ::4].std()) > 2.0
+                if frame_textured and is_valid_plate_quad(p.corners_xy):
+                    q_kal = np.asarray(p.corners_xy, dtype=np.float32)
+                    p.raw_corners_xy = q_kal.copy()
+                    p.bbox_xyxy = (
+                        float(np.clip(q_kal[:, 0].min(), 0.0, float(w_f))),
+                        float(np.clip(q_kal[:, 1].min(), 0.0, float(h_f))),
+                        float(np.clip(q_kal[:, 0].max(), 0.0, float(w_f))),
+                        float(np.clip(q_kal[:, 1].max(), 0.0, float(h_f))),
+                    )
+                    p.ocr_crop_rgb = None
+                    p.tight_crop_rgb = None
+                    q_cnn = q_kal
 
         if not p.quad_edge_touch and float(p.quad_is_plate_prob) >= 0.58:
             cand_ref = create_optical_ref(frame_rgb, q_cnn)
             if cand_ref is not None:
                 if ref is None or cand_ref.sharpness >= 0.92 * ref.sharpness or cand_ref.basis.width >= 1.12 * ref.basis.width:
                     opt_refs[tid] = cand_ref
+
+
+class _CanonicalDrizzleState:
+    """Rolling canonical 80x160 RGB Drizzle super-resolution state (pure ISP pixel alignment, zero character ops)."""
+
+    __slots__ = ("sr_num", "sr_den", "sr_ref_luma", "sr_eff_views", "sr_width_ema", "_tpl", "_jac", "_inv_h")
+
+    def __init__(self) -> None:
+        self.sr_num = np.zeros((3, 80, 160), dtype=np.float32)
+        self.sr_den = np.zeros((80, 160), dtype=np.float32)
+        self.sr_ref_luma = np.zeros((40, 80), dtype=np.float32)
+        self.sr_eff_views: float = 0.0
+        self.sr_width_ema: float = 0.0
+        self._tpl: np.ndarray | None = None
+        self._jac: np.ndarray | None = None
+        self._inv_h: np.ndarray | None = None
+
+    def _update_ic_tables(self, luma_40x80: np.ndarray) -> None:
+        self.sr_ref_luma = luma_40x80.astype(np.float32, copy=False)
+        std = float(np.std(self.sr_ref_luma))
+        if std < 0.012:
+            self._tpl = None
+            self._jac = None
+            self._inv_h = None
+            return
+        tpl = ((self.sr_ref_luma - float(np.mean(self.sr_ref_luma))) / std).astype(np.float32)
+        gx = np.empty_like(tpl)
+        gy = np.empty_like(tpl)
+        gx[:, 1:-1] = 0.5 * (tpl[:, 2:] - tpl[:, :-2])
+        gx[:, 0] = tpl[:, 1] - tpl[:, 0]
+        gx[:, -1] = tpl[:, -1] - tpl[:, -2]
+        gy[1:-1, :] = 0.5 * (tpl[2:, :] - tpl[:-2, :])
+        gy[0, :] = tpl[1, :] - tpl[0, :]
+        gy[-1, :] = tpl[-1, :] - tpl[-2, :]
+        xc = ((np.arange(80, dtype=np.float32) + 0.5) / 80.0 - 0.5)[None, :]
+        yc = ((np.arange(40, dtype=np.float32) + 0.5) / 40.0 - 0.5)[:, None]
+        jac = np.stack([gx.reshape(-1), gy.reshape(-1), (gx * xc).reshape(-1), (gy * yc).reshape(-1)], axis=-1)
+        h_mat = jac.T.astype(np.float64) @ jac.astype(np.float64)
+        h_mat[0, 0] += 2.0
+        h_mat[1, 1] += 2.0
+        h_mat[2, 2] += 80.0
+        h_mat[3, 3] += 60.0
+        try:
+            self._inv_h = np.linalg.inv(h_mat)
+            self._tpl = tpl.reshape(-1)
+            self._jac = jac
+        except np.linalg.LinAlgError:
+            self._tpl = None
+            self._jac = None
+            self._inv_h = None
+
+    def _align_corners_iclk(self, frame_rgb: np.ndarray, corners_xy: np.ndarray, margin_ratio: float) -> tuple[float, np.ndarray]:
+        if self._tpl is None or self._jac is None or self._inv_h is None:
+            return -1.0, corners_xy
+        basis = quad_basis(corners_xy)
+        mx = float(margin_ratio) * 80.0
+        my = float(margin_ratio) * 40.0
+        dst_40 = np.array(
+            [[mx - 0.5, my - 0.5], [80.0 - 0.5 - mx, my - 0.5], [80.0 - 0.5 - mx, 40.0 - 0.5 - my], [mx - 0.5, 40.0 - 0.5 - my]],
+            dtype=np.float32,
+        )
+        tu, tv, su, sv = 0.0, 0.0, 1.0, 1.0
+        n_pix = 3200.0
+
+        def _warp_luma(c_tu: float, c_tv: float, c_su: float, c_sv: float) -> tuple[np.ndarray, np.ndarray]:
+            u0, u1 = c_tu - 0.5 * c_su, c_tu + 0.5 * c_su
+            v0, v1 = c_tv - 0.5 * c_sv, c_tv + 0.5 * c_sv
+            uv = np.array([[u0, v0], [u1, v0], [u1, v1], [u0, v1]], dtype=np.float32)
+            u, v = uv[:, 0], uv[:, 1]
+            q = np.stack(
+                [
+                    basis.mx + u * basis.aux + v * basis.avx + u * v * basis.auvx,
+                    basis.my + u * basis.auy + v * basis.avy + u * v * basis.auvy,
+                ],
+                axis=-1,
+            ).astype(np.float32)
+            H_40 = cv2.getPerspectiveTransform(q, dst_40)
+            patch_rgb = cv2.warpPerspective(frame_rgb, H_40, (80, 40), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            lum = (
+                0.299 * patch_rgb[:, :, 0].astype(np.float32)
+                + 0.587 * patch_rgb[:, :, 1].astype(np.float32)
+                + 0.114 * patch_rgb[:, :, 2].astype(np.float32)
+            ) / 255.0
+            return lum.reshape(-1), q
+
+        best_tu, best_tv, best_zncc = 0.0, 0.0, -1.0
+        step_u = min(0.08, 1.2 / max(10.0, basis.width))
+        step_v = min(0.10, 1.0 / max(5.0, basis.height))
+        for iv in (-1, 0, 1):
+            for iu in (-1, 0, 1):
+                lum, _ = _warp_luma(iu * step_u, iv * step_v, 1.0, 1.0)
+                d = lum - float(np.mean(lum))
+                sq = float(np.dot(d, d))
+                z = float(np.dot(d, self._tpl) / math.sqrt(sq * n_pix)) if sq > 1e-4 * n_pix else -1.0
+                if z > best_zncc:
+                    best_zncc = z
+                    best_tu, best_tv = iu * step_u, iv * step_v
+        if best_zncc < 0.32:
+            return best_zncc, corners_xy
+        tu, tv = best_tu, best_tv
+        eff_span_u = 1.0 - 2.0 * float(margin_ratio)
+        eff_span_v = 1.0 - 2.0 * float(margin_ratio)
+        for _ in range(4):
+            lum, _ = _warp_luma(tu, tv, su, sv)
+            d = lum - float(np.mean(lum))
+            std = math.sqrt(float(np.dot(d, d)) / n_pix)
+            if std < 0.01:
+                return -1.0, corners_xy
+            err = (d / std - self._tpl).astype(np.float64)
+            dp = self._inv_h @ (self._jac.T.astype(np.float64) @ err)
+            dx_g = float(np.clip(dp[0], -2.5, 2.5))
+            dy_g = float(np.clip(dp[1], -2.0, 2.0))
+            d_su = float(np.clip(dp[2], -0.06, 0.06))
+            d_sv = float(np.clip(dp[3], -0.06, 0.06))
+            tu -= su * (dx_g / (80.0 * eff_span_u))
+            tv -= sv * (dy_g / (40.0 * eff_span_v))
+            su = float(np.clip(su / (1.0 + d_su / 80.0), 0.85, 1.18))
+            sv = float(np.clip(sv / (1.0 + d_sv / 40.0), 0.85, 1.18))
+            if abs(dx_g) < 0.03 and abs(dy_g) < 0.03:
+                break
+        lum, q_final = _warp_luma(tu, tv, su, sv)
+        d = lum - float(np.mean(lum))
+        sq = float(np.dot(d, d))
+        final_z = float(np.dot(d, self._tpl) / math.sqrt(sq * n_pix)) if sq > 1e-4 * n_pix else -1.0
+        return final_z, q_final
+
+    def step(
+        self,
+        frame_rgb: np.ndarray,
+        corners_xy: np.ndarray,
+        crop_u8: np.ndarray,
+        margin_ratio: float = 0.05,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        q_use = np.asarray(corners_xy, dtype=np.float32).reshape(4, 2)
+        w_t = 0.5 * (float(np.linalg.norm(q_use[1] - q_use[0])) + float(np.linalg.norm(q_use[2] - q_use[3])))
+        if w_t >= 56.0 or crop_u8.shape[:2] != (80, 160):
+            return q_use, crop_u8
+
+        re_warped = False
+        if self.sr_eff_views >= 1.0:
+            zncc, q_ic = self._align_corners_iclk(frame_rgb, q_use, margin_ratio)
+            if zncc < 0.56:
+                return q_use, crop_u8
+            shift = float(np.linalg.norm(q_ic - q_use, axis=-1).mean())
+            if shift <= max(2.5, 0.18 * w_t) and is_valid_plate_quad(q_ic):
+                q_use = q_ic
+                crop_u8 = warp_plate_canonical(frame_rgb, q_use, out_hw=(80, 160), margin_ratio=margin_ratio)
+                re_warped = True
+                w_t = 0.5 * (float(np.linalg.norm(q_use[1] - q_use[0])) + float(np.linalg.norm(q_use[2] - q_use[3])))
+
+        i_bilin = crop_u8.astype(np.float32).transpose(2, 0, 1) / 255.0
+        if self.sr_eff_views <= 0.0:
+            gamma_t = 0.0
+            self.sr_width_ema = w_t
+        else:
+            gamma_t = (
+                float(np.clip((self.sr_width_ema / max(1e-3, w_t)) ** 3, 0.25, 0.85))
+                if w_t > 1.08 * self.sr_width_ema
+                else 0.94
+            )
+            self.sr_num *= gamma_t
+            self.sr_den *= gamma_t
+            self.sr_width_ema = 0.75 * self.sr_width_ema + 0.25 * w_t
+        self.sr_eff_views = gamma_t * self.sr_eff_views + 1.0
+
+        h_f, w_f = frame_rgb.shape[:2]
+        x0 = max(0, int(math.floor(float(q_use[:, 0].min()) - 2.0)))
+        y0 = max(0, int(math.floor(float(q_use[:, 1].min()) - 2.0)))
+        x1 = min(w_f - 1, int(math.ceil(float(q_use[:, 0].max()) + 2.0)))
+        y1 = min(h_f - 1, int(math.ceil(float(q_use[:, 1].max()) + 2.0)))
+        if x1 > x0 and y1 > y0:
+            mx = float(margin_ratio) * 160.0
+            my = float(margin_ratio) * 80.0
+            dst_160 = np.array(
+                [[mx - 0.5, my - 0.5], [160.0 - 0.5 - mx, my - 0.5], [160.0 - 0.5 - mx, 80.0 - 0.5 - my], [mx - 0.5, 80.0 - 0.5 - my]],
+                dtype=np.float32,
+            )
+            H_s2c = cv2.getPerspectiveTransform(q_use, dst_160)
+            ys_grid, xs_grid = np.meshgrid(
+                np.arange(y0, y1 + 1, dtype=np.float32),
+                np.arange(x0, x1 + 1, dtype=np.float32),
+                indexing="ij",
+            )
+            xs_flat = xs_grid.reshape(-1)
+            ys_flat = ys_grid.reshape(-1)
+            denom = H_s2c[2, 0] * xs_flat + H_s2c[2, 1] * ys_flat + H_s2c[2, 2]
+            valid_w = np.abs(denom) > 1e-6
+            if np.any(valid_w):
+                inv_d = np.where(valid_w, 1.0 / np.where(valid_w, denom, 1.0), 0.0)
+                xc = (H_s2c[0, 0] * xs_flat + H_s2c[0, 1] * ys_flat + H_s2c[0, 2]) * inv_d
+                yc = (H_s2c[1, 0] * xs_flat + H_s2c[1, 1] * ys_flat + H_s2c[1, 2]) * inv_d
+                in_bounds = valid_w & (xc >= 0.0) & (xc <= 159.0) & (yc >= 0.0) & (yc <= 79.0)
+                if np.any(in_bounds):
+                    xc = xc[in_bounds]
+                    yc = yc[in_bounds]
+                    rgb_s = frame_rgb[y0 : y1 + 1, x0 : x1 + 1].reshape(-1, 3)[in_bounds].astype(np.float32) / 255.0
+                    ix0 = np.clip(np.rint(xc).astype(np.int32), 0, 159)
+                    iy0 = np.clip(np.rint(yc).astype(np.int32), 0, 79)
+                    den0 = self.sr_den[iy0, ix0]
+                    ref_rgb = np.where(
+                        (den0 > 0.20)[:, None],
+                        (self.sr_num[:, iy0, ix0] / np.maximum(den0[None, :], 1e-6)).T,
+                        i_bilin[:, iy0, ix0].T,
+                    )
+                    res = np.max(np.abs(rgb_s - ref_rgb), axis=-1)
+                    w_huber = np.where(res <= 0.18, 1.0, 0.18 / np.maximum(res, 1e-6)).astype(np.float32)
+                    sigma_d = float(np.clip(0.38 * (144.0 / max(12.0, w_t)), 0.60, 1.35))
+                    inv_2s2 = 0.5 / (sigma_d * sigma_d)
+                    for oy in (-1, 0, 1):
+                        ny = iy0 + oy
+                        vy = (ny >= 0) & (ny < 80)
+                        if not np.any(vy):
+                            continue
+                        for ox in (-1, 0, 1):
+                            nx = ix0 + ox
+                            v = vy & (nx >= 0) & (nx < 160)
+                            if not np.any(v):
+                                continue
+                            ny_v, nx_v = ny[v], nx[v]
+                            kw = w_huber[v] * np.exp(-((xc[v] - nx_v) ** 2 + (yc[v] - ny_v) ** 2) * inv_2s2).astype(np.float32)
+                            np.add.at(self.sr_den, (ny_v, nx_v), kw)
+                            np.add.at(self.sr_num, (slice(None), ny_v, nx_v), (rgb_s[v] * kw[:, None]).T)
+
+        alpha_sr = float(
+            np.clip((56.0 - w_t) / 34.0, 0.0, 0.86) * np.clip((self.sr_eff_views - 1.0) / 3.5, 0.0, 1.0)
+        )
+        if alpha_sr <= 1e-4:
+            lum_160 = 0.299 * i_bilin[0] + 0.587 * i_bilin[1] + 0.114 * i_bilin[2]
+            lum_40 = 0.25 * (lum_160[0::2, 0::2] + lum_160[0::2, 1::2] + lum_160[1::2, 0::2] + lum_160[1::2, 1::2])
+            self._update_ic_tables(lum_40 if self.sr_eff_views <= 1.01 else (0.75 * self.sr_ref_luma + 0.25 * lum_40))
+            return q_use, crop_u8
+
+        eff_alpha = np.where(self.sr_den > 1e-4, alpha_sr * (self.sr_den / (self.sr_den + 0.25)), 0.0).astype(np.float32)
+        i_sr = self.sr_num / np.maximum(self.sr_den[None, :, :], 1e-6)
+        i_out = np.clip((1.0 - eff_alpha[None, :, :]) * i_bilin + eff_alpha[None, :, :] * i_sr, 0.0, 1.0)
+        lum_160 = 0.299 * i_out[0] + 0.587 * i_out[1] + 0.114 * i_out[2]
+        lum_40 = 0.25 * (lum_160[0::2, 0::2] + lum_160[0::2, 1::2] + lum_160[1::2, 0::2] + lum_160[1::2, 1::2])
+        self._update_ic_tables(0.70 * self.sr_ref_luma + 0.30 * lum_40)
+        out_u8 = np.round(i_out.transpose(1, 2, 0) * 255.0).astype(np.uint8)
+        return q_use, out_u8 if (re_warped or alpha_sr > 1e-4) else crop_u8
 
 
 def _search_requests(owner: Any, candidates: list[PlateDetection], ts: float,
@@ -410,6 +684,7 @@ class VehiclePlateVideoPipeline:
         self._retired_decisions: dict[int, Any] = {}
         self._prev_corners: dict[int, np.ndarray] = {}
         self._opt_refs: dict[int, OpticalPlateRef] = {}
+        self._sr_states: dict[int, _CanonicalDrizzleState] = {}
         self._det_hidden_state: tuple[torch.Tensor, torch.Tensor] | None = None
         self._prev_frame_luma: float | None = None
         self._frame_idx: int = 0
@@ -434,6 +709,7 @@ class VehiclePlateVideoPipeline:
         self._retired_decisions.clear()
         self._prev_corners.clear()
         self._opt_refs.clear()
+        self._sr_states.clear()
         self._det_hidden_state = None
         self._prev_frame_luma = None
         self._frame_idx = 0
@@ -576,6 +852,7 @@ class VehiclePlateVideoPipeline:
             for exp_tid in self.tracker.last_expired_track_ids:
                 self._prev_corners.pop(exp_tid, None)
                 self._opt_refs.pop(exp_tid, None)
+                self._sr_states.pop(exp_tid, None)
                 exp_sess = self._ocr_sessions.pop(exp_tid, None)
                 if exp_sess is not None:
                     exp_dec = _finish_cached(self, exp_tid, exp_sess)
@@ -612,6 +889,15 @@ class VehiclePlateVideoPipeline:
                         p.ocr_crop_rgb = warp_plate_quad(
                             frame_rgb, q_exact, out_hw=ocr_hw, margin_ratio=ocr_margin
                         )
+                if (
+                    use_v2_crop
+                    and p.track_id is not None
+                    and ocr_hw == (80, 160)
+                    and float(np.linalg.norm(q_exact[1] - q_exact[0]) + np.linalg.norm(q_exact[2] - q_exact[3])) * 0.5 < 56.0
+                    and float(frame_rgb[::4, ::4].std()) > 2.0
+                ):
+                    sr_st = self._sr_states.setdefault(p.track_id, _CanonicalDrizzleState())
+                    q_exact, p.ocr_crop_rgb = sr_st.step(frame_rgb, q_exact, p.ocr_crop_rgb, margin_ratio=ocr_margin)
                 prev_q = self._prev_corners.get(p.track_id) if p.track_id is not None else None
                 p.geom_meta = extract_quad_geometry_meta(q_exact, p.ocr_crop_rgb, prev_corners_xy=prev_q)
                 if p.track_id is not None:
@@ -981,6 +1267,7 @@ class MultiRateEdgeCascadePipeline:
         self._retired_decisions: dict[int, Any] = {}
         self._prev_corners: dict[int, np.ndarray] = {}
         self._opt_refs: dict[int, OpticalPlateRef] = {}
+        self._sr_states: dict[int, _CanonicalDrizzleState] = {}
         self._cached_vehicles: list[VehicleDetection] = []
         self._cached_vehicle_bboxes: list[tuple[float, float, float, float, float]] = []
         self._frame_idx: int = 0
@@ -1013,6 +1300,7 @@ class MultiRateEdgeCascadePipeline:
         self._retired_decisions.clear()
         self._prev_corners.clear()
         self._opt_refs.clear()
+        self._sr_states.clear()
         self._cached_vehicles.clear()
         self._cached_vehicle_bboxes.clear()
         self._frame_idx = 0
@@ -1071,7 +1359,8 @@ class MultiRateEdgeCascadePipeline:
         dormant_props = [pr for pr in proposals if pr.is_dormant]
         any_reacquire = any(pr.needs_detector_reacquire for pr in active_props)
         all_reacquire = bool(active_props) and all(pr.needs_detector_reacquire for pr in active_props)
-        needs_reacquire = all_reacquire or (any_reacquire and self._frames_since_det >= 2)
+        min_reacq_gap = 3 if (self._ocr_sessions or self._retired_decisions) and self._frame_idx >= 10 else 1
+        needs_reacquire = (all_reacquire and self._frames_since_det >= min_reacq_gap) or (any_reacquire and self._frames_since_det >= max(2, min_reacq_gap))
 
         monitored_boxes: list[tuple[float, float, float, float]] = [
             pr.predicted_bbox_xyxy for pr in active_props
@@ -1119,13 +1408,15 @@ class MultiRateEdgeCascadePipeline:
                 if dormant_reappear:
                     break
 
+        min_trig_gap = 3 if (self._ocr_sessions or self._retired_decisions) and self._frame_idx >= 10 else 1
         interior_empty_trigger = (
             len(active_props) == 0
             and len(unmon_rois) > 0
             and self._empty_scene_cooldown == 0
+            and self._frames_since_det >= min_trig_gap
         )
         border_trigger = bool(scout_info["has_border_entry"]) and (
-            (len(active_props) == 0 and self._empty_scene_cooldown == 0)
+            (len(active_props) == 0 and self._empty_scene_cooldown == 0 and self._frames_since_det >= min_trig_gap)
             or (len(active_props) > 0 and self._frames_since_det >= 3)
         )
 
@@ -1271,6 +1562,7 @@ class MultiRateEdgeCascadePipeline:
         for exp_tid in self.tracker.last_expired_track_ids:
             self._prev_corners.pop(exp_tid, None)
             self._opt_refs.pop(exp_tid, None)
+            self._sr_states.pop(exp_tid, None)
             self._dormant_reappear_cooldown.pop(exp_tid, None)
             exp_sess = self._ocr_sessions.pop(exp_tid, None)
             if exp_sess is not None:
@@ -1303,6 +1595,15 @@ class MultiRateEdgeCascadePipeline:
                     p.ocr_crop_rgb = warp_plate_quad(
                         frame_rgb, q_exact, out_hw=ocr_hw, margin_ratio=ocr_margin
                     )
+            if (
+                use_v2_crop
+                and p.track_id is not None
+                and ocr_hw == (80, 160)
+                and float(np.linalg.norm(q_exact[1] - q_exact[0]) + np.linalg.norm(q_exact[2] - q_exact[3])) * 0.5 < 56.0
+                and float(frame_rgb[::4, ::4].std()) > 2.0
+            ):
+                sr_st = self._sr_states.setdefault(p.track_id, _CanonicalDrizzleState())
+                q_exact, p.ocr_crop_rgb = sr_st.step(frame_rgb, q_exact, p.ocr_crop_rgb, margin_ratio=ocr_margin)
             prev_q = self._prev_corners.get(p.track_id) if p.track_id is not None else None
             p.geom_meta = extract_quad_geometry_meta(q_exact, p.ocr_crop_rgb, prev_corners_xy=prev_q)
             if p.track_id is not None:

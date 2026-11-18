@@ -185,6 +185,7 @@ class _Prim3D:
     # Substrate-decoupled conformal RGBA alpha-paint / 3D normal-relief stencil:
     # (decal_idx, proj_face, u_center, v_center, u_half, v_half, relief_strength)
     decal_spec: tuple[int, int, float, float, float, float, float] | None = None
+    nir_scale_override: float = 0.0
 
 
 @dataclass(slots=True)
@@ -212,6 +213,8 @@ class _PlanarQuad3D:
     specular_f0: float = 0.0
     normal_undul_amp: float = 0.0
     has_backing_substrate: bool = True
+    cavity_sky_ao: float = 1.0
+    decal_prim_coupled: bool = False
 
 
 @dataclass
@@ -1630,6 +1633,8 @@ class Scene3DClipSample:
             veh_fp_poly_l: list[Tensor] = []
             veh_fp_v_l: list[bool] = []
             veh_mask_l: list[np.ndarray] = []
+            veh_vis_l: list[float] = []
+            box_vis_l: list[float] = []
 
             ps_idx_l: list[int] = []
             ps_is_plate_l: list[float] = []
@@ -1643,6 +1648,9 @@ class Scene3DClipSample:
                 veh_idx_l.append(len(labels_l))
                 labels_l.append(CLS_VEHICLE)
                 boxes_l.append(vgt.bbox_xyxy)
+                v_vis = float(np.clip(vgt.visibility, 0.0, 1.0))
+                veh_vis_l.append(v_vis)
+                box_vis_l.append(v_vis)
                 bx0, by0, bx1, by1 = [float(x) for x in vgt.bbox_xyxy]
                 corners_l.append(np.array([[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]], dtype=np.float32))
                 veh_sub_l.append(int(vgt.vehicle_subtype))
@@ -1674,6 +1682,7 @@ class Scene3DClipSample:
                 ps_idx_l.append(len(labels_l))
                 labels_l.append(int(pgt.cls_id))
                 boxes_l.append(pgt.bbox_xyxy)
+                box_vis_l.append(float(np.clip(pgt.visibility, 0.0, 1.0)))
                 corners_l.append(pgt.corners_xy)
                 ps_is_plate_l.append(float(pgt.is_plate) if int(pgt.cls_id) == CLS_PLATE else 0.0)
                 ps_vis_mask_l.append(np.asarray(pgt.plate_vis_mask, dtype=np.float32).reshape(16, 32))
@@ -1706,6 +1715,8 @@ class Scene3DClipSample:
                         if corners_l
                         else torch.zeros((0, 4, 2), device=dev, dtype=torch.float32)
                     ),
+                    "box_visibility": torch.tensor(box_vis_l, device=dev, dtype=torch.float32),
+                    "veh_visibility": torch.tensor(veh_vis_l, device=dev, dtype=torch.float32),
                     "ignore_boxes": torch.from_numpy(ig_arr).to(device=dev, dtype=torch.float32),
                     "vehicle_indices": torch.tensor(veh_idx_l, device=dev, dtype=torch.long),
                     "vehicle_subtypes": torch.tensor(veh_sub_l, device=dev, dtype=torch.long),
@@ -1859,6 +1870,7 @@ class _GPU3DTextureBank:
     _BANK_VERSION: int = 6
     _CACHE: dict[tuple[int, str, int | None, int, int, str, str, int], _GPU3DTextureBank] = {}
 
+    _LEGACY_SIGN_SPEC_COUNT: int = 10
     SIGN_SPECS: tuple[tuple[str, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]], ...] = (
         ("工事車両出入口", (246, 246, 242), (22, 54, 138), (198, 34, 34)),
         ("徐行 10km/h", (248, 214, 38), (22, 22, 24), (194, 30, 30)),
@@ -1870,6 +1882,10 @@ class _GPU3DTextureBank:
         ("誘導員配置中", (36, 78, 52), (244, 246, 242), (238, 206, 48)),
         ("最大積載量 8500kg", (238, 198, 34), (20, 22, 24), (20, 22, 24)),
         ("追突注意 ダンプ", (236, 62, 36), (248, 248, 246), (248, 248, 246)),
+        ("319", (14, 68, 158), (246, 248, 250), (246, 248, 250)),
+        ("246", (14, 68, 158), (246, 248, 250), (246, 248, 250)),
+        ("16", (14, 68, 158), (246, 248, 250), (246, 248, 250)),
+        ("R17", (14, 68, 158), (246, 248, 250), (246, 248, 250)),
     )
     # Index 0 MUST remain `("危", ...)` (`[危]` hazard placard); indices 1..6 rear stickers;
     # indices 7..12 front cab fleet stencils & manufacturer grille badges; indices 13..15 bumper reflectors/vents.
@@ -1893,6 +1909,7 @@ class _GPU3DTextureBank:
     )
 
     # Substrate-decoupled 1..3-row multi-script (Kanji/Kana/Latin/Digits) frameless alpha-paint & relief stencils
+    _LEGACY_ALPHA_STENCIL_COUNT: int = 12
     ALPHA_STENCIL_SPECS: tuple[tuple[tuple[str, ...], tuple[int, int, int]], ...] = (
         (("最大積載量 9500kg",), (244, 246, 248)),
         (("生コン 東京第4",), (24, 52, 118)),
@@ -1906,6 +1923,12 @@ class _GPU3DTextureBank:
         (("北関東建機リース", "クレーン作業半径内立入禁止", "機番 K-3105"), (28, 30, 34)),
         (("HINO PROFIA", "7200kg MAX"), (228, 232, 238)),
         (("資材搬入ゲート B", "一旦停止・誘導員確認", "SPEED LIMIT 10"), (196, 32, 32)),
+        (("スケルトン車",), (244, 246, 248)),
+        (("最大積載量 2000kg",), (22, 24, 28)),
+        (("産廃収集運搬車",), (244, 246, 248)),
+        (("自家用",), (24, 48, 118)),
+        (("スケルトン車", "最大積載量 2000kg"), (22, 24, 28)),
+        (("産廃収集運搬車", "許可 第02700号"), (242, 204, 38)),
     )
 
     def __init__(
@@ -2259,17 +2282,50 @@ class _GPU3DTextureBank:
         t2 = F.avg_pool2d(t1, kernel_size=2, stride=2, ceil_mode=False)
         return (t0, t1, t2)
 
+    @staticmethod
+    def _apply_commercial_mud_soot_cement(patch_u8: np.ndarray, rng: random.Random) -> np.ndarray:
+        """Apply realistic mud / diesel soot / quarry cement-dust weathering onto commercial green & black kei plates."""
+        pf = patch_u8.astype(np.float32)
+        h_p, w_p = pf.shape[:2]
+        yy, xx = np.mgrid[0:h_p, 0:w_p].astype(np.float32)
+        yn = yy / float(max(1, h_p - 1))
+        xn = xx / float(max(1, w_p - 1))
+        mode = rng.random()
+        if mode < 0.36:
+            # Diesel exhaust soot darkening lower/corner zones (`なにわ 800` / `品川 830` commercial trucks)
+            soot = np.clip(0.32 + 0.52 * yn + 0.18 * np.sin(xn * 9.3 + rng.uniform(0.0, 6.2)), 0.0, 1.0)
+            strength = rng.uniform(0.24, 0.52)
+            pf = pf * (1.0 - strength * soot[:, :, None]) + np.array([22.0, 23.0, 25.0], dtype=np.float32) * (0.28 * strength * soot[:, :, None])
+        elif mode < 0.70:
+            # Cement / quarry chalk dust veil lifting dark background & softening glyph contrast
+            veil = rng.uniform(0.14, 0.34) * (0.55 + 0.45 * np.cos(xn * 5.1 - yn * 3.7 + rng.uniform(0.0, 6.2)))
+            dust_c = np.array([rng.uniform(146, 178), rng.uniform(144, 174), rng.uniform(136, 166)], dtype=np.float32)
+            pf = pf * (1.0 - veil[:, :, None]) + dust_c[None, None, :] * veil[:, :, None]
+        else:
+            # Road-spray mud spatter along bottom plate rim
+            spatter = np.clip((yn - rng.uniform(0.28, 0.52)) * 2.2 + 0.35 * np.sin(xn * 17.0 + rng.uniform(0.0, 6.2)), 0.0, 0.78)
+            mud_c = np.array([68.0, 56.0, 42.0], dtype=np.float32)
+            pf = pf * (1.0 - spatter[:, :, None]) + mud_c[None, None, :] * spatter[:, :, None]
+        return np.clip(pf, 0.0, 255.0).astype(np.uint8)
+
     def _build_all(self, seed: int, split: str, domain_split: str) -> None:
         n_fs = len(self.font_subset)
+        is_train_dom = domain_split == "train"
+        sign_specs_use = self.SIGN_SPECS if is_train_dom else self.SIGN_SPECS[: self._LEGACY_SIGN_SPEC_COUNT]
         # Signs (208x80 + 208x96 procedural + bolted non-plate blank brackets, divisible by 8) & stickers
-        for s_i, (txt, bg_c, fg_c, bd_c) in enumerate(self.SIGN_SPECS):
+        for s_i, (txt, bg_c, fg_c, bd_c) in enumerate(sign_specs_use):
             _, fp_s = self.font_subset[s_i % n_fs]
-            u8 = self._render_text_board(txt, 208, 80, bg_c, fg_c, bd_c, font_path=fp_s, cjk_fallback_path=self.cjk_fallback_path)
+            is_blue_route = bg_c == (14, 68, 158)
+            w_sign, h_sign = (160, 96) if is_blue_route else (208, 80)
+            u8 = self._render_text_board(txt, w_sign, h_sign, bg_c, fg_c, bd_c, font_path=fp_s, cjk_fallback_path=self.cjk_fallback_path)
+            if is_blue_route:
+                # Reinforce bold crisp white highway route border without corner rivets
+                cv2.rectangle(u8, (3, 3), (w_sign - 4, h_sign - 4), (248, 250, 252), 4)
             t0 = _srgb_u8_to_linear_tensor(u8, self.device)
             t1 = F.avg_pool2d(t0, kernel_size=2, stride=2, ceil_mode=False)
             self.sign_mips.append((t0, t1))
 
-        # Indices 10..25: procedural architectural, multi-font door, & bolted/framed blank non-plate placards
+        # Procedural architectural, multi-font door, & bolted/framed blank non-plate placards
         for hn_kind, n_vars in (
             ("ribbed_metal", 3),
             ("grated_rail", 2),
@@ -2314,8 +2370,26 @@ class _GPU3DTextureBank:
             t1_bb = F.avg_pool2d(t0_bb, kernel_size=2, stride=2, ceil_mode=False)
             self.sticker_mips.append((t0_bb, t1_bb))
 
+        if is_train_dom:
+            # Indices 26..29 (`train` only): Bus amber/white LED destination header boards (`CLS_SIGNBOARD_HARDNEG`)
+            for led_i, (led_txt, led_fg) in enumerate((
+                ("東京駅八重洲口 24", (252, 168, 32)),
+                ("回送 OUT OF SERVICE", (252, 174, 38)),
+                ("急行 新宿駅西口", (244, 248, 252)),
+                ("空港リムジン EXPRESS", (250, 164, 28)),
+            )):
+                _, fp_l = self.font_subset[led_i % n_fs]
+                u8_led = self._render_text_board(
+                    led_txt, 224, 48, (18, 20, 22), led_fg, (46, 50, 56),
+                    font_path=fp_l, cjk_fallback_path=self.cjk_fallback_path,
+                )
+                t0_l = _srgb_u8_to_linear_tensor(u8_led, self.device)
+                t1_l = F.avg_pool2d(t0_l, kernel_size=2, stride=2, ceil_mode=False)
+                self.sticker_mips.append((t0_l, t1_l))
+
         # Build frameless 1..3-row RGBA alpha-paint & relief stencils exclusively with this domain_split's font subset!
-        for dec_i, (rows_t, fg_col) in enumerate(self.ALPHA_STENCIL_SPECS):
+        alpha_specs_use = self.ALPHA_STENCIL_SPECS if is_train_dom else self.ALPHA_STENCIL_SPECS[: self._LEGACY_ALPHA_STENCIL_COUNT]
+        for dec_i, (rows_t, fg_col) in enumerate(alpha_specs_use):
             fid_d, fp_d = self.font_subset[dec_i % n_fs]
             h_dec = 64 if len(rows_t) == 1 else (96 if len(rows_t) == 2 else 128)
             rgba_u8 = self._render_frameless_alpha_stencil(rows_t, 224, h_dec, fg_col, fp_d, self.cjk_fallback_path)
@@ -2330,16 +2404,30 @@ class _GPU3DTextureBank:
         split_seed = seed + part_id * 1_000_003
         sampler = StratifiedPlateSampler(seed=split_seed)
         rng = random.Random(split_seed + 9191)
-        strata: list[tuple[str, PlateType, PlateSize, bool]] = (
-            [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 6
-            + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 3
-            + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 2
-            + [("med_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.MEDIUM, False)] * 3
-            + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 5
-            + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 3
-            + [("kei_comm", PlateType.KEI_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
-            + [("med_priv", PlateType.GRAPHIC, PlateSize.MEDIUM, False)] * 1
-        )
+        rng_comm = random.Random(split_seed + 424291)
+        if is_train_dom:
+            # ~42% (10 / 24 = 41.7%) STANDARD_COMMERCIAL + KEI_COMMERCIAL share in `train` strata
+            strata: list[tuple[str, PlateType, PlateSize, bool]] = (
+                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 4
+                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 2
+                + [("med_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
+                + [("kei_comm", PlateType.KEI_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
+                + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 2
+                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 7
+                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 4
+                + [("med_priv", PlateType.GRAPHIC, PlateSize.MEDIUM, False)] * 1
+            )
+        else:
+            strata = (
+                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 6
+                + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 3
+                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 2
+                + [("med_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.MEDIUM, False)] * 3
+                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 5
+                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 3
+                + [("kei_comm", PlateType.KEI_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
+                + [("med_priv", PlateType.GRAPHIC, PlateSize.MEDIUM, False)] * 1
+            )
         type_to_rem = {pt_enum: i for i, pt_enum in enumerate(sampler._plate_types)}
         n_pt = len(sampler._plate_types)
         occ_by_type = {pt_enum: 0 for pt_enum in sampler._plate_types}
@@ -2364,24 +2452,28 @@ class _GPU3DTextureBank:
             pt = replace(pt, serial=int(serial_val))
 
             if bucket_name == "special_8_9":
-                pref = rng.choices(["8", "9", "0"], weights=[0.62, 0.22, 0.16], k=1)[0]
-                if pref == "0":
-                    if len(pt.classification) == 1:
-                        new_cls = "0"
-                    elif len(pt.classification) == 2:
-                        new_cls = f"0{pt.classification[1] if pt.classification[1].isdigit() else '0'}"
-                    else:
-                        c3 = pt.classification[2]
-                        new_cls = f"0{rng.choice(['0', '9'])}{c3}"
+                if is_train_dom and rng_comm.random() < 0.55:
+                    new_cls = rng_comm.choice(("800", "830", "880", "80", "88", "900", "00"))
+                    pt = replace(pt, classification=new_cls)
                 else:
-                    if len(pt.classification) == 1:
-                        new_cls = pref
-                    elif len(pt.classification) == 2:
-                        c2 = rng.choice(["8", "0"]) if (pref == "8" and rng.random() < 0.45) else pt.classification[1]
-                        new_cls = f"{pref}{c2}"
+                    pref = rng.choices(["8", "9", "0"], weights=[0.62, 0.22, 0.16], k=1)[0]
+                    if pref == "0":
+                        if len(pt.classification) == 1:
+                            new_cls = "0"
+                        elif len(pt.classification) == 2:
+                            new_cls = f"0{pt.classification[1] if pt.classification[1].isdigit() else '0'}"
+                        else:
+                            c3 = pt.classification[2]
+                            new_cls = f"0{rng.choice(['0', '9'])}{c3}"
                     else:
-                        new_cls = pref + pt.classification[1:]
-                pt = replace(pt, classification=new_cls)
+                        if len(pt.classification) == 1:
+                            new_cls = pref
+                        elif len(pt.classification) == 2:
+                            c2 = rng.choice(["8", "0"]) if (pref == "8" and rng.random() < 0.45) else pt.classification[1]
+                            new_cls = f"{pref}{c2}"
+                        else:
+                            new_cls = pref + pt.classification[1:]
+                    pt = replace(pt, classification=new_cls)
             elif p_size == PlateSize.LARGE and pt.classification and pt.classification[0] not in ("1", "2", "8", "9", "0"):
                 pref = rng.choices(["1", "2", "8"], weights=[0.62, 0.18, 0.20], k=1)[0]
                 pt = replace(pt, classification=pref + pt.classification[1:])
@@ -2391,6 +2483,11 @@ class _GPU3DTextureBank:
             frame_style = ("chrome" if rng.random() < 0.5 else "black") if has_frame else None
             weath = rng.uniform(0.06, 0.48) if rng.random() < 0.45 else 0.0
             mud_l = rng.uniform(0.05, 0.34) if rng.random() < 0.28 else 0.0
+            is_comm_plate = (not is_temp) and tgt_type in (PlateType.STANDARD_COMMERCIAL, PlateType.KEI_COMMERCIAL)
+            do_comm_weather = is_train_dom and is_comm_plate and (rng_comm.random() < 0.35)
+            if do_comm_weather:
+                weath = max(weath, rng_comm.uniform(0.20, 0.62))
+                mud_l = max(mud_l, rng_comm.uniform(0.14, 0.46))
             is_green = tgt_type == PlateType.STANDARD_COMMERCIAL and not is_temp
             do_green_var = is_green and (rng.random() < 0.65)
             green_var = idx % 3
@@ -2419,6 +2516,9 @@ class _GPU3DTextureBank:
             if do_green_var:
                 front_u8 = self._apply_green_spectral_variant(front_u8, green_var)
                 rear_u8 = self._apply_green_spectral_variant(rear_u8, green_var)
+            if do_comm_weather:
+                front_u8 = self._apply_commercial_mud_soot_cement(front_u8, rng_comm)
+                rear_u8 = self._apply_commercial_mud_soot_cement(rear_u8, rng_comm)
 
             is_large_b = p_size == PlateSize.LARGE
             self.front_plate_mips.append(self._build_plate_mips(front_u8, is_large_b))
@@ -2515,6 +2615,10 @@ class _VehiclePassSpec:
     flex_sheet_lin: tuple[float, float, float] = (0.28, 0.34, 0.26)
     boom_yaw_rad: float = 0.0
     boom_elev_rad: float = 0.14
+    is_train_v7: bool = False
+    cavity_sky_ao_rear: float = 1.0
+    cavity_sky_ao_front: float = 1.0
+    nir_paint_refl: float = 0.0
 
     def signed_speed_at(self, t: float) -> float:
         """Signed longitudinal speed `s(t)` along vehicle forward axis `+Y` (continuous piecewise-linear)."""
@@ -2670,6 +2774,34 @@ ARCHETYPE_CATALOG: tuple[tuple[str, int, float], ...] = (
     ("suv_4wd", SUBTYPE_PASSENGER_KEI, 0.03),
 )
 
+TRAIN_V7_ARCHETYPE_CATALOG: tuple[tuple[str, int, float], ...] = (
+    # Everyday passenger = 48.0%
+    ("sedan", SUBTYPE_PASSENGER_KEI, 0.120),
+    ("hatchback_compact", SUBTYPE_PASSENGER_KEI, 0.080),
+    ("minivan_1box_jp", SUBTYPE_PASSENGER_KEI, 0.110),
+    ("kei_tall_wagon", SUBTYPE_PASSENGER_KEI, 0.060),
+    ("kei_crossover", SUBTYPE_PASSENGER_KEI, 0.050),
+    ("suv_4wd", SUBTYPE_PASSENGER_KEI, 0.060),
+    # Buses = 10.0% (unified single CLS_VEHICLE, subtype_unknown = NUM_VEHICLE_SUBTYPES)
+    ("city_route_bus", NUM_VEHICLE_SUBTYPES, 0.040),
+    ("highway_coach_bus", NUM_VEHICLE_SUBTYPES, 0.035),
+    ("microbus", NUM_VEHICLE_SUBTYPES, 0.025),
+    # Commercial vans / trucks / heavy machinery = 42.0%
+    ("hiace_van", SUBTYPE_VAN_KEITRUCK, 0.070),
+    ("kei_truck", SUBTYPE_VAN_KEITRUCK, 0.050),
+    ("box_wing_truck", SUBTYPE_BOX_TRUCK, 0.070),
+    ("flatbed_truck", SUBTYPE_FLATBED_CARGO, 0.040),
+    ("concrete_mixer", SUBTYPE_CONCRETE_MIXER, 0.040),
+    ("dump_10t", SUBTYPE_DUMP_TRUCK, 0.040),
+    ("deep_dump", SUBTYPE_DUMP_TRUCK, 0.015),
+    ("cargo_crane_truck", SUBTYPE_CRANE_HEAVY, 0.030),
+    ("garbage_packer", SUBTYPE_TANKER_SPECIAL, 0.025),
+    ("wheel_loader", SUBTYPE_CRANE_HEAVY, 0.015),
+    ("semi_container_trailer", SUBTYPE_TRACTOR_TRAILER, 0.010),
+    ("tractor_head", SUBTYPE_TRACTOR_TRAILER, 0.010),
+    ("tanker_lorry", SUBTYPE_TANKER_SPECIAL, 0.005),
+)
+
 
 @dataclass(slots=True)
 class _CameraTrajectorySpec:
@@ -2689,6 +2821,7 @@ class _CameraTrajectorySpec:
     vib_amp_rad: float = 0.0
     vib_freq_hz: float = 11.0
     vib_phase: float = 0.0
+    ego_forward_mps: float = 0.0
 
     def eval_at(self, t: float) -> tuple[np.ndarray, np.ndarray, float, float]:
         """Return exact continuous `(cam_o(t), R_cam(t), fx(t), fy(t))` (`== base` at `t = 0.0`)."""
@@ -2709,6 +2842,8 @@ class _CameraTrajectorySpec:
         dx = vx * t_pos
         dy = vy * t_pos
         dz = vz * t_pos
+        if abs(self.ego_forward_mps) > 1e-6:
+            dy += float(self.ego_forward_mps) * (1.20 * math.tanh(tf / 1.20))
         d_pan = self.pan_rate_rad_s * t_ang
         d_tilt = self.tilt_rate_rad_s * t_ang
         d_roll = self.roll_rate_rad_s * t_ang
@@ -2798,6 +2933,8 @@ def _make_planar_quad(
     specular_f0: float = 0.0,
     normal_undul_amp: float = 0.0,
     has_backing_substrate: bool = True,
+    cavity_sky_ao: float = 1.0,
+    decal_prim_coupled: bool = False,
 ) -> _PlanarQuad3D:
     n = outward_normal_w.astype(np.float32)
     n = n / max(1e-6, float(np.linalg.norm(n)))
@@ -2837,6 +2974,8 @@ def _make_planar_quad(
         specular_f0=float(specular_f0),
         normal_undul_amp=float(normal_undul_amp),
         has_backing_substrate=bool(has_backing_substrate),
+        cavity_sky_ao=float(cavity_sky_ao),
+        decal_prim_coupled=bool(decal_prim_coupled),
     )
 
 
@@ -3172,17 +3311,38 @@ def _assemble_vehicle_3d(
         SUBTYPE_FLATBED_CARGO,
     )
 
-    is_med_truck = (arch in ("box_wing_truck", "flatbed_truck", "cargo_crane_truck")) and (not spec.is_large_truck)
-    wheel_r = 0.40 if is_med_truck else (0.52 if is_heavy else (0.29 if "kei" in arch else 0.34))
-    wheel_w = 0.22 if is_med_truck else (0.28 if is_heavy else 0.20)
-    chassis_z = wheel_r * 0.92
+    is_bus = arch in ("city_route_bus", "highway_coach_bus", "microbus")
+    is_wheel_loader = arch == "wheel_loader"
+    is_pass_arch = arch in (
+        "sedan",
+        "hatchback_compact",
+        "minivan_1box_jp",
+        "kei_tall_wagon",
+        "kei_crossover",
+        "suv_4wd",
+        "hiace_van",
+    )
+    is_med_truck = (arch in ("box_wing_truck", "flatbed_truck", "cargo_crane_truck", "garbage_packer")) and (not spec.is_large_truck)
+    if is_wheel_loader:
+        wheel_r, wheel_w = 0.70, 0.36
+    elif is_bus:
+        wheel_r = 0.38 if arch == "microbus" else 0.50
+        wheel_w = 0.22 if arch == "microbus" else 0.28
+    else:
+        wheel_r = 0.40 if is_med_truck else (0.52 if is_heavy else (0.29 if "kei" in arch else 0.34))
+        wheel_w = 0.22 if is_med_truck else (0.28 if is_heavy else 0.20)
+    chassis_z = wheel_r * (0.86 if is_bus else 0.92)
     dn_wheel_n = max(3, int(spec.radial_dn_n))
     n_dec_bank = max(1, len(bank.alpha_decal_mips))
     dec_i = int(spec.decal_idx) % n_dec_bank
     dec_rel = float(spec.decal_relief)
 
     # 1. Wheels / axles with compositional D_N radial aperture/stud hubs (`N in {3..12}`)
-    if arch == "cargo_crane_truck" and not spec.is_large_truck:
+    if is_wheel_loader:
+        axle_ys = [hl * 0.42, -hl * 0.56]
+    elif is_bus:
+        axle_ys = [hl - 1.35, -hl + 1.65] if arch == "microbus" else [hl - 1.95, -hl + 2.55]
+    elif arch in ("cargo_crane_truck", "garbage_packer") and not spec.is_large_truck:
         axle_ys = [hl - 1.15, -hl + 1.25]
     elif spec.subtype in (SUBTYPE_DUMP_TRUCK, SUBTYPE_CONCRETE_MIXER, SUBTYPE_TANKER_SPECIAL, SUBTYPE_CRANE_HEAVY):
         axle_ys = [hl - 1.35, -hl + 2.05, -hl + 0.85]
@@ -3215,8 +3375,8 @@ def _assemble_vehicle_3d(
 
     # Dark chassis frame rail between wheels (bobtail `tractor_head` uses explicit dual I-beams below)
     if arch != "tractor_head":
-        ch_len = hl * 0.88 if not is_articulated else hl * 0.45
-        ch_y = 0.0 if not is_articulated else (hl - ch_len)
+        ch_len = hl * (0.72 if is_wheel_loader else (0.88 if not is_articulated else 0.45))
+        ch_y = -hl * 0.12 if is_wheel_loader else (0.0 if not is_articulated else (hl - ch_len))
         ch_c = _to_world(0.0, ch_y, chassis_z + 0.16)
         prims.append(
             _Prim3D(
@@ -3247,7 +3407,7 @@ def _assemble_vehicle_3d(
     front_plate_local_y = hl + 0.038
     front_plate_local_z = wheel_r * 0.95
 
-    if arch in ("sedan", "kei_tall_wagon", "suv_4wd", "hiace_van"):
+    if is_pass_arch and not spec.is_train_v7:
         low_h = (spec.body_h_m - wheel_r * 0.45) * (0.52 if arch != "hiace_van" else 0.56)
         low_c = _to_world(0.0, 0.0, wheel_r * 0.45 + low_h * 0.5)
         van_decal = (dec_i, 0, 0.0, 0.05, 0.42, 0.34, dec_rel) if (arch == "hiace_van" and len(bank.alpha_decal_mips) > 0) else None
@@ -3293,6 +3453,515 @@ def _assemble_vehicle_3d(
         _record_cabin_obb(gh_c, R, gh_ext[0], gh_ext[1], gh_ext[2])
         rear_plate_local_z = wheel_r * 0.95 + (0.22 if arch != "sedan" else 0.16)
         front_plate_local_z = wheel_r * 0.82
+    elif is_pass_arch:
+        # True Japanese passenger & 1-box silhouettes (`train` v7):
+        # stepped hood/trunk (`sedan`), 2-box compact (`hatchback_compact`), 1-box grille & chrome garnish (`minivan_1box_jp`),
+        # boxy/cladded kei (`kei_tall_wagon`, `kei_crossover`), SUV roof rails, protruding mirrors, lower grille, & wheel-well arches!
+        sill_z0 = wheel_r * 0.44
+        waist_frac = 0.50 if arch in ("sedan", "hatchback_compact") else (0.56 if arch == "hiace_van" else 0.53)
+        low_h = (spec.body_h_m - sill_z0) * waist_frac
+        waist_z = sill_z0 + low_h
+        van_decal = None
+        if arch == "hiace_van" and n_dec_bank > 0:
+            v_dec_i = (12 + (spec.track_id + dec_i) % max(1, n_dec_bank - 12)) if n_dec_bank > 12 else dec_i
+            van_decal = (v_dec_i, 0, -0.06, 0.06, 0.40, 0.32, max(0.0, dec_rel))
+
+        if arch == "sedan":
+            # 3-box stepped lower body: lower sill + mid cabin waist + stepped front hood & rear trunk deck
+            base_h = low_h * 0.66
+            c_sill = _to_world(0.0, 0.0, sill_z0 + 0.5 * base_h)
+            prims.append(
+                _Prim3D(
+                    center=(float(c_sill[0]), float(c_sill[1]), float(c_sill[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw, hl, 0.5 * base_h),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.paint_lin,
+                    roughness=0.17,
+                    mud_level=spec.mud_level * 0.6,
+                    mud_phase=spec.mud_phase,
+                    metallic=spec.paint_metallic,
+                    clearcoat=max(0.58, spec.paint_clearcoat),
+                    normal_undul_amp=0.012,
+                )
+            )
+            step_h = low_h - base_h
+            # Hood deck (sloped front) + cabin waist + stepped rear trunk deck
+            for seg_y, seg_hl, seg_hz, seg_sh, seg_sl in (
+                (hl * 0.58, hl * 0.40, step_h * 0.42, _SHAPE_SLOPED_CAB, 0.36),
+                (-hl * 0.04, hl * 0.48, step_h * 0.50, _SHAPE_OBB, 0.0),
+                (-hl * 0.66, hl * 0.32, step_h * 0.44, _SHAPE_OBB, 0.0),
+            ):
+                sc = _to_world(0.0, seg_y, sill_z0 + base_h + seg_hz)
+                prims.append(
+                    _Prim3D(
+                        center=(float(sc[0]), float(sc[1]), float(sc[2])),
+                        rot_w2l=RT,
+                        half_ext=(hw * 0.97, seg_hl, seg_hz),
+                        shape=seg_sh,
+                        veh_idx=veh_idx,
+                        role=_ROLE_BODY,
+                        albedo_rgb=spec.paint_lin,
+                        roughness=0.16,
+                        slope_param=seg_sl,
+                        metallic=spec.paint_metallic,
+                        clearcoat=max(0.60, spec.paint_clearcoat),
+                    )
+                )
+        else:
+            low_c = _to_world(0.0, 0.0, sill_z0 + low_h * 0.5)
+            prims.append(
+                _Prim3D(
+                    center=(float(low_c[0]), float(low_c[1]), float(low_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw, hl, low_h * 0.5),
+                    shape=_SHAPE_SLOPED_CAB if arch in ("hatchback_compact", "minivan_1box_jp") else _SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.paint_lin,
+                    roughness=0.18,
+                    slope_param=0.22 if arch == "hatchback_compact" else 0.14,
+                    mud_level=spec.mud_level * 0.65,
+                    mud_phase=spec.mud_phase,
+                    metallic=spec.paint_metallic,
+                    clearcoat=max(0.55, spec.paint_clearcoat),
+                    normal_undul_amp=0.014,
+                    decal_spec=van_decal,
+                )
+            )
+
+        # Greenhouse cabin glass per passenger silhouette
+        if arch == "sedan":
+            gh_len, gh_y, gh_slope = hl * 0.54, -hl * 0.05, 0.44
+        elif arch == "hatchback_compact":
+            gh_len, gh_y, gh_slope = hl * 0.66, -hl * 0.16, 0.36
+        elif arch == "minivan_1box_jp":
+            gh_len, gh_y, gh_slope = hl * 0.80, -hl * 0.11, 0.22
+        elif arch == "hiace_van":
+            gh_len, gh_y, gh_slope = hl * 0.88, -hl * 0.04, 0.20
+        elif arch in ("kei_tall_wagon", "kei_crossover"):
+            gh_len, gh_y, gh_slope = hl * 0.78, -hl * 0.10, 0.19
+        else:
+            gh_len, gh_y, gh_slope = hl * 0.70, -hl * 0.10, 0.30
+        gh_h = max(0.32, spec.body_h_m - waist_z)
+        gh_z = waist_z + gh_h * 0.5
+        gh_c = _to_world(0.0, gh_y, gh_z)
+        gh_ext = (hw * (0.92 if arch in ("minivan_1box_jp", "hiace_van", "kei_tall_wagon") else 0.87), gh_len, gh_h * 0.5)
+        prims.append(
+            _Prim3D(
+                center=(float(gh_c[0]), float(gh_c[1]), float(gh_c[2])),
+                rot_w2l=RT,
+                half_ext=gh_ext,
+                shape=_SHAPE_SLOPED_CAB,
+                veh_idx=veh_idx,
+                role=_ROLE_CABIN_GLASS,
+                albedo_rgb=(0.05, 0.07, 0.09),
+                roughness=0.06,
+                slope_param=gh_slope,
+                clearcoat=0.92,
+                specular_f0=0.045,
+            )
+        )
+        _record_cabin_obb(gh_c, R, gh_ext[0], gh_ext[1], gh_ext[2])
+
+        # Protruding passenger left & right side door mirrors
+        mir_y = hl * (0.38 if arch in ("minivan_1box_jp", "hiace_van", "kei_tall_wagon") else 0.26)
+        for side_s in (-1.0, 1.0):
+            mc_p = _to_world(side_s * (hw + 0.085), mir_y, waist_z + 0.06)
+            prims.append(
+                _Prim3D(
+                    center=(float(mc_p[0]), float(mc_p[1]), float(mc_p[2])),
+                    rot_w2l=RT,
+                    half_ext=(0.075, 0.065, 0.055),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY if (spec.track_id % 3 != 0) else _ROLE_DARK_CHASSIS,
+                    albedo_rgb=spec.paint_lin if (spec.track_id % 3 != 0) else (0.04, 0.04, 0.05),
+                    roughness=0.22,
+                    metallic=spec.paint_metallic,
+                    clearcoat=0.55,
+                )
+            )
+
+        # Dark 3D wheel-well arch cutouts / cladding around axles
+        arch_r = wheel_r * (1.16 if arch in ("suv_4wd", "kei_crossover") else 1.10)
+        for ay_w in axle_ys:
+            for side_s in (-1.0, 1.0):
+                wa_c = _to_world(side_s * (hw - 0.018), ay_w, wheel_r * 1.02)
+                prims.append(
+                    _Prim3D(
+                        center=(float(wa_c[0]), float(wa_c[1]), float(wa_c[2])),
+                        rot_w2l=RT,
+                        half_ext=(0.032, arch_r, arch_r * 0.92),
+                        shape=_SHAPE_CYLINDER_X,
+                        veh_idx=veh_idx,
+                        role=_ROLE_DARK_CHASSIS,
+                        albedo_rgb=(0.025, 0.028, 0.032),
+                        roughness=0.84,
+                        metallic=0.08,
+                    )
+                )
+
+        # Lower front radiator grille / bumper intake (and giant metallic grille on Japanese 1-box minivans!)
+        if arch == "minivan_1box_jp":
+            gr_h = max(0.22, low_h * 0.36)
+            gr_c = _to_world(0.0, hl + 0.012, sill_z0 + low_h * 0.52)
+            prims.append(
+                _Prim3D(
+                    center=(float(gr_c[0]), float(gr_c[1]), float(gr_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw * 0.68, 0.024, gr_h),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_CHROME_METAL,
+                    albedo_rgb=(0.58, 0.61, 0.65),
+                    roughness=0.16,
+                    rib_freq=22.0,
+                    metallic=0.88,
+                    clearcoat=0.35,
+                )
+            )
+        else:
+            lg_c = _to_world(0.0, hl + 0.010, sill_z0 + 0.14)
+            prims.append(
+                _Prim3D(
+                    center=(float(lg_c[0]), float(lg_c[1]), float(lg_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw * 0.66, 0.020, 0.095),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_DARK_CHASSIS,
+                    albedo_rgb=(0.030, 0.032, 0.038),
+                    roughness=0.68,
+                    rib_freq=24.0,
+                    metallic=0.22,
+                )
+            )
+
+        if arch == "hatchback_compact":
+            sp_c = _to_world(0.0, -hl + 0.08, spec.body_h_m - 0.03)
+            prims.append(
+                _Prim3D(
+                    center=(float(sp_c[0]), float(sp_c[1]), float(sp_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw * 0.78, 0.11, 0.03),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.paint_lin,
+                    roughness=0.20,
+                    clearcoat=0.65,
+                )
+            )
+        elif arch == "suv_4wd":
+            for side_s in (-1.0, 1.0):
+                rr_c = _to_world(side_s * hw * 0.72, -hl * 0.12, spec.body_h_m + 0.03)
+                prims.append(
+                    _Prim3D(
+                        center=(float(rr_c[0]), float(rr_c[1]), float(rr_c[2])),
+                        rot_w2l=RT,
+                        half_ext=(0.03, hl * 0.54, 0.03),
+                        shape=_SHAPE_OBB,
+                        veh_idx=veh_idx,
+                        role=_ROLE_CHROME_METAL,
+                        albedo_rgb=(0.55, 0.58, 0.62),
+                        roughness=0.24,
+                        metallic=0.75,
+                    )
+                )
+
+        rear_plate_local_z = wheel_r * 0.95 + (0.24 if arch in ("minivan_1box_jp", "suv_4wd", "hiace_van") else 0.16)
+        front_plate_local_z = wheel_r * 0.78
+        if arch in ("minivan_1box_jp", "hiace_van", "suv_4wd"):
+            # Rear chrome/painted tailgate garnish overhanging recessed rear license plate!
+            rear_plate_local_y = -hl - 0.016
+            gn_c = _to_world(0.0, -hl - 0.048, rear_plate_local_z + 0.115)
+            is_chr_gn = arch == "minivan_1box_jp" or (spec.track_id % 2 == 0)
+            prims.append(
+                _Prim3D(
+                    center=(float(gn_c[0]), float(gn_c[1]), float(gn_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(0.26, 0.042, 0.026),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_CHROME_METAL if is_chr_gn else _ROLE_BODY,
+                    albedo_rgb=(0.66, 0.69, 0.73) if is_chr_gn else spec.paint_lin,
+                    roughness=0.14 if is_chr_gn else 0.22,
+                    metallic=0.90 if is_chr_gn else spec.paint_metallic,
+                    clearcoat=0.40,
+                )
+            )
+
+    elif is_bus:
+        # Unified Japanese bus (`city_route_bus`, `highway_coach_bus`, `microbus`):
+        # Continuous passenger window band + internal seatbacks & window mullions (`veh_idx=veh_idx`) + LED destination header sign!
+        skirt_z0 = wheel_r * 0.50
+        belt_z = spec.body_h_m * (0.50 if arch == "highway_coach_bus" else 0.44)
+        roof_bot_z = spec.body_h_m * 0.84
+        skirt_h = belt_z - skirt_z0
+        sk_c = _to_world(0.0, 0.0, skirt_z0 + 0.5 * skirt_h)
+        bus_decal = (
+            ((12 + (spec.track_id % max(1, n_dec_bank - 12))) if n_dec_bank > 12 else dec_i, 0, 0.05, 0.05, 0.28, 0.30, 0.0)
+            if n_dec_bank > 0
+            else None
+        )
+        prims.append(
+            _Prim3D(
+                center=(float(sk_c[0]), float(sk_c[1]), float(sk_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw, hl, 0.5 * skirt_h),
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_BODY,
+                albedo_rgb=spec.paint_lin,
+                roughness=0.20,
+                mud_level=spec.mud_level * 0.55,
+                mud_phase=spec.mud_phase,
+                metallic=spec.paint_metallic,
+                clearcoat=max(0.55, spec.paint_clearcoat),
+                decal_spec=bus_decal,
+            )
+        )
+        # Fleet waist livery band
+        liv_c = _to_world(0.0, 0.0, belt_z - 0.14)
+        prims.append(
+            _Prim3D(
+                center=(float(liv_c[0]), float(liv_c[1]), float(liv_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw + 0.004, hl + 0.004, 0.11),
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_BODY,
+                albedo_rgb=spec.secondary_lin,
+                roughness=0.20,
+                clearcoat=0.62,
+            )
+        )
+        # Upper roof crown + rooftop HVAC pod
+        rf_h = spec.body_h_m - roof_bot_z
+        rf_c = _to_world(0.0, 0.0, roof_bot_z + 0.5 * rf_h)
+        prims.append(
+            _Prim3D(
+                center=(float(rf_c[0]), float(rf_c[1]), float(rf_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw * 0.98, hl * 0.99, 0.5 * rf_h),
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_BODY,
+                albedo_rgb=spec.paint_lin,
+                roughness=0.22,
+                clearcoat=0.55,
+            )
+        )
+        ac_c = _to_world(0.0, -hl * 0.08, spec.body_h_m + 0.11)
+        prims.append(
+            _Prim3D(
+                center=(float(ac_c[0]), float(ac_c[1]), float(ac_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw * 0.62, hl * 0.28, 0.11),
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_BODY,
+                albedo_rgb=(0.86, 0.88, 0.90),
+                roughness=0.34,
+            )
+        )
+        # Continuous passenger window band (recessed 3.5 cm inward) + front/rear windshield
+        win_h = roof_bot_z - belt_z
+        win_z = belt_z + 0.5 * win_h
+        win_c = _to_world(0.0, 0.0, win_z)
+        win_ext = (hw - 0.036, hl * 0.97, 0.5 * win_h)
+        prims.append(
+            _Prim3D(
+                center=(float(win_c[0]), float(win_c[1]), float(win_c[2])),
+                rot_w2l=RT,
+                half_ext=win_ext,
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_CABIN_GLASS,
+                albedo_rgb=(0.04, 0.06, 0.08),
+                roughness=0.06,
+                clearcoat=0.92,
+                specular_f0=0.045,
+            )
+        )
+        _record_cabin_obb(win_c, R, hw, hl * 0.99, 0.5 * win_h)
+
+        # Internal seatbacks & flush vertical window pillars (`_Prim3D`, `veh_idx=veh_idx` -> unified bus supervision!)
+        n_pillars = 5 if arch == "microbus" else 7
+        for pi_b in range(n_pillars):
+            fy_p = -0.88 + 1.76 * (pi_b / float(max(1, n_pillars - 1)))
+            for side_s in (-1.0, 1.0):
+                pl_c = _to_world(side_s * (hw - 0.014), fy_p * hl, win_z)
+                prims.append(
+                    _Prim3D(
+                        center=(float(pl_c[0]), float(pl_c[1]), float(pl_c[2])),
+                        rot_w2l=RT,
+                        half_ext=(0.016, 0.048, 0.5 * win_h),
+                        shape=_SHAPE_OBB,
+                        veh_idx=veh_idx,
+                        role=_ROLE_DARK_CHASSIS,
+                        albedo_rgb=(0.05, 0.055, 0.065),
+                        roughness=0.42,
+                        metallic=0.25,
+                    )
+                )
+        n_seat_rows = 4 if arch == "microbus" else 6
+        for sr_i in range(n_seat_rows):
+            fy_s = -0.74 + 1.48 * (sr_i / float(max(1, n_seat_rows - 1)))
+            st_b_c = _to_world(0.0, fy_s * hl, belt_z + 0.16)
+            prims.append(
+                _Prim3D(
+                    center=(float(st_b_c[0]), float(st_b_c[1]), float(st_b_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw - 0.022, 0.09, 0.16),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_DARK_CHASSIS,
+                    albedo_rgb=(0.11, 0.15, 0.24),
+                    roughness=0.68,
+                )
+            )
+        # Protruding long-arm bus mirrors
+        for side_s in (-1.0, 1.0):
+            bm_c = _to_world(side_s * (hw + 0.15), hl + 0.12, belt_z + 0.36)
+            prims.append(
+                _Prim3D(
+                    center=(float(bm_c[0]), float(bm_c[1]), float(bm_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(0.09, 0.08, 0.20),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_DARK_CHASSIS,
+                    albedo_rgb=(0.04, 0.04, 0.05),
+                    roughness=0.45,
+                )
+            )
+        # Amber/white LED destination header sign (`CLS_SIGNBOARD_HARDNEG`)
+        if len(bank.sticker_mips) >= 30:
+            led_idx = 26 + (int(spec.track_id) % 4)
+            led_f_c = _to_world(0.0, hl + 0.026, roof_bot_z + 0.08)
+            led_f_n = R @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            quads.append(
+                _make_planar_quad(
+                    led_f_c,
+                    led_f_n,
+                    min(0.62, hw * 0.56),
+                    0.11,
+                    ("sticker", led_idx),
+                    CLS_SIGNBOARD_HARDNEG,
+                    veh_idx,
+                    up_hint_w=up_body,
+                    plate_side=SIDE_FRONT,
+                    retro_gain=1.35,
+                    roughness=0.14,
+                    clearcoat=0.75,
+                )
+            )
+            led_r_c = _to_world(0.0, -hl - 0.022, roof_bot_z - 0.08)
+            led_r_n = R @ np.array([0.0, -1.0, 0.0], dtype=np.float32)
+            quads.append(
+                _make_planar_quad(
+                    led_r_c,
+                    led_r_n,
+                    min(0.46, hw * 0.42),
+                    0.09,
+                    ("sticker", led_idx),
+                    CLS_SIGNBOARD_HARDNEG,
+                    veh_idx,
+                    up_hint_w=up_body,
+                    plate_side=SIDE_REAR,
+                    retro_gain=1.35,
+                    roughness=0.14,
+                    clearcoat=0.75,
+                )
+            )
+        front_plate_local_y = hl + 0.036
+        front_plate_local_z = chassis_z * 0.86
+        rear_plate_local_y = -hl - 0.028
+        rear_plate_local_z = chassis_z * 0.92
+
+    elif is_wheel_loader:
+        # Articulated wheel loader (`ホイールローダー`): central ROPS cab + rear counterweight + front lift arms & bucket!
+        cw_hl = hl * 0.34
+        cw_h = max(0.85, (spec.body_h_m - chassis_z) * 0.56)
+        cw_c = _to_world(0.0, -hl + cw_hl, chassis_z + 0.18 + 0.5 * cw_h)
+        prims.append(
+            _Prim3D(
+                center=(float(cw_c[0]), float(cw_c[1]), float(cw_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw * 0.86, cw_hl, 0.5 * cw_h),
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_BODY,
+                albedo_rgb=spec.paint_lin,
+                roughness=0.38,
+                rib_freq=8.0,
+                mud_level=max(0.18, spec.mud_level),
+                mud_phase=spec.mud_phase,
+                metallic=0.22,
+                decal_spec=((dec_i + 4) % n_dec_bank, 0, 0.0, 0.0, 0.45, 0.34, max(0.0, dec_rel)),
+            )
+        )
+        # Central elevated ROPS operator cab
+        cab_wl_z0 = chassis_z + 0.32
+        cab_wl_h = max(0.95, spec.cab_h_m - cab_wl_z0)
+        cab_wl_c = _to_world(0.0, -hl * 0.08, cab_wl_z0 + 0.5 * cab_wl_h)
+        cab_wl_ext = (hw * 0.62, hl * 0.24, 0.5 * cab_wl_h)
+        prims.append(
+            _Prim3D(
+                center=(float(cab_wl_c[0]), float(cab_wl_c[1]), float(cab_wl_c[2])),
+                rot_w2l=RT,
+                half_ext=cab_wl_ext,
+                shape=_SHAPE_OBB,
+                veh_idx=veh_idx,
+                role=_ROLE_CABIN_GLASS,
+                albedo_rgb=(0.05, 0.07, 0.09),
+                roughness=0.08,
+                clearcoat=0.88,
+            )
+        )
+        _record_cabin_obb(cab_wl_c, R, cab_wl_ext[0], cab_wl_ext[1], cab_wl_ext[2])
+        # Twin front steel lift arms + wide front earthmoving bucket
+        R_arm = R @ _rot_zyx(0.0, 0.28, 0.0)
+        for side_s in (-1.0, 1.0):
+            arm_c = _to_world(side_s * hw * 0.48, hl * 0.36, chassis_z + 0.52)
+            prims.append(
+                _Prim3D(
+                    center=(float(arm_c[0]), float(arm_c[1]), float(arm_c[2])),
+                    rot_w2l=R_arm.T.copy(),
+                    half_ext=(0.09, hl * 0.38, 0.14),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.paint_lin,
+                    roughness=0.40,
+                    metallic=0.28,
+                )
+            )
+        bkt_c = _to_world(0.0, hl - 0.36, 0.48)
+        prims.append(
+            _Prim3D(
+                center=(float(bkt_c[0]), float(bkt_c[1]), float(bkt_c[2])),
+                rot_w2l=RT,
+                half_ext=(hw * 0.99, 0.36, 0.40),
+                shape=_SHAPE_SLOPED_CAB,
+                veh_idx=veh_idx,
+                role=_ROLE_DARK_CHASSIS,
+                albedo_rgb=(0.08, 0.085, 0.09),
+                roughness=0.68,
+                slope_param=0.45,
+                metallic=0.42,
+                mud_level=max(0.25, spec.mud_level),
+            )
+        )
+        front_plate_local_y = hl * 0.16
+        front_plate_local_z = cab_wl_z0 + cab_wl_h - 0.16
+        rear_plate_local_y = -hl - 0.032
+        rear_plate_local_z = chassis_z + 0.32
+
     else:
         # Cab-over-engine Japanese truck / medium-duty cab / kei-truck / sleeper tractor / right-offset crane cab
         is_rt_crane = arch == "rough_terrain_crane"
@@ -3309,8 +3978,13 @@ def _assemble_vehicle_3d(
         cab_low_h = (spec.cab_h_m - chassis_z) * 0.52
         cab_low_z = chassis_z + cab_low_h * 0.5
         c_low = _to_world(cab_cx, cab_cy, cab_low_z)
+        cab_dec_i = (
+            (12 + (dec_i % max(1, n_dec_bank - 12)))
+            if (spec.is_train_v7 and n_dec_bank > 12 and (spec.track_id % 2 == 0))
+            else dec_i
+        )
         cab_decal = (
-            (dec_i, 0, 0.0, 0.02, 0.58, 0.36, dec_rel)
+            (cab_dec_i, 0, 0.0, 0.02, 0.58, 0.36, dec_rel)
             if (not spec.has_side_door_decal and len(bank.alpha_decal_mips) > 0)
             else None
         )
@@ -3418,7 +4092,8 @@ def _assemble_vehicle_3d(
             return _ROLE_DARK_CHASSIS, (0.035, 0.038, 0.042), 0.72, 0.20, 0.05
 
         bed_y0 = -hl
-        bed_y1 = hl - cab_len - 0.14
+        cab_box_gap_m = 0.28 if (spec.is_train_v7 and arch == "box_wing_truck") else 0.14
+        bed_y1 = hl - cab_len - cab_box_gap_m
         bed_cy = 0.5 * (bed_y0 + bed_y1)
         bed_hl = max(0.6, 0.5 * (bed_y1 - bed_y0))
 
@@ -4058,6 +4733,7 @@ def _assemble_vehicle_3d(
                     clearcoat=0.38,
                     specular_f0=0.04,
                     normal_undul_amp=0.024,
+                    cavity_sky_ao=float(spec.cavity_sky_ao_rear),
                 )
             )
             rear_plate_local_y = 999.0  # already placed on articulated trailer
@@ -4092,7 +4768,12 @@ def _assemble_vehicle_3d(
         elif arch == "box_wing_truck":
             box_h = spec.body_h_m - chassis_z - 0.18
             bc = _to_world(0.0, bed_cy, chassis_z + 0.18 + box_h * 0.5)
-            box_decal = ((dec_i + 7) % n_dec_bank, 0, -0.05, 0.12, 0.42, 0.28, dec_rel)
+            box_dec_i = (
+                (12 + ((dec_i + 7) % max(1, n_dec_bank - 12)))
+                if (spec.is_train_v7 and n_dec_bank > 12 and (spec.track_id % 2 == 0))
+                else ((dec_i + 7) % n_dec_bank)
+            )
+            box_decal = (box_dec_i, 0, -0.05, 0.12, 0.42, 0.28, dec_rel)
             prims.append(
                 _Prim3D(
                     center=(float(bc[0]), float(bc[1]), float(bc[2])),
@@ -4152,23 +4833,108 @@ def _assemble_vehicle_3d(
                     )
                 )
             rb_role, rb_alb, rb_rough, rb_met, rb_coat = _rear_bumper_style_props()
-            rb_c = _to_world(0.0, -hl + 0.34, chassis_z * 0.72)
+            if spec.is_train_v7:
+                # Explicit steel rear underrun protection bar (`突入防止装置`) + drop stanchions
+                for side_s in (-1.0, 1.0):
+                    st_u = _to_world(side_s * hw * 0.56, -hl + 0.22, chassis_z * 0.72)
+                    prims.append(
+                        _Prim3D(
+                            center=(float(st_u[0]), float(st_u[1]), float(st_u[2])),
+                            rot_w2l=RT,
+                            half_ext=(0.055, 0.055, 0.24),
+                            shape=_SHAPE_OBB,
+                            veh_idx=veh_idx,
+                            role=_ROLE_DARK_CHASSIS,
+                            albedo_rgb=(0.045, 0.050, 0.058),
+                            roughness=0.62,
+                            metallic=0.35,
+                        )
+                    )
+                rb_c = _to_world(0.0, -hl + 0.18, chassis_z * 0.50)
+                prims.append(
+                    _Prim3D(
+                        center=(float(rb_c[0]), float(rb_c[1]), float(rb_c[2])),
+                        rot_w2l=RT,
+                        half_ext=(hw * 0.90, 0.065, 0.068),
+                        shape=_SHAPE_OBB,
+                        veh_idx=veh_idx,
+                        role=rb_role,
+                        albedo_rgb=rb_alb,
+                        roughness=rb_rough,
+                        metallic=rb_met,
+                        clearcoat=rb_coat,
+                    )
+                )
+                rear_plate_local_y = -hl + 0.24
+                rear_plate_local_z = chassis_z * 0.76
+            else:
+                rb_c = _to_world(0.0, -hl + 0.34, chassis_z * 0.72)
+                prims.append(
+                    _Prim3D(
+                        center=(float(rb_c[0]), float(rb_c[1]), float(rb_c[2])),
+                        rot_w2l=RT,
+                        half_ext=(hw * 0.88, 0.07, 0.10),
+                        shape=_SHAPE_OBB,
+                        veh_idx=veh_idx,
+                        role=rb_role,
+                        albedo_rgb=rb_alb,
+                        roughness=rb_rough,
+                        metallic=rb_met,
+                        clearcoat=rb_coat,
+                    )
+                )
+                rear_plate_local_y = -hl + 0.20
+                rear_plate_local_z = chassis_z * 0.76
+
+        elif arch == "garbage_packer":
+            # Japanese sanitation / waste compactor truck (`塵芥車` / `パッカー車`):
+            # Compact ribbed compactor drum-box + sloped rear hopper tailgate overhanging recessed plate + frameless body text!
+            pk_h = max(1.15, spec.body_h_m - chassis_z - 0.16)
+            hop_len = min(1.15, max(0.72, (bed_y1 - bed_y0) * 0.32))
+            main_y0 = bed_y0 + hop_len
+            main_cy = 0.5 * (main_y0 + bed_y1)
+            main_hl = max(0.55, 0.5 * (main_y0 - bed_y1) * -1.0)
+            pk_dec_i = (12 + (spec.track_id % max(1, n_dec_bank - 12))) if n_dec_bank > 12 else dec_i
+            pk_c = _to_world(0.0, main_cy, chassis_z + 0.16 + 0.5 * pk_h)
             prims.append(
                 _Prim3D(
-                    center=(float(rb_c[0]), float(rb_c[1]), float(rb_c[2])),
+                    center=(float(pk_c[0]), float(pk_c[1]), float(pk_c[2])),
                     rot_w2l=RT,
-                    half_ext=(hw * 0.88, 0.07, 0.10),
+                    half_ext=(hw * 0.96, main_hl, 0.5 * pk_h),
                     shape=_SHAPE_OBB,
                     veh_idx=veh_idx,
-                    role=rb_role,
-                    albedo_rgb=rb_alb,
-                    roughness=rb_rough,
-                    metallic=rb_met,
-                    clearcoat=rb_coat,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.secondary_lin,
+                    roughness=0.26,
+                    rib_freq=6.0,
+                    mud_level=spec.mud_level * 0.85,
+                    mud_phase=spec.mud_phase,
+                    metallic=0.14,
+                    clearcoat=0.52,
+                    decal_spec=(pk_dec_i, 0, 0.0, 0.06, 0.48, 0.34, max(0.0, dec_rel)),
                 )
             )
-            rear_plate_local_y = -hl + 0.20
-            rear_plate_local_z = chassis_z * 0.76
+            # Sloped rear compactor hopper tailgate facing `-Y`
+            R_hop = R @ _rot_zyx(math.pi, 0.0, 0.0)
+            hop_c = _to_world(0.0, bed_y0 + 0.5 * hop_len, chassis_z + 0.24 + 0.48 * pk_h)
+            hop_dec_i = (12 + ((spec.track_id + 2) % max(1, n_dec_bank - 12))) if n_dec_bank > 12 else ((dec_i + 1) % n_dec_bank)
+            prims.append(
+                _Prim3D(
+                    center=(float(hop_c[0]), float(hop_c[1]), float(hop_c[2])),
+                    rot_w2l=R_hop.T.copy(),
+                    half_ext=(hw * 0.94, 0.5 * hop_len, 0.46 * pk_h),
+                    shape=_SHAPE_SLOPED_CAB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=spec.secondary_lin,
+                    roughness=0.28,
+                    slope_param=0.38,
+                    clearcoat=0.48,
+                    decal_spec=(hop_dec_i, 1, 0.0, 0.14, 0.46, 0.28, 0.0),
+                )
+            )
+            rear_plate_local_y = -hl + 0.22
+            rear_plate_local_z = chassis_z * 0.78
 
         else:
             # Flatbed cargo truck & Kei-truck (drop-side bed + compositional flexural wave sheet / lattice rack / boom!)
@@ -4387,7 +5153,7 @@ def _assemble_vehicle_3d(
     front_boxes_xz: list[tuple[float, float, float, float]] = [
         (fp_lx - fp_pw, fp_lx + fp_pw, front_plate_local_z - fp_ph, front_plate_local_z + fp_ph)
     ]
-    if is_heavy or spec.veh_struct_prod == "csg_recess_cavity":
+    if is_heavy or spec.veh_struct_prod == "csg_recess_cavity" or (spec.is_train_v7 and spec.cavity_sky_ao_front < 0.6):
         prims.extend(
             _prod_csg_recess_cavity(
                 pos_w=pos,
@@ -4428,6 +5194,7 @@ def _assemble_vehicle_3d(
             clearcoat=0.38,
             specular_f0=0.04,
             normal_undul_amp=0.024,
+            cavity_sky_ao=float(spec.cavity_sky_ao_front),
         )
     )
 
@@ -4438,7 +5205,8 @@ def _assemble_vehicle_3d(
         rear_boxes_xz: list[tuple[float, float, float, float]] = [
             (rp_x - rp_pw, rp_x + rp_pw, rear_plate_local_z - rp_ph, rear_plate_local_z + rp_ph)
         ]
-        if is_heavy or spec.veh_struct_prod == "csg_recess_cavity":
+        deep_recess_r = bool(spec.is_train_v7 and spec.cavity_sky_ao_rear < 0.5)
+        if is_heavy or spec.veh_struct_prod == "csg_recess_cavity" or deep_recess_r:
             prims.extend(
                 _prod_csg_recess_cavity(
                     pos_w=pos,
@@ -4447,10 +5215,10 @@ def _assemble_vehicle_3d(
                     half_w=rp_pw,
                     half_h=rp_ph,
                     outward_sign_y=-1.0,
-                    top_lip_out_m=0.017,
-                    cheek_out_m=0.006,
+                    top_lip_out_m=0.074 if deep_recess_r else 0.017,
+                    cheek_out_m=0.032 if deep_recess_r else 0.006,
                     inward_depth_m=0.095,
-                    top_clear_z_m=0.102,
+                    top_clear_z_m=0.032 if deep_recess_r else 0.102,
                     cheek_clear_x_m=0.038,
                     veh_idx=veh_idx,
                     role=_ROLE_DARK_CHASSIS,
@@ -4479,13 +5247,14 @@ def _assemble_vehicle_3d(
                 clearcoat=0.38,
                 specular_f0=0.04,
                 normal_undul_amp=0.024,
+                cavity_sky_ao=float(spec.cavity_sky_ao_rear),
             )
         )
 
         # Vehicle-mounted placards & bolted/framed blank non-plate brackets
         # (strictly disjoint in `(X, Z)` with `>= 6.5 cm` margin AND strictly recessed inward behind real plate planes!)
         if spec.has_sticker and arch != "tractor_head":
-            is_pass_car = arch in ("sedan", "kei_tall_wagon", "suv_4wd", "hiace_van")
+            is_pass_car = is_pass_arch
             st_pw = 0.18 if arch == "kei_truck" else 0.20
             st_ph = 0.065
             if arch == "concrete_mixer":
@@ -4549,7 +5318,7 @@ def _assemble_vehicle_3d(
                 )
 
     # Front cab stencils, grille badges, bolted blank brackets, and bumper intake slots (`CLS_SIGNBOARD_HARDNEG`)
-    if arch not in ("sedan", "kei_tall_wagon", "suv_4wd", "hiace_van"):
+    if not (is_pass_arch or is_bus or is_wheel_loader):
         n_st_bank = len(bank.sticker_mips)
         if spec.has_front_cab_hn and n_st_bank > 7:
             cab_hn_i = int(spec.front_cab_hn_idx) % n_st_bank
@@ -4621,6 +5390,93 @@ def _assemble_vehicle_3d(
                     )
                 )
 
+    if spec.is_train_v7:
+        if spec.nir_paint_refl > 0.0:
+            for pr_v in prims:
+                if pr_v.veh_idx == veh_idx and pr_v.role == _ROLE_BODY:
+                    pr_v.nir_scale_override = float(spec.nir_paint_refl)
+
+        # Emit conformal frameless painted `_Prim3D.decal_spec` rectangles as `CLS_SIGNBOARD_HARDNEG` quads
+        # (appended AFTER real `CLS_PLATE` & bolted sticker quads so real plates retain strict priority!)
+        if n_dec_bank > 0:
+            for pr_v in prims:
+                if pr_v.veh_idx != veh_idx or pr_v.decal_spec is None:
+                    continue
+                d_idx_q, proj_f_q, uc_q, vc_q, uhw_q, vhh_q, rel_q = pr_v.decal_spec
+                if float(rel_q) < 0.0:
+                    continue
+                R_pr = pr_v.rot_w2l.T
+                c_pr = np.array(pr_v.center, dtype=np.float32)
+                sx_p, sy_p, sz_p = pr_v.half_ext
+                up_pr = R_pr[:, 2].copy()
+                d_tidx = int(d_idx_q) % n_dec_bank
+                if proj_f_q == 0:
+                    q_hw = max(0.08, float(uhw_q) * sy_p)
+                    q_hh = max(0.05, float(vhh_q) * sz_p)
+                    for s_x_q in (-1.0, 1.0):
+                        dc_l = np.array([s_x_q * (sx_p + 0.004), s_x_q * float(uc_q) * sy_p, float(vc_q) * sz_p], dtype=np.float32)
+                        dn_w = R_pr @ np.array([s_x_q, 0.0, 0.0], dtype=np.float32)
+                        quads.append(
+                            _make_planar_quad(
+                                c_pr + R_pr @ dc_l,
+                                dn_w,
+                                q_hw,
+                                q_hh,
+                                ("alpha_decal", d_tidx),
+                                CLS_SIGNBOARD_HARDNEG,
+                                veh_idx,
+                                up_hint_w=up_pr,
+                                plate_side=SIDE_PURE_SIDE,
+                                retro_gain=0.0,
+                                has_backing_substrate=False,
+                                decal_prim_coupled=True,
+                            )
+                        )
+                elif proj_f_q == 1:
+                    q_hw = max(0.08, float(uhw_q) * sx_p)
+                    q_hh = max(0.05, float(vhh_q) * sz_p)
+                    dc_l = np.array([-float(uc_q) * sx_p, sx_p * 0.0 + sy_p + 0.004, float(vc_q) * sz_p], dtype=np.float32)
+                    dn_w = R_pr @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    p_side_q = SIDE_REAR if float(dn_w @ R[:, 1]) < 0.0 else SIDE_FRONT
+                    quads.append(
+                        _make_planar_quad(
+                            c_pr + R_pr @ dc_l,
+                            dn_w,
+                            q_hw,
+                            q_hh,
+                            ("alpha_decal", d_tidx),
+                            CLS_SIGNBOARD_HARDNEG,
+                            veh_idx,
+                            up_hint_w=up_pr,
+                            plate_side=p_side_q,
+                            retro_gain=0.0,
+                            has_backing_substrate=False,
+                            decal_prim_coupled=True,
+                        )
+                    )
+                else:
+                    q_hw = max(0.08, float(uhw_q) * sy_p)
+                    q_hh = max(0.05, float(vhh_q) * sz_p * 0.72)
+                    for s_x_q in (-1.0, 1.0):
+                        dc_l = np.array([s_x_q * (sx_p * 0.96), s_x_q * float(uc_q) * sy_p, float(vc_q) * sz_p * 0.65], dtype=np.float32)
+                        dn_w = R_pr @ np.array([s_x_q, 0.0, 0.14], dtype=np.float32)
+                        quads.append(
+                            _make_planar_quad(
+                                c_pr + R_pr @ dc_l,
+                                dn_w,
+                                q_hw,
+                                q_hh,
+                                ("alpha_decal", d_tidx),
+                                CLS_SIGNBOARD_HARDNEG,
+                                veh_idx,
+                                up_hint_w=up_pr,
+                                plate_side=SIDE_PURE_SIDE,
+                                retro_gain=0.0,
+                                has_backing_substrate=False,
+                                decal_prim_coupled=True,
+                            )
+                        )
+
     # Exact world Z = 0.0 road-plane footprint [FL, FR, RR, RL] (never lifted by suspension pitch/roll!)
     R_yaw = _rot_z(yaw)
     p_ground = np.array([pos[0], pos[1], 0.0], dtype=np.float32)
@@ -4678,6 +5534,15 @@ class Scene3DGPUEngine:
             split=self.config.split,
             domain_split=self.config.domain_split,
         )
+        if self.config.domain_split == "train":
+            sobol_eng = torch.quasirandom.SobolEngine(
+                dimension=12,
+                scramble=True,
+                seed=(int(self.config.bank_seed) ^ 0x50B01C12) & 0x7FFFFFFF,
+            )
+            self._sobol_table: np.ndarray | None = sobol_eng.draw(4096, dtype=torch.float32).cpu().numpy()
+        else:
+            self._sobol_table = None
 
     @staticmethod
     def _project_points(
@@ -4839,36 +5704,46 @@ class Scene3DGPUEngine:
         veh_struct_prod: str | None = None,
         marking_prod: str | None = None,
         radial_dn_n: int | None = None,
+        sobol_vec: np.ndarray | None = None,
+        forced_arch: str | None = None,
+        forced_paint_lin: tuple[float, float, float] | None = None,
+        forced_secondary_lin: tuple[float, float, float] | None = None,
+        forced_dims: tuple[float, float, float, float] | None = None,
+        forced_yaw_rad: float | None = None,
+        forced_speed_mps: float | None = None,
+        force_dark_car: bool = False,
+        force_comm_plate: bool = False,
+        force_recessed_ao: bool = False,
+        exclude_plate_indices: set[int] | None = None,
     ) -> _VehiclePassSpec:
-        names = [a[0] for a in ARCHETYPE_CATALOG]
-        subs = [a[1] for a in ARCHETYPE_CATALOG]
-        if self.config.domain_split == "train":
-            # Balanced urban road + working-vehicle (`はたらくくるま`) distribution for high general recall
-            train_weight_map = {
-                "dump_10t": 0.09,
-                "deep_dump": 0.04,
-                "concrete_mixer": 0.08,
-                "flatbed_truck": 0.07,
-                "box_wing_truck": 0.11,
-                "semi_container_trailer": 0.04,
-                "skeletal_chassis_trailer": 0.03,
-                "heavy_lowboy_trailer": 0.03,
-                "tractor_head": 0.04,
-                "rough_terrain_crane": 0.03,
-                "cargo_crane_truck": 0.04,
-                "tanker_lorry": 0.04,
-                "kei_truck": 0.08,
-                "hiace_van": 0.10,
-                "sedan": 0.06,
-                "kei_tall_wagon": 0.06,
-                "suv_4wd": 0.06,
-            }
-            weights = [train_weight_map.get(nm, w0) for nm, w0 in zip(names, (a[2] for a in ARCHETYPE_CATALOG))]
+        is_train = self.config.domain_split == "train"
+        if is_train:
+            cat_use = TRAIN_V7_ARCHETYPE_CATALOG
+            names = [a[0] for a in cat_use]
+            subs = [a[1] for a in cat_use]
+            weights = [a[2] for a in cat_use]
+            if forced_arch is not None and forced_arch in names:
+                idx_a = names.index(forced_arch)
+            elif sobol_vec is not None:
+                u_arch = (float(sobol_vec[0]) + float(track_id - 1) * 0.61803398875) % 1.0
+                acc_w = 0.0
+                idx_a = len(names) - 1
+                for ai, wi in enumerate(weights):
+                    acc_w += float(wi)
+                    if u_arch < acc_w:
+                        idx_a = ai
+                        break
+            else:
+                idx_a = rng.choices(range(len(names)), weights=weights, k=1)[0]
+            arch = names[idx_a]
+            subtype = subs[idx_a]
         else:
+            names = [a[0] for a in ARCHETYPE_CATALOG]
+            subs = [a[1] for a in ARCHETYPE_CATALOG]
             weights = [a[2] for a in ARCHETYPE_CATALOG]
-        idx_a = rng.choices(range(len(names)), weights=weights, k=1)[0]
-        arch = names[idx_a]
-        subtype = subs[idx_a]
+            idx_a = rng.choices(range(len(names)), weights=weights, k=1)[0]
+            arch = names[idx_a]
+            subtype = subs[idx_a]
 
         is_lg = True
         if arch in ("dump_10t", "deep_dump"):
@@ -4883,6 +5758,25 @@ class Scene3DGPUEngine:
         elif arch == "rough_terrain_crane":
             L, W, cab_h, body_h = rng.uniform(8.2, 10.6), rng.uniform(2.48, 2.62), 2.95, 3.55
             p_bucket = "special_8_9"
+        elif arch == "wheel_loader":
+            L, W, cab_h, body_h = rng.uniform(6.2, 7.6), rng.uniform(2.38, 2.60), 3.18, 3.18
+            p_bucket = "special_8_9"
+        elif arch == "garbage_packer":
+            is_lg = rng.random() < 0.36
+            L = rng.uniform(6.0, 7.0) if is_lg else rng.uniform(5.2, 6.1)
+            W = 2.26 if is_lg else 2.12
+            cab_h, body_h = 2.58, 2.76
+            p_bucket = "special_8_9" if rng.random() < 0.68 else "med_comm"
+        elif arch == "city_route_bus":
+            L, W, cab_h, body_h = rng.uniform(10.2, 11.0), 2.49, 3.12, 3.12
+            p_bucket = "heavy_comm" if rng.random() < 0.88 else "heavy_priv"
+        elif arch == "highway_coach_bus":
+            L, W, cab_h, body_h = rng.uniform(11.4, 12.0), 2.49, 3.52, 3.52
+            p_bucket = "heavy_comm" if rng.random() < 0.88 else "heavy_priv"
+        elif arch == "microbus":
+            is_lg = False
+            L, W, cab_h, body_h = rng.uniform(6.25, 6.99), 2.08, 2.64, 2.64
+            p_bucket = "med_comm" if rng.random() < 0.66 else "med_priv"
         elif arch == "cargo_crane_truck":
             is_lg = rng.random() < 0.62
             L = rng.uniform(7.6, 9.2) if is_lg else rng.uniform(5.6, 6.8)
@@ -4914,23 +5808,38 @@ class Scene3DGPUEngine:
         elif arch == "kei_truck":
             is_lg = False
             L, W, cab_h, body_h = 3.39, 1.48, 1.78, 1.78
-            p_bucket = "kei_priv" if rng.random() < 0.72 else "kei_comm"
+            p_bucket = ("kei_comm" if rng.random() < 0.48 else "kei_priv") if is_train else ("kei_priv" if rng.random() < 0.72 else "kei_comm")
         elif arch == "hiace_van":
             is_lg = False
             L, W, cab_h, body_h = rng.uniform(4.69, 5.38), rng.uniform(1.69, 1.88), 1.98, 2.08
-            p_bucket = "med_priv" if rng.random() < 0.68 else "med_comm"
+            p_bucket = ("med_comm" if rng.random() < 0.54 else "med_priv") if is_train else ("med_priv" if rng.random() < 0.68 else "med_comm")
+        elif arch == "kei_crossover":
+            is_lg = False
+            L, W, cab_h, body_h = 3.39, 1.48, 1.66, 1.68
+            p_bucket = "kei_comm" if rng.random() < 0.24 else "kei_priv"
         elif arch == "kei_tall_wagon":
             is_lg = False
             L, W, cab_h, body_h = 3.39, 1.48, 1.76, 1.78
-            p_bucket = "kei_priv" if rng.random() < 0.85 else "kei_comm"
+            p_bucket = ("kei_comm" if rng.random() < 0.28 else "kei_priv") if is_train else ("kei_priv" if rng.random() < 0.85 else "kei_comm")
+        elif arch == "minivan_1box_jp":
+            is_lg = False
+            L, W, cab_h, body_h = rng.uniform(4.69, 4.95), rng.uniform(1.73, 1.85), 1.88, 1.92
+            p_bucket = "med_comm" if rng.random() < 0.16 else "med_priv"
+        elif arch == "hatchback_compact":
+            is_lg = False
+            L, W, cab_h, body_h = rng.uniform(3.85, 4.25), rng.uniform(1.69, 1.76), 1.52, 1.54
+            p_bucket = "med_comm" if rng.random() < 0.14 else "med_priv"
         elif arch == "suv_4wd":
             is_lg = False
             L, W, cab_h, body_h = rng.uniform(4.55, 4.95), rng.uniform(1.82, 1.94), 1.76, 1.80
-            p_bucket = "med_priv"
+            p_bucket = ("med_comm" if rng.random() < 0.12 else "med_priv") if is_train else "med_priv"
         else:
             is_lg = False
             L, W, cab_h, body_h = rng.uniform(4.45, 4.88), rng.uniform(1.74, 1.84), 1.46, 1.48
-            p_bucket = "med_priv"
+            p_bucket = ("med_comm" if rng.random() < 0.20 else "med_priv") if is_train else "med_priv"
+
+        if forced_dims is not None:
+            L, W, cab_h, body_h = forced_dims
 
         palettes: tuple[tuple[float, float, float], ...] = (
             (0.88, 0.89, 0.91),  # Isuzu / Hino commercial bright white
@@ -4955,17 +5864,42 @@ class Scene3DGPUEngine:
             (0.82, 0.80, 0.70),
             (0.74, 0.76, 0.80),
         )
-        if self.config.domain_split == "train":
+        if is_train:
             palettes = palettes + (
-                (0.76, 0.03, 0.03),  # Fire pump / emergency working-vehicle vivid red (`はたらくくるま`)
-                (0.04, 0.20, 0.70),  # Municipal sanitation / packer royal blue (`清掃車`)
-                (0.78, 0.54, 0.03),  # Road maintenance patrol bright yellow (`道路維持作業車`)
+                (0.76, 0.03, 0.03),  # Emergency working-vehicle vivid red
+                (0.04, 0.20, 0.70),  # Municipal sanitation / packer royal blue
+                (0.78, 0.54, 0.03),  # Road maintenance patrol bright yellow
                 (0.84, 0.34, 0.04),  # Municipal / utility high-visibility orange
+                (0.028, 0.030, 0.035),  # Obsidian passenger pearl black
+                (0.065, 0.068, 0.075),  # Dark gunmetal charcoal
+                (0.56, 0.59, 0.63),  # Everyday champagne / light gray metallic
             )
-            if arch in ("box_wing_truck", "hiace_van", "flatbed_truck", "dump_10t") and rng.random() < 0.24:
+            if force_comm_plate:
+                p_bucket = "kei_comm" if "kei" in arch else ("heavy_comm" if is_lg else "med_comm")
+            elif arch in ("box_wing_truck", "hiace_van", "flatbed_truck", "dump_10t", "garbage_packer") and rng.random() < 0.24:
                 p_bucket = "special_8_9"
-        paint_lin = rng.choice(palettes)
-        if arch in ("box_wing_truck", "concrete_mixer") and rng.random() < 0.52:
+
+        if is_train and forced_paint_lin is not None:
+            paint_lin = forced_paint_lin
+        elif is_train and force_dark_car:
+            paint_lin = rng.choice(
+                (
+                    (0.028, 0.030, 0.035),
+                    (0.040, 0.042, 0.048),
+                    (0.065, 0.068, 0.075),
+                    (0.032, 0.055, 0.110),
+                    (0.065, 0.042, 0.036),
+                )
+            )
+        elif is_train and sobol_vec is not None:
+            u_paint = (float(sobol_vec[1]) + float(track_id - 1) * 0.381966011) % 1.0
+            paint_lin = palettes[min(len(palettes) - 1, int(u_paint * len(palettes)))]
+        else:
+            paint_lin = rng.choice(palettes)
+
+        if is_train and forced_secondary_lin is not None:
+            sec_lin = forced_secondary_lin
+        elif arch in ("box_wing_truck", "concrete_mixer") and rng.random() < 0.52:
             # High-frequency Japanese commercial two-tone: colored cab + bright white/silver box or mixer drum!
             sec_lin = rng.choice(bright_cargo_palettes)
         elif rng.random() < 0.44:
@@ -4977,7 +5911,13 @@ class Scene3DGPUEngine:
         # Articulated tractor-trailers have independent tractor front & semi-trailer rear commercial registrations.
         is_articulated = arch in _ARTICULATED_ARCHETYPES
         reg_list = self.bank.reg_buckets[p_bucket]
-        fp_idx = rng.choice(reg_list)
+        if is_train and exclude_plate_indices:
+            avail_regs = [p_i for p_i in reg_list if p_i not in exclude_plate_indices]
+            if not avail_regs:
+                avail_regs = reg_list
+            fp_idx = rng.choice(avail_regs)
+        else:
+            fp_idx = rng.choice(reg_list)
         if is_articulated:
             rp_idx = rng.choice(reg_list)
             if len(reg_list) > 1 and rp_idx == fp_idx:
@@ -4991,12 +5931,34 @@ class Scene3DGPUEngine:
         oblique_deg = rng.uniform(-max_oblique, max_oblique) if rng.random() < 0.55 else rng.uniform(-10.0, 10.0)
         base_yaw = (math.pi if approaching else 0.0) + math.radians(oblique_deg)
 
+        if is_train:
+            if forced_yaw_rad is not None:
+                base_yaw = float(forced_yaw_rad)
+            elif sobol_vec is not None:
+                # Decoupled full `[-180°, +180°]` (`[-pi, +pi]`) yaw stratification via Sobol u[4]
+                u_yaw = (float(sobol_vec[4]) + float(track_id - 1) * 0.2734375) % 1.0
+                if u_yaw < 0.34:
+                    # Departing / 3-4 rear (`-58°..+58°`)
+                    base_yaw = math.radians((u_yaw / 0.34) * 116.0 - 58.0)
+                elif u_yaw < 0.68:
+                    # Oncoming / 3-4 front (`122°..238°`, wrapped to `[-pi, +pi]`)
+                    ang_d = 122.0 + ((u_yaw - 0.34) / 0.34) * 116.0
+                    base_yaw = math.atan2(math.sin(math.radians(ang_d)), math.cos(math.radians(ang_d)))
+                else:
+                    # Full continuous `[-180°, +180°]` oblique turning & cross-traffic (`+-58°..+-122°` + full circle)
+                    base_yaw = -math.pi + ((u_yaw - 0.68) / 0.32) * (2.0 * math.pi)
+
         y0 = rng.uniform(y_range[0], y_range[1])
-        if stationary:
+        if stationary or (is_train and forced_speed_mps is not None and abs(forced_speed_mps) < 1e-6):
             motion_mode = "stationary"
             speed = 0.0
             accel_mag = 0.0
             yaw_rate = 0.0
+        elif is_train and forced_speed_mps is not None:
+            motion_mode = "reverse" if forced_speed_mps < 0.0 else "cruise"
+            speed = float(forced_speed_mps)
+            accel_mag = rng.uniform(-1.5, 1.5) if rng.random() < 0.4 else 0.0
+            yaw_rate = math.radians(rng.uniform(-10.0, 10.0)) if rng.random() < 0.35 else 0.0
         else:
             motion_mode = rng.choices(
                 ["cruise", "gate_creep", "brake_to_stop", "stop_and_go", "reverse"],
@@ -5025,7 +5987,13 @@ class Scene3DGPUEngine:
                 accel_mag = rng.uniform(-2.8, 2.6) if rng.random() < 0.5 else 0.0
                 yaw_rate = math.radians(rng.uniform(-16.0, 16.0)) if rng.random() < 0.45 else 0.0
 
-        off_f = rng.choice([-0.34, 0.0, 0.0, 0.34]) if "kei" in arch else (rng.uniform(-0.38, 0.38) if rng.random() < 0.25 else 0.0)
+        if is_train and abs(math.sin(base_yaw)) > 0.58 and abs(speed) > 3.6:
+            speed = math.copysign(3.6, speed)
+
+        if is_train and "kei" in arch:
+            off_f = rng.choice([-0.34, 0.34, -0.31, 0.31, 0.0])
+        else:
+            off_f = rng.choice([-0.34, 0.0, 0.0, 0.34]) if "kei" in arch else (rng.uniform(-0.38, 0.38) if rng.random() < 0.25 else 0.0)
         is_heavy = subtype in (SUBTYPE_DUMP_TRUCK, SUBTYPE_CONCRETE_MIXER, SUBTYPE_CRANE_HEAVY, SUBTYPE_TRACTOR_TRAILER, SUBTYPE_TANKER_SPECIAL)
         off_r = rng.uniform(-0.42, 0.42) if is_heavy and rng.random() < 0.35 else 0.0
 
@@ -5066,10 +6034,14 @@ class Scene3DGPUEngine:
         smooth_frp = bool(arch == "box_wing_truck" and rng_v5.random() < 0.52)
         reefer_nose = bool(arch == "box_wing_truck" and rng_v5.random() < 0.48)
         wind_defl = bool(arch == "box_wing_truck" and rng_v5.random() < 0.50)
-        has_door_dec = bool(arch not in ("sedan", "kei_tall_wagon", "suv_4wd") and rng_v5.random() < 0.55)
-        door_dec_idx = int(rng_v5.randrange(16, len(self.bank.sticker_mips))) if len(self.bank.sticker_mips) > 16 else 1
+        n_st_avail = min(26, len(self.bank.sticker_mips)) if is_train else len(self.bank.sticker_mips)
+        has_door_dec = bool(
+            arch not in ("sedan", "hatchback_compact", "minivan_1box_jp", "kei_tall_wagon", "kei_crossover", "suv_4wd")
+            and rng_v5.random() < 0.55
+        )
+        door_dec_idx = int(rng_v5.randrange(16, n_st_avail)) if n_st_avail > 16 else 1
         # Wider intersection / turning / oblique yard yaw angles (`0°..360°`)
-        if dist_mid >= 7.8 and abs(lane_x) <= 2.4 and rng_v5.random() < 0.24:
+        if (not is_train or (forced_yaw_rad is None and sobol_vec is None)) and dist_mid >= 7.8 and abs(lane_x) <= 2.4 and rng_v5.random() < 0.24:
             base_yaw = rng_v5.uniform(0.0, 2.0 * math.pi)
             if abs(math.sin(base_yaw)) > 0.62 and abs(speed) > 4.2:
                 speed = math.copysign(4.2, speed)
@@ -5098,6 +6070,35 @@ class Scene3DGPUEngine:
         flex_lin_val = rng_v5.choice(flex_sheet_palettes)
         boom_yaw_val = math.radians(rng_v5.uniform(-16.0, 16.0))
         boom_elev_val = rng_v5.uniform(0.08, 0.34)
+
+        if is_train:
+            recessed_rear_archs = (
+                "dump_10t",
+                "deep_dump",
+                "concrete_mixer",
+                "box_wing_truck",
+                "garbage_packer",
+                "cargo_crane_truck",
+                "flatbed_truck",
+                "semi_container_trailer",
+                "skeletal_chassis_trailer",
+                "heavy_lowboy_trailer",
+                "hiace_van",
+                "minivan_1box_jp",
+                "suv_4wd",
+            )
+            if force_recessed_ao:
+                cav_ao_r = rng_v5.uniform(0.08, 0.18)
+            elif arch in recessed_rear_archs or rng_v5.random() < 0.45:
+                cav_ao_r = rng_v5.uniform(0.08, 0.28)
+            else:
+                cav_ao_r = rng_v5.uniform(0.55, 0.92)
+            cav_ao_f = rng_v5.uniform(0.14, 0.32) if (is_heavy or v_prod_val == "csg_recess_cavity" or rng_v5.random() < 0.30) else 1.0
+            nir_refl = rng_v5.uniform(0.04, 0.82)
+        else:
+            cav_ao_r = 1.0
+            cav_ao_f = 1.0
+            nir_refl = 0.0
 
         return _VehiclePassSpec(
             track_id=track_id,
@@ -5153,6 +6154,10 @@ class Scene3DGPUEngine:
             flex_sheet_lin=flex_lin_val,
             boom_yaw_rad=float(boom_yaw_val),
             boom_elev_rad=float(boom_elev_val),
+            is_train_v7=is_train,
+            cavity_sky_ao_rear=float(cav_ao_r),
+            cavity_sky_ao_front=float(cav_ao_f),
+            nir_paint_refl=float(nir_refl),
         )
 
     @staticmethod
@@ -5222,11 +6227,14 @@ class Scene3DGPUEngine:
         existing: list[_VehiclePassSpec],
         duration_s: float = 1.25,
         t_start_s: float = 0.0,
+        *,
+        pad_w: float = 0.28,
+        pad_l: float = 0.38,
     ) -> bool:
         """Guarantee zero rotated/articulated 3D vehicle interpenetration across continuous `[t_start_s, duration_s]`.
 
         Uses a Lipschitz swept-margin bound: choosing `dt <= 2 * r_sweep / (V_max(cand) + V_max(ex))` with
-        `r_sweep = 0.12 m <= pad_w` guarantees that for every continuous `t in [t_k - dt/2, t_k + dt/2]`, the true
+        `r_sweep <= pad_w` guarantees that for every continuous `t in [t_k - dt/2, t_k + dt/2]`, the true
         moving OBB `B(t)` is strictly contained inside the padded OBB `B_pad(t_k)` checked at grid sample `t_k`.
         """
         if not existing:
@@ -5235,7 +6243,7 @@ class Scene3DGPUEngine:
         t_hi = max(t_lo + 1e-5, max(float(t_start_s), float(duration_s)))
         span_s = t_hi - t_lo
         v_cand = cls._max_planar_point_speed_mps(cand, t_lo, t_hi)
-        r_sweep = 0.12
+        r_sweep = min(0.12, max(0.03, float(pad_w)))
 
         for ex in existing:
             v_rel = max(0.5, v_cand + cls._max_planar_point_speed_mps(ex, t_lo, t_hi))
@@ -5244,8 +6252,8 @@ class Scene3DGPUEngine:
             inv_n = 1.0 / float(n_steps)
             for si in range(n_steps + 1):
                 t_chk = t_lo + span_s * (si * inv_n)
-                c_obbs = cls._vehicle_planar_obbs_at(cand, t_chk, pad_w=0.28, pad_l=0.38)
-                e_obbs = cls._vehicle_planar_obbs_at(ex, t_chk, pad_w=0.28, pad_l=0.38)
+                c_obbs = cls._vehicle_planar_obbs_at(cand, t_chk, pad_w=pad_w, pad_l=pad_l)
+                e_obbs = cls._vehicle_planar_obbs_at(ex, t_chk, pad_w=pad_w, pad_l=pad_l)
                 for cc, cyaw, chw, chl in c_obbs:
                     rc = math.hypot(chw, chl)
                     cx_f, cy_f = float(cc[0]), float(cc[1])
@@ -5734,6 +6742,7 @@ class Scene3DGPUEngine:
         emit_buf = torch.zeros((h, w), device=dev, dtype=torch.float32)
         nir_scale_buf = torch.ones((h, w), device=dev, dtype=torch.float32)
         green_plate_buf = torch.zeros((h, w), device=dev, dtype=torch.bool)
+        cavity_ao_buf = torch.ones((h, w), device=dev, dtype=torch.float32)
 
         # Pass 1A: Ground Plane Z = 0 Intersection (Zero analytic ellipse shadow proxy; 3D shadows cast in Pass 2!)
         hit_road = dz_w < -1e-4
@@ -5776,6 +6785,20 @@ class Scene3DGPUEngine:
                         dim=0,
                     )
                 road_rgb = road_rgb * dapple[None, :, :]
+                if float(es.get("has_zebra", 0.0)) > 0.5:
+                    zy0 = float(es.get("zebra_y0", 6.2))
+                    zy1 = float(es.get("zebra_y1", 9.6))
+                    zeb_bar = (wy > zy0) & (wy < zy1) & (wx.abs() < 4.4) & (wx.remainder(0.90) < 0.45)
+                    if zeb_bar.any():
+                        zeb_rgb = torch.stack(
+                            [
+                                torch.full_like(lam_r, 0.72),
+                                torch.full_like(lam_r, 0.73),
+                                torch.full_like(lam_r, 0.70),
+                            ],
+                            dim=0,
+                        ) * dapple[None, :, :]
+                        road_rgb = torch.where(zeb_bar[None, :, :], road_rgb * 0.22 + zeb_rgb * 0.78, road_rgb)
                 if is_wet:
                     road_rgb = road_rgb * (0.86 - 0.30 * puddle)[None, :, :]
                     r_rough = 0.62 * (1.0 - puddle) + 0.065 * puddle
@@ -6176,6 +7199,35 @@ class Scene3DGPUEngine:
                     alb = torch.where(in_pane[None, :, :], pane_col, mull_col)
                     p_rough = torch.where(in_pane, torch.full_like(p_rough, 0.08), p_rough)
                     p_coat = torch.where(in_pane, torch.full_like(p_coat, 0.80), p_coat)
+            p_emit_map: Tensor | None = None
+            if pr.veh_idx == 0 and pr.role == _ROLE_ENV_SOLID and sy > 1.2 and int(round(float(pr.mud_phase))) == 5:
+                # Lit night storefront / commercial building multi-pane window grid (`veh_idx == 0`)
+                cell_y = (hy + sy).remainder(0.92)
+                cell_z = (hz + sz).remainder(0.64)
+                in_pane = (cell_y > 0.10) & (cell_y < 0.82) & (cell_z > 0.10) & (cell_z < 0.54)
+                cid_y = torch.floor((hy + sy) / 0.92)
+                cid_z = torch.floor((hz + sz) / 0.64)
+                chash = torch.sin(cid_y * 12.9898 + cid_z * 78.233 + ph_e)
+                pane_lit = in_pane & (chash > (-0.42 if is_night else 0.22))
+                warm_w = (0.5 + 0.5 * torch.cos(cid_y * 3.1 + cid_z * 1.7)).clamp(0.0, 1.0)
+                lit_col = torch.stack(
+                    [
+                        0.88 + 0.10 * warm_w,
+                        0.84 + 0.06 * warm_w,
+                        0.92 - 0.34 * warm_w,
+                    ],
+                    dim=0,
+                )
+                dark_pane = torch.tensor([0.05, 0.08, 0.12], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
+                mull_col = torch.tensor([0.16, 0.18, 0.21], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
+                alb = torch.where(pane_lit[None, :, :], lit_col, torch.where(in_pane[None, :, :], dark_pane, mull_col))
+                p_rough = torch.where(in_pane, torch.full_like(p_rough, 0.07), p_rough)
+                p_coat = torch.where(in_pane, torch.full_like(p_coat, 0.82), p_coat)
+                p_emit_map = torch.where(
+                    pane_lit,
+                    torch.full_like(p_rough, 2.55 if is_night else 0.50),
+                    torch.zeros_like(p_rough),
+                )
 
             # Substrate-decoupled conformal RGBA alpha-paint & 3D normal-relief typography (ZERO rectangular border!)
             if pr.decal_spec is not None and len(self.bank.alpha_decal_mips) > 0:
@@ -6259,7 +7311,11 @@ class Scene3DGPUEngine:
                 emit_val = 3.4 if is_ir else (2.8 if is_night else 0.9)
             else:
                 emit_val = 0.0
-            nir_sc = 0.45 if pr.role == _ROLE_CABIN_GLASS else (0.70 if pr.role == _ROLE_TIRE else 1.0)
+            nir_sc = (
+                float(pr.nir_scale_override)
+                if pr.nir_scale_override > 0.0
+                else (0.45 if pr.role == _ROLE_CABIN_GLASS else (0.70 if pr.role == _ROLE_TIRE else 1.0))
+            )
             hk_val = 4 if is_lamp else 2
 
             alb_buf[:, v0:v1, u0:u1] = torch.where(valid_p[None, :, :], alb, alb_buf[:, v0:v1, u0:u1])
@@ -6274,10 +7330,20 @@ class Scene3DGPUEngine:
             f0_buf[v0:v1, u0:u1] = torch.where(valid_p, p_f0, f0_buf[v0:v1, u0:u1])
             coat_buf[v0:v1, u0:u1] = torch.where(valid_p, p_coat, coat_buf[v0:v1, u0:u1])
             retro_buf[v0:v1, u0:u1] = torch.where(valid_p, p_retro, retro_buf[v0:v1, u0:u1])
-            emit_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(emit_buf[v0:v1, u0:u1], emit_val), emit_buf[v0:v1, u0:u1])
+            if p_emit_map is not None:
+                emit_buf[v0:v1, u0:u1] = torch.where(valid_p, p_emit_map, emit_buf[v0:v1, u0:u1])
+                hk_map = torch.where(
+                    p_emit_map > 0.0,
+                    torch.full_like(hit_kind_buf[v0:v1, u0:u1], 4),
+                    torch.full_like(hit_kind_buf[v0:v1, u0:u1], 2),
+                )
+                hit_kind_buf[v0:v1, u0:u1] = torch.where(valid_p, hk_map, hit_kind_buf[v0:v1, u0:u1])
+            else:
+                emit_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(emit_buf[v0:v1, u0:u1], emit_val), emit_buf[v0:v1, u0:u1])
+                hit_kind_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(hit_kind_buf[v0:v1, u0:u1], hk_val), hit_kind_buf[v0:v1, u0:u1])
             nir_scale_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(nir_scale_buf[v0:v1, u0:u1], nir_sc), nir_scale_buf[v0:v1, u0:u1])
             green_plate_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.zeros_like(green_plate_buf[v0:v1, u0:u1]), green_plate_buf[v0:v1, u0:u1])
-            hit_kind_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(hit_kind_buf[v0:v1, u0:u1], hk_val), hit_kind_buf[v0:v1, u0:u1])
+            cavity_ao_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.ones_like(cavity_ao_buf[v0:v1, u0:u1]), cavity_ao_buf[v0:v1, u0:u1])
             prim_id_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(prim_id_buf[v0:v1, u0:u1], p_idx), prim_id_buf[v0:v1, u0:u1])
             quad_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(quad_buf[v0:v1, u0:u1], -1), quad_buf[v0:v1, u0:u1])
             t_best[v0:v1, u0:u1] = torch.where(valid_p, t_hit, t_best[v0:v1, u0:u1])
@@ -6323,6 +7389,24 @@ class Scene3DGPUEngine:
             eta = (px_w * v_t[0] + py_w * v_t[1] + pz_w * v_t[2]) / max(1e-4, qd.half_h)
 
             if not qd.has_backing_substrate:
+                if self.config.domain_split == "train" and qd.decal_prim_coupled:
+                    # Geometric plane visibility on parent vehicle body (Pass 1B already blended conformal paint!)
+                    in_decal_plane = (
+                        (denom < -1e-5)
+                        & (lam_q > 0.16)
+                        & (xi.abs() <= 1.0)
+                        & (eta.abs() <= 1.0)
+                        & (veh_buf[v0:v1, u0:u1] == qd.veh_idx)
+                        & ((lam_q - t_best[v0:v1, u0:u1]).abs() <= 0.28)
+                        & (quad_buf[v0:v1, u0:u1] < 0)
+                    )
+                    if in_decal_plane.any():
+                        quad_buf[v0:v1, u0:u1] = torch.where(
+                            in_decal_plane,
+                            torch.full_like(quad_buf[v0:v1, u0:u1], q_idx),
+                            quad_buf[v0:v1, u0:u1],
+                        )
+                    continue
                 # Frameless painted alpha stencil applied onto an existing underlying surface (zero rectangular border!)
                 in_stencil = (
                     (denom < -1e-5)
@@ -6347,6 +7431,14 @@ class Scene3DGPUEngine:
                     cur_alb = alb_buf[:, v0:v1, u0:u1]
                     alb_buf[:, v0:v1, u0:u1] = cur_alb * (1.0 - alpha_s[None]) + samp_s[:3] * alpha_s[None]
                     rough_buf[v0:v1, u0:u1] = rough_buf[v0:v1, u0:u1] * (1.0 - alpha_s) + float(qd.roughness) * alpha_s
+                if self.config.domain_split == "train":
+                    vis_st_plane = in_stencil & (quad_buf[v0:v1, u0:u1] < 0)
+                    if vis_st_plane.any():
+                        quad_buf[v0:v1, u0:u1] = torch.where(
+                            vis_st_plane,
+                            torch.full_like(quad_buf[v0:v1, u0:u1], q_idx),
+                            quad_buf[v0:v1, u0:u1],
+                        )
                 continue
 
             # Coplanar +3cm tolerance ONLY against the plate's OWN parent vehicle body (never nearer pillars/signs/trucks!)
@@ -6408,6 +7500,7 @@ class Scene3DGPUEngine:
             retro_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.retro_gain)), retro_buf[v0:v1, u0:u1])
             emit_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.zeros_like(xi), emit_buf[v0:v1, u0:u1])
             nir_scale_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.ones_like(xi), nir_scale_buf[v0:v1, u0:u1])
+            cavity_ao_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.cavity_sky_ao)), cavity_ao_buf[v0:v1, u0:u1])
             green_plate_buf[v0:v1, u0:u1] = torch.where(
                 in_quad,
                 torch.full_like(green_plate_buf[v0:v1, u0:u1], bool(qd.is_green_plate)),
@@ -6653,15 +7746,26 @@ class Scene3DGPUEngine:
             if is_ir:
                 # Strictly monochrome 850nm/940nm coaxial NIR LED reflectance (bit-exact R == G == B!)
                 nir_alb = (0.42 * alb_buf[0] + 0.38 * alb_buf[1] + 0.20 * alb_buf[2]) * nir_scale_buf
-                if green_plate_buf.any():
-                    whiteness = torch.minimum(alb_buf[0], alb_buf[2])
-                    nir_green = 0.22 * (0.48 * alb_buf[0] + 0.24 * alb_buf[1] + 0.28 * alb_buf[2]) + 1.15 * whiteness
-                    nir_alb = torch.where(green_plate_buf, nir_green, nir_alb)
+                if self.config.domain_split == "train":
+                    if green_plate_buf.any():
+                        whiteness = torch.minimum(alb_buf[0], alb_buf[2]).clamp(0.0, 1.0)
+                        g_bg_nir = 0.18 + 0.24 * (0.5 + 0.5 * math.sin(ph_e * 2.31))
+                        nir_green = g_bg_nir * (1.0 - whiteness) + 1.24 * whiteness
+                        nir_alb = torch.where(green_plate_buf, nir_green, nir_alb)
+                    ir_road = 0.015 + 2.4 * ir_ang_gain / (1.0 + 0.028 * dist_m * dist_m)
+                    ir_prim = (0.012 + 3.2 * ir_ang_gain / (1.0 + 0.025 * dist_m * dist_m)) * (0.20 + 0.80 * ndotv)
+                    coax_q = (retro_buf * 6.8 * ir_ang_gain / (1.0 + 0.026 * dist_m * dist_m)).clamp(0.06, 4.4)
+                    spec_ir = ndotv.pow(12.0) * (0.15 + 0.55 * (1.0 - rough_buf)) * 0.42
+                else:
+                    if green_plate_buf.any():
+                        whiteness = torch.minimum(alb_buf[0], alb_buf[2])
+                        nir_green = 0.22 * (0.48 * alb_buf[0] + 0.24 * alb_buf[1] + 0.28 * alb_buf[2]) + 1.15 * whiteness
+                        nir_alb = torch.where(green_plate_buf, nir_green, nir_alb)
 
-                ir_road = 0.015 + 2.4 * ir_ang_gain / (1.0 + 0.028 * dist_m * dist_m)
-                ir_prim = (0.012 + 3.2 * ir_ang_gain / (1.0 + 0.025 * dist_m * dist_m)) * (0.20 + 0.80 * ndotv)
-                coax_q = (retro_buf * 5.8 * ir_ang_gain / (1.0 + 0.030 * dist_m * dist_m)).clamp(0.06, 3.2)
-                spec_ir = ndotv.pow(12.0) * (0.15 + 0.55 * (1.0 - rough_buf)) * 0.42
+                    ir_road = 0.015 + 2.4 * ir_ang_gain / (1.0 + 0.028 * dist_m * dist_m)
+                    ir_prim = (0.012 + 3.2 * ir_ang_gain / (1.0 + 0.025 * dist_m * dist_m)) * (0.20 + 0.80 * ndotv)
+                    coax_q = (retro_buf * 5.8 * ir_ang_gain / (1.0 + 0.030 * dist_m * dist_m)).clamp(0.06, 3.2)
+                    spec_ir = ndotv.pow(12.0) * (0.15 + 0.55 * (1.0 - rough_buf)) * 0.42
 
                 lum_ir = torch.where(
                     hit_kind_buf == 1,
@@ -6753,6 +7857,13 @@ class Scene3DGPUEngine:
                     retro_hdr = alb_buf * (retro_buf * 0.08 * ir_ang_gain * shadow_vis)[None]
                 else:
                     retro_hdr = torch.zeros_like(direct_hdr)
+
+                if self.config.domain_split == "train":
+                    # Recessed cavity sky/coaxial occlusion (`cavity_sky_ao` in [0.08, 0.28] when shadowed, 1.0 when sunlit)
+                    cav_sh_mult = (cavity_ao_buf + (1.0 - cavity_ao_buf) * shadow_vis)[None]
+                    amb_hdr = amb_hdr * cav_sh_mult
+                    ibl_hdr = ibl_hdr * cav_sh_mult
+                    retro_hdr = retro_hdr * cav_sh_mult
 
                 surf_hdr = torch.where(
                     (hit_kind_buf == 4)[None, :, :],
@@ -6926,6 +8037,18 @@ class Scene3DGPUEngine:
         K = int(num_frames if num_frames is not None else self.config.num_frames)
         h, w = image_hw if image_hw is not None else self.config.image_hw
         dev = self.device
+        is_train = self.config.domain_split == "train"
+
+        sobol_u: np.ndarray | None = None
+        is_hard_tail = False
+        hard_tail_sub = 0
+        if is_train and self._sobol_table is not None:
+            row_s = self._sobol_table[int(seed) & 4095]
+            cp_shift = float((((int(seed) >> 12) * 0x9E3779B9) & 0xFFFF)) / 65536.0
+            sobol_u = np.mod(row_s + cp_shift, 1.0).astype(np.float32)
+            # ~15% joint hard-tail stratum (`clip_idx % 7 == 0` -> 14.3% + 0.7% tail)
+            is_hard_tail = (int(seed) % 7 == 0) or (float(sobol_u[5]) > 0.993)
+            hard_tail_sub = (int(seed) // 7) & 1
 
         is_neg = rng.random() < self.config.p_negative_clip
         is_night = rng.random() < self.config.p_night_scene
@@ -6936,49 +8059,133 @@ class Scene3DGPUEngine:
         has_pillar = (K >= 2) and (rng.random() < self.config.p_gate_pillar_occlusion)
         stationary_all = rng.random() < self.config.p_stationary_clip
 
-        # Camera rig: covers close-up giant gate, top-edge approach, mid-gate, distant wide pole, and elevated CCTV!
-        if self.config.domain_split == "train":
-            cam_mode = rng.choices(
-                ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch", "cctv_elevated_security"],
-                weights=[0.28, 0.28, 0.14, 0.10, 0.20],
-                k=1,
-            )[0]
+        is_backlit_train = False
+        is_tunnel_train = False
+        ego_fwd_mps = 0.0
+
+        if is_train and sobol_u is not None:
+            # Decouple lighting, weather, fence/pillar occlusion, and 5 camera rigs via 12-D Sobol vector!
+            if self.config.p_night_scene > 0.0:
+                is_night = float(sobol_u[6]) < float(self.config.p_night_scene)
+                ir_frac = float(self.config.p_night_ir) / max(0.05, float(self.config.p_night_scene))
+                is_ir = is_night and (float(sobol_u[6]) < float(self.config.p_night_scene) * ir_frac)
+                is_backlit_train = (not is_night) and (float(sobol_u[6]) > 0.76)
+            if self.config.p_rain_wet > 0.0:
+                is_wet = float(sobol_u[7]) < max(0.28, float(self.config.p_rain_wet))
+            if self.config.p_chainlink_fence > 0.0:
+                has_fence = float(sobol_u[5]) < float(self.config.p_chainlink_fence)
+            if K >= 2 and self.config.p_gate_pillar_occlusion > 0.0:
+                has_pillar = float(sobol_u[5]) > (1.0 - float(self.config.p_gate_pillar_occlusion))
+            if self.config.p_stationary_clip > 0.0:
+                stationary_all = float(sobol_u[9]) < float(self.config.p_stationary_clip)
+
+            if is_hard_tail and not is_neg:
+                if hard_tail_sub == 0:
+                    # Joint hard-tail A: night or strong low-sun backlight x dark car x occlusion x distant/wide low-res
+                    if float(sobol_u[6]) < 0.55 and self.config.p_night_scene > 0.0:
+                        is_night = True
+                        is_ir = float(sobol_u[6]) < 0.16 and self.config.p_night_ir > 0.0
+                    else:
+                        is_night = False
+                        is_ir = False
+                        is_backlit_train = True
+                    has_pillar = K >= 2 and (float(sobol_u[8]) < 0.45)
+                else:
+                    # Joint hard-tail B: recessed dark green/black commercial plate x rain wet glare
+                    is_wet = True
+
+            u_rig = float(sobol_u[2])
+            u_dist = float(sobol_u[3])
+            if is_hard_tail and hard_tail_sub == 0 and u_rig < 0.42:
+                cam_mode = "cctv_lowres_pole" if u_rig < 0.24 else "dashcam_ego"
+            elif u_rig < 0.22:
+                cam_mode = "dashcam_ego"
+            elif u_rig < 0.42:
+                cam_mode = "smartphone_closeup"
+            elif u_rig < 0.62:
+                cam_mode = "cctv_lowres_pole"
+            elif u_rig < 0.82:
+                cam_mode = "red_light_intersection"
+            else:
+                cam_mode = "highway_tunnel"
+
+            if cam_mode == "dashcam_ego":
+                cam_x = rng.uniform(-1.75, 1.75)
+                cam_z = rng.uniform(1.15, 1.62)
+                hfov_deg = 95.0 + 33.0 * ((u_rig / 0.22) % 1.0)
+                y_spawn = (8.0 + 4.5 * u_dist, 14.5 + 11.5 * u_dist)
+                look_y, look_z = rng.uniform(12.0, 22.0), rng.uniform(0.95, 1.50)
+                ego_fwd_mps = 0.0 if stationary_all else rng.uniform(2.8, 8.8)
+            elif cam_mode == "smartphone_closeup":
+                cam_x = rng.uniform(-2.0, 2.0)
+                cam_z = rng.uniform(1.05, 1.72)
+                hfov_deg = rng.uniform(58.0, 78.0)
+                y_spawn = (3.6 + 1.4 * u_dist, 5.2 + 2.5 * u_dist)
+                look_y, look_z = rng.uniform(3.2, 6.2), rng.uniform(0.58, 1.28)
+            elif cam_mode == "cctv_lowres_pole":
+                cam_x = rng.uniform(-5.2, 5.2)
+                cam_z = rng.uniform(3.6, 8.5)
+                hfov_deg = rng.uniform(52.0, 88.0)
+                y_spawn = (9.5 + 8.5 * u_dist, 18.5 + 12.5 * u_dist)
+                look_y, look_z = rng.uniform(11.5, 23.5), rng.uniform(0.35, 1.38)
+            elif cam_mode == "red_light_intersection":
+                cam_x = rng.uniform(-3.6, 3.6)
+                cam_z = rng.uniform(1.55, 4.4)
+                hfov_deg = rng.uniform(56.0, 88.0)
+                y_spawn = (6.4 + 4.0 * u_dist, 13.5 + 8.5 * u_dist)
+                look_y, look_z = rng.uniform(8.5, 16.5), rng.uniform(0.72, 1.52)
+            else:
+                # `highway_tunnel`
+                cam_x = rng.uniform(-3.2, 3.2)
+                cam_z = rng.uniform(1.45, 4.8)
+                hfov_deg = rng.uniform(50.0, 84.0)
+                y_spawn = (7.8 + 6.0 * u_dist, 15.5 + 13.5 * u_dist)
+                look_y, look_z = rng.uniform(11.5, 22.0), rng.uniform(0.75, 1.52)
+                is_tunnel_train = float(sobol_u[8]) < 0.55
         else:
-            cam_mode = rng.choices(
-                ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch"],
-                weights=[0.38, 0.34, 0.16, 0.12],
-                k=1,
-            )[0]
-        if cam_mode == "close_gate":
-            cam_x = rng.uniform(-2.9, 2.9)
-            cam_z = rng.uniform(1.10, 2.45)
-            hfov_deg = rng.uniform(52.0, 82.0)
-            y_spawn = (4.8, 9.6)
-            look_y, look_z = rng.uniform(5.2, 8.8), rng.uniform(0.85, 1.75)
-        elif cam_mode == "top_edge_pitch":
-            cam_x = rng.uniform(-2.6, 2.6)
-            cam_z = rng.uniform(2.1, 4.1)
-            hfov_deg = rng.uniform(46.0, 70.0)
-            y_spawn = (7.2, 14.5)
-            look_y, look_z = rng.uniform(4.4, 6.6), rng.uniform(0.0, 0.30)
-        elif cam_mode == "cctv_elevated_security":
-            cam_x = rng.uniform(-5.2, 5.2)
-            cam_z = rng.uniform(3.8, 8.4)
-            hfov_deg = rng.uniform(50.0, 88.0)
-            y_spawn = (8.5, 30.5)
-            look_y, look_z = rng.uniform(11.0, 22.5), rng.uniform(0.35, 1.35)
-        elif cam_mode == "high_pole_wide":
-            cam_x = rng.uniform(-4.0, 4.0)
-            cam_z = rng.uniform(3.4, 6.2)
-            hfov_deg = rng.uniform(54.0, 86.0)
-            y_spawn = (10.5, 25.0)
-            look_y, look_z = rng.uniform(12.5, 20.5), rng.uniform(0.6, 1.5)
-        else:
-            cam_x = rng.uniform(-3.0, 3.0)
-            cam_z = rng.uniform(1.5, 3.2)
-            hfov_deg = rng.uniform(45.0, 72.0)
-            y_spawn = (6.5, 16.5)
-            look_y, look_z = rng.uniform(8.5, 14.5), rng.uniform(0.8, 1.5)
+            # Camera rig: covers close-up giant gate, top-edge approach, mid-gate, distant wide pole, and elevated CCTV!
+            if is_train:
+                cam_mode = rng.choices(
+                    ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch", "cctv_elevated_security"],
+                    weights=[0.28, 0.28, 0.14, 0.10, 0.20],
+                    k=1,
+                )[0]
+            else:
+                cam_mode = rng.choices(
+                    ["close_gate", "mid_gate", "high_pole_wide", "top_edge_pitch"],
+                    weights=[0.38, 0.34, 0.16, 0.12],
+                    k=1,
+                )[0]
+            if cam_mode == "close_gate":
+                cam_x = rng.uniform(-2.9, 2.9)
+                cam_z = rng.uniform(1.10, 2.45)
+                hfov_deg = rng.uniform(52.0, 82.0)
+                y_spawn = (4.8, 9.6)
+                look_y, look_z = rng.uniform(5.2, 8.8), rng.uniform(0.85, 1.75)
+            elif cam_mode == "top_edge_pitch":
+                cam_x = rng.uniform(-2.6, 2.6)
+                cam_z = rng.uniform(2.1, 4.1)
+                hfov_deg = rng.uniform(46.0, 70.0)
+                y_spawn = (7.2, 14.5)
+                look_y, look_z = rng.uniform(4.4, 6.6), rng.uniform(0.0, 0.30)
+            elif cam_mode == "cctv_elevated_security":
+                cam_x = rng.uniform(-5.2, 5.2)
+                cam_z = rng.uniform(3.8, 8.4)
+                hfov_deg = rng.uniform(50.0, 88.0)
+                y_spawn = (8.5, 30.5)
+                look_y, look_z = rng.uniform(11.0, 22.5), rng.uniform(0.35, 1.35)
+            elif cam_mode == "high_pole_wide":
+                cam_x = rng.uniform(-4.0, 4.0)
+                cam_z = rng.uniform(3.4, 6.2)
+                hfov_deg = rng.uniform(54.0, 86.0)
+                y_spawn = (10.5, 25.0)
+                look_y, look_z = rng.uniform(12.5, 20.5), rng.uniform(0.6, 1.5)
+            else:
+                cam_x = rng.uniform(-3.0, 3.0)
+                cam_z = rng.uniform(1.5, 3.2)
+                hfov_deg = rng.uniform(45.0, 72.0)
+                y_spawn = (6.5, 16.5)
+                look_y, look_z = rng.uniform(8.5, 14.5), rng.uniform(0.8, 1.5)
 
         cam_o = np.array([cam_x, 0.0, cam_z], dtype=np.float32)
         look_p = np.array([rng.uniform(-1.0, 1.0), look_y, look_z], dtype=np.float32)
@@ -7003,15 +8210,19 @@ class Scene3DGPUEngine:
         combo = rng_g6.choice(GRAMMAR_COMBOS_BY_DOMAIN_SPLIT[self.config.domain_split])
         radial_order = rng_g6.choice(RADIAL_DN_ORDERS_BY_DOMAIN_SPLIT[self.config.domain_split])
         camera_family = rng_g6.choice(CAMERA_FAMILIES_BY_DOMAIN_SPLIT[self.config.domain_split])
+        if is_train and cam_mode == "smartphone_closeup":
+            camera_family = "lorenz_chaotic_handheld"
         solar_radius_deg = rng_g6.uniform(0.25, 6.0)
         camera_path = _CameraTrajectorySpec(
             cam_o_base=cam_o.copy(), R_cam_base=R_cam.copy(), fx_base=fx, fy_base=fy,
-            family=camera_family, stationary=stationary_all or camera_family == "stationary_rig_fixed",
+            family=camera_family,
+            stationary=(stationary_all or camera_family == "stationary_rig_fixed") and ego_fwd_mps == 0.0,
             vel_xyz_mps=(rng_g6.uniform(-0.12, 0.12), 0.0, 0.0),
             pan_rate_rad_s=rng_g6.uniform(-0.025, 0.025),
             tilt_rate_rad_s=rng_g6.uniform(-0.012, 0.012),
             zoom_rate_s=rng_g6.uniform(-0.035, 0.035),
             vib_amp_rad=rng_g6.uniform(0.0002, 0.0012), vib_phase=rng_g6.uniform(0, 2 * math.pi),
+            ego_forward_mps=float(ego_fwd_mps),
         )
 
         # Sample lighting, frame timestamps, and ALL static/nuisance environment BEFORE vehicles
@@ -7021,6 +8232,12 @@ class Scene3DGPUEngine:
             "ground_type": float(rng.choices([0, 1, 2], weights=[0.50, 0.26, 0.24], k=1)[0]),
             "skyline_type": float(rng.choices([0, 1, 2], weights=[0.45, 0.40, 0.15], k=1)[0]),
         }
+        if is_train and (cam_mode == "red_light_intersection" or (sobol_u is not None and float(sobol_u[8]) > 0.68)):
+            env_style["ground_type"] = 0.0
+            env_style["has_zebra"] = 1.0
+            env_style["zebra_y0"] = 6.2
+            env_style["zebra_y1"] = 9.6
+
         env_prims_base: list[_Prim3D] = []
         static_obs: list[tuple[np.ndarray, float, float]] = []  # (xy_center, hw, hl) for collision clearance
         I3 = np.eye(3, dtype=np.float32)
@@ -7057,7 +8274,7 @@ class Scene3DGPUEngine:
                 wall_col = rng.choice([(0.54, 0.56, 0.58), (0.12, 0.26, 0.18), (0.36, 0.34, 0.31), (0.18, 0.24, 0.34)])
                 wall_cz = rng.uniform(1.1, 1.8)
                 wall_hz = rng.uniform(1.1, 1.8)
-                wall_style_v5 = float(rng_v5.choice([0, 1, 2, 3, 4]))
+                wall_style_v5 = float(rng_v5.choice([0, 1, 2, 3, 4, 5] if is_train else [0, 1, 2, 3, 4]))
                 env_prims_base.append(
                     _Prim3D(
                         center=(wx_h, 18.0, wall_cz),
@@ -7094,7 +8311,7 @@ class Scene3DGPUEngine:
         if has_pillar:
             # Foreground gate pillar (`門柱`) placed on inter-lane island or foreground post (`y in [2.1, 3.3]`)
             pil_x = rng.choice([-1.68, 1.68]) + rng.uniform(-0.14, 0.14)
-            pil_y = rng.uniform(2.2, 3.6)
+            pil_y = rng.uniform(2.2, 3.6) if ego_fwd_mps == 0.0 else rng.uniform(4.8, 6.8)
             pil_hx = rng.uniform(0.22, 0.34)
             env_prims_base.append(
                 _Prim3D(
@@ -7113,13 +8330,18 @@ class Scene3DGPUEngine:
         # Bolted roadside signs & swaying safety placards (`CLS_SIGNBOARD_HARDNEG`, label-independent distribution!)
         n_signs = rng.choices([0, 1, 2, 3], weights=[0.26, 0.36, 0.24, 0.14], k=1)[0]
         sign_defs: list[dict[str, Any]] = []
+        n_sign_specs_eff = len(self.bank.SIGN_SPECS) if is_train else self.bank._LEGACY_SIGN_SPEC_COUNT
         for si in range(n_signs):
             sx_s = rng.choice([-1.0, 1.0]) * rng.uniform(4.75, 5.65)
             sy_s = rng.uniform(4.8, 18.5)
             sz_s = rng.uniform(0.95, 2.35)
             sway = rng.random() < 0.35
-            sidx_leg = rng.randrange(len(self.bank.SIGN_SPECS))
-            sidx_eff = rng_v5.randrange(len(self.bank.sign_mips)) if (len(self.bank.sign_mips) > len(self.bank.SIGN_SPECS) and rng_v5.random() < 0.62) else sidx_leg
+            sidx_leg = rng.randrange(n_sign_specs_eff)
+            sidx_eff = (
+                rng_v5.randrange(len(self.bank.sign_mips))
+                if (len(self.bank.sign_mips) > n_sign_specs_eff and rng_v5.random() < 0.62)
+                else sidx_leg
+            )
             sign_defs.append(
                 {
                     "track_id": 100 + si,
@@ -7158,23 +8380,30 @@ class Scene3DGPUEngine:
                 sign_ra = hw_a + 0.14
                 static_obs.append((np.array([sx_a, sy_a], dtype=np.float32), sign_ra, sign_ra))
 
-        # v0.7.0 train-only roadside bright storefronts/kiosks & red reflector bollards (teaches negative suppression
-        # against bright white livecam shop facades and glowing red non-plate lamps without touching holdout splits).
-        if self.config.domain_split == "train":
+        # Train-only structured hard-negative Japanese roadside environment:
+        # 1) Blue national-route / highway signs (`"319"`, `"246"`, `"16"`, `"R17"`, `CLS_SIGNBOARD_HARDNEG`),
+        # 2) Roadside blue polyethylene garbage tarps (`ブルーシート`, `veh_idx=0`),
+        # 3) Lit night storefront multi-pane window grids (`veh_idx=0`),
+        # 4) White corrugated W-beam guardrails (`veh_idx=0`),
+        # 5) Overhead concrete tunnel portal & warm sodium ceiling lamps (`highway_tunnel`).
+        if is_train:
             rng_ch = random.Random(int(seed) ^ 0x4348414F)
-            if rng_ch.random() < 0.36:
-                n_kiosk = rng_ch.choices([1, 2], weights=[0.65, 0.35], k=1)[0]
+            # Storefronts / illuminated window grids
+            p_store = 0.62 if is_night else 0.38
+            if rng_ch.random() < p_store:
+                n_kiosk = rng_ch.choices([1, 2], weights=[0.62, 0.38], k=1)[0]
                 for ki in range(n_kiosk):
                     kx = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(6.2, 8.2)
-                    ky = rng_ch.uniform(8.5, 25.0)
+                    ky = rng_ch.uniform(8.0, 25.0)
                     khx = rng_ch.uniform(0.95, 1.65)
-                    khy = rng_ch.uniform(1.55, 2.85)
-                    khz = rng_ch.uniform(1.25, 1.95)
+                    khy = rng_ch.uniform(1.65, 3.10)
+                    khz = rng_ch.uniform(1.35, 2.25)
                     bright_wall = rng_ch.choice([
                         (0.88, 0.90, 0.93),
                         (0.92, 0.89, 0.82),
-                        (0.82, 0.86, 0.90),
+                        (0.24, 0.27, 0.32),
                     ])
+                    is_lit_win_grid = is_night or (rng_ch.random() < 0.55)
                     env_prims_base.append(
                         _Prim3D(
                             center=(kx, ky, khz),
@@ -7185,26 +8414,45 @@ class Scene3DGPUEngine:
                             role=_ROLE_ENV_SOLID,
                             albedo_rgb=bright_wall,
                             roughness=0.28,
-                            rib_freq=rng_ch.choice([4.0, 8.0]),
-                            retro_gain=0.35,
+                            rib_freq=0.0 if is_lit_win_grid else rng_ch.choice([4.0, 8.0]),
+                            mud_phase=5.0 if is_lit_win_grid else 0.0,
+                            retro_gain=0.25,
                         )
                     )
-                    # Dark shop-window recess band + glowing red roadside bollard reflector next to kiosk
                     face_s = -1.0 if kx > 0.0 else 1.0
-                    env_prims_base.append(
-                        _Prim3D(
-                            center=(kx + face_s * (khx + 0.03), ky, 0.85),
-                            rot_w2l=I3,
-                            half_ext=(0.04, khy * 0.72, 0.52),
-                            shape=_SHAPE_OBB,
-                            veh_idx=0,
-                            role=_ROLE_CABIN_GLASS,
-                            albedo_rgb=(0.08, 0.12, 0.16),
-                            roughness=0.08,
-                            clearcoat=0.85,
+                    if not is_lit_win_grid:
+                        env_prims_base.append(
+                            _Prim3D(
+                                center=(kx + face_s * (khx + 0.03), ky, 0.85),
+                                rot_w2l=I3,
+                                half_ext=(0.04, khy * 0.72, 0.52),
+                                shape=_SHAPE_OBB,
+                                veh_idx=0,
+                                role=_ROLE_CABIN_GLASS,
+                                albedo_rgb=(0.08, 0.12, 0.16),
+                                roughness=0.08,
+                                clearcoat=0.85,
+                            )
                         )
-                    )
-                    if rng_ch.random() < 0.55:
+                    # Frameless painted wall stencil on kiosk facade (`CLS_SIGNBOARD_HARDNEG`, `vis_q >= 0.35`)
+                    if len(self.bank.alpha_decal_mips) > 12 and rng_ch.random() < 0.45:
+                        st_x_f = kx + face_s * (khx + 0.012)
+                        st_yaw = (-0.5 * math.pi) if face_s < 0.0 else (0.5 * math.pi)
+                        sign_defs.append(
+                            {
+                                "track_id": 150 + ki,
+                                "pos": np.array([st_x_f, ky, 1.15], dtype=np.float32),
+                                "yaw": st_yaw,
+                                "hw": min(0.55, khy * 0.38),
+                                "hh": 0.22,
+                                "tex_kind": "alpha_decal",
+                                "sidx": int(rng_ch.randrange(12, len(self.bank.alpha_decal_mips))),
+                                "has_backing_substrate": False,
+                                "has_pole": False,
+                                "sway": False,
+                            }
+                        )
+                    if rng_ch.random() < 0.50:
                         env_prims_base.append(
                             _Prim3D(
                                 center=(kx + face_s * (khx + 0.28), ky - khy * 0.65, 0.55),
@@ -7220,10 +8468,107 @@ class Scene3DGPUEngine:
                         )
                     static_obs.append((np.array([kx, ky], dtype=np.float32), khx + 0.45, khy + 0.35))
 
+            # Blue national-route / highway signs (`"319"`, `"246"`, `"16"`, `"R17"` at indices 10..13)
+            if len(self.bank.sign_mips) >= 14 and rng_ch.random() < 0.44:
+                n_blue_s = rng_ch.choices([1, 2], weights=[0.70, 0.30], k=1)[0]
+                for bsi in range(n_blue_s):
+                    bx_s = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(4.45, 5.55)
+                    by_s = rng_ch.uniform(6.2, 22.0)
+                    bz_s = rng_ch.uniform(1.75, 3.35)
+                    bhw = rng_ch.uniform(0.28, 0.46)
+                    bhh = bhw * rng_ch.uniform(0.78, 0.96)
+                    sign_defs.append(
+                        {
+                            "track_id": 160 + bsi,
+                            "pos": np.array([bx_s, by_s, bz_s], dtype=np.float32),
+                            "yaw": math.pi + rng_ch.uniform(-0.35, 0.35),
+                            "hw": bhw,
+                            "hh": bhh,
+                            "sidx": int(rng_ch.randrange(10, 14)),
+                            "sway": False,
+                            "retro_gain": 1.35,
+                        }
+                    )
+                    static_obs.append((np.array([bx_s, by_s], dtype=np.float32), bhw + 0.14, bhw + 0.14))
+
+            # Roadside blue garbage tarps (`ブルーシート`, `veh_idx=0`)
+            if rng_ch.random() < 0.36:
+                tx_b = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(4.55, 5.65)
+                ty_b = rng_ch.uniform(5.8, 17.5)
+                thl = rng_ch.uniform(0.65, 1.25)
+                thw = rng_ch.uniform(0.45, 0.72)
+                R_tarp = _rot_zyx(rng_ch.uniform(-0.35, 0.35), 0.0, 0.45 * math.pi)
+                env_prims_base.append(
+                    _prod_flex_wave_sheet(
+                        center_w=np.array([tx_b, ty_b, 0.42], dtype=np.float32),
+                        R_l2w=R_tarp,
+                        half_ext=(0.22, thl, thw),
+                        veh_idx=0,
+                        role=_ROLE_ENV_SOLID,
+                        albedo_rgb=rng_ch.choice([(0.015, 0.15, 0.64), (0.020, 0.20, 0.72)]),
+                        roughness=0.28,
+                        wave_amp=0.075,
+                        wave_freq=6.4,
+                        phase=rng_ch.uniform(0.0, 6.28),
+                    )
+                )
+                static_obs.append((np.array([tx_b, ty_b], dtype=np.float32), thw + 0.25, thl + 0.25))
+
+            # White W-beam roadside guardrails (`ガードレール`, `veh_idx=0`)
+            if rng_ch.random() < 0.42:
+                for g_side in (-1.0, 1.0):
+                    if rng_ch.random() < 0.72:
+                        gx_r = g_side * rng_ch.uniform(4.45, 4.95)
+                        env_prims_base.append(
+                            _Prim3D(
+                                center=(gx_r, 15.5, 0.62),
+                                rot_w2l=I3,
+                                half_ext=(0.055, 12.5, 0.17),
+                                shape=_SHAPE_OBB,
+                                veh_idx=0,
+                                role=_ROLE_ENV_SOLID,
+                                albedo_rgb=(0.85, 0.87, 0.89),
+                                roughness=0.34,
+                                rib_freq=16.0,
+                                metallic=0.26,
+                                retro_gain=0.25,
+                            )
+                        )
+                        static_obs.append((np.array([gx_r, 15.5], dtype=np.float32), 0.22, 12.7))
+
+            # Concrete highway tunnel portal ceiling & warm sodium ceiling luminaires (`highway_tunnel`)
+            if is_tunnel_train:
+                env_prims_base.append(
+                    _Prim3D(
+                        center=(0.0, 20.0, 5.45),
+                        rot_w2l=I3,
+                        half_ext=(6.8, 16.5, 0.35),
+                        shape=_SHAPE_OBB,
+                        veh_idx=0,
+                        role=_ROLE_ENV_SOLID,
+                        albedo_rgb=(0.09, 0.09, 0.10),
+                        roughness=0.78,
+                    )
+                )
+                for ty_tun in (9.0, 16.0, 23.0, 30.0):
+                    for tx_tun in (-2.6, 2.6):
+                        env_prims_base.append(
+                            _Prim3D(
+                                center=(tx_tun, ty_tun, 5.04),
+                                rot_w2l=I3,
+                                half_ext=(0.22, 0.55, 0.06),
+                                shape=_SHAPE_OBB,
+                                veh_idx=0,
+                                role=_ROLE_HEADLIGHT,
+                                albedo_rgb=(0.98, 0.64, 0.20),
+                                roughness=0.12,
+                            )
+                        )
+
         fence_cfg: dict[str, float] | None = None
         if has_fence:
             fence_cfg = {
-                "depth_m": rng.uniform(2.2, 4.2),
+                "depth_m": rng.uniform(2.2, 4.2) if ego_fwd_mps == 0.0 else rng.uniform(5.2, 6.8),
                 "pitch_px": rng.uniform(11.0, 24.0),
                 "wire_half_px": rng.uniform(0.42, 0.95),
                 "top_v_px": rng.uniform(-10.0, float(h) * 0.28),
@@ -7235,6 +8580,10 @@ class Scene3DGPUEngine:
 
         sun_az = rng.uniform(0.0, 6.28)
         sun_el = rng.uniform(0.18, 1.15)
+        if is_train and is_backlit_train:
+            # Strong low-elevation forward sun directly behind traffic (`backlit` glare + deep front/rear shadow!)
+            sun_az = 0.5 * math.pi + rng.uniform(-0.36, 0.36)
+            sun_el = rng.uniform(0.12, 0.28)
         sun_dir = torch.tensor(
             [math.cos(sun_el) * math.cos(sun_az), math.cos(sun_el) * math.sin(sun_az), math.sin(sun_el)],
             device=dev,
@@ -7254,6 +8603,14 @@ class Scene3DGPUEngine:
             sky_zen = torch.tensor([0.008, 0.011, 0.022], device=dev, dtype=torch.float32)
             sky_hor = torch.tensor([0.025, 0.030, 0.045], device=dev, dtype=torch.float32)
             exp_s = rng.uniform(1.0 / 60.0, 1.0 / 15.0)
+        elif is_train and is_tunnel_train:
+            sky_zen = torch.tensor([0.04, 0.035, 0.025], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([0.16, 0.12, 0.06], device=dev, dtype=torch.float32)
+            exp_s = rng.uniform(1.0 / 120.0, 1.0 / 25.0)
+        elif is_train and is_backlit_train:
+            sky_zen = torch.tensor([0.52, 0.56, 0.64], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([1.08, 0.96, 0.80], device=dev, dtype=torch.float32)
+            exp_s = rng.uniform(1.0 / 600.0, 1.0 / 45.0)
         else:
             sky_roll = rng.random()
             if sky_roll < 0.28:
@@ -7282,10 +8639,42 @@ class Scene3DGPUEngine:
         clip_span_s = max(0.35, timestamps[-1] + 0.6 * exp_s)
 
         # Sample collision-free vehicles (clear of camera, static pillars/signs, and each other across `clip_span_s`)
-        # Gen-5 (`v0.5.0`) crowded multi-vehicle traffic & gate queues: `2..6` simultaneous vehicles in `>= 55%` of positive clips
-        # across staggered lanes & depths `5m..36m`, with exact per-vehicle visibility/bbox/plate-association GT!
         if cam_z < 3.8:
-            static_obs.append((cam_o[:2].copy(), 0.55, 0.55))
+            if is_train and ego_fwd_mps > 0.0:
+                ego_span_y = float(ego_fwd_mps) * (1.20 * math.tanh(clip_span_s / 1.20))
+                static_obs.append(
+                    (
+                        np.array([float(cam_o[0]), float(cam_o[1]) + 0.5 * ego_span_y], dtype=np.float32),
+                        0.60,
+                        0.5 * ego_span_y + 0.75,
+                    )
+                )
+            elif is_train and cam_mode == "smartphone_closeup":
+                static_obs.append((cam_o[:2].copy(), 0.36, 0.36))
+            else:
+                static_obs.append((cam_o[:2].copy(), 0.55, 0.55))
+
+        def _static_obs_clear(vs_chk: _VehiclePassSpec, t_lo_c: float, t_hi_c: float, pw_c: float = 0.18, pl_c: float = 0.22) -> bool:
+            if not static_obs:
+                return True
+            v_c_obs = max(0.5, self._max_planar_point_speed_mps(vs_chk, t_lo_c, t_hi_c))
+            dt_obs = (2.0 * 0.10) / v_c_obs
+            n_obs = max(16, int(math.ceil((t_hi_c - t_lo_c) / max(1e-4, dt_obs))))
+            for si_chk in range(n_obs + 1):
+                t_chk = t_lo_c + (t_hi_c - t_lo_c) * (si_chk / float(n_obs))
+                c_obbs = self._vehicle_planar_obbs_at(vs_chk, t_chk, pad_w=pw_c, pad_l=pl_c)
+                for cc, cyaw, chw, chl in c_obbs:
+                    rc_o = math.hypot(chw, chl)
+                    for obs_xy, obs_hw, obs_hl in static_obs:
+                        r_so = rc_o + math.hypot(obs_hw, obs_hl)
+                        dx_o = float(obs_xy[0]) - float(cc[0])
+                        dy_o = float(obs_xy[1]) - float(cc[1])
+                        if (dx_o * dx_o + dy_o * dy_o) > (r_so * r_so):
+                            continue
+                        if self._obb2d_overlap(cc, cyaw, chw, chl, obs_xy, 0.0, obs_hw, obs_hl):
+                            return False
+            return True
+
         veh_specs: list[_VehiclePassSpec] = []
         if not is_neg:
             _ = rng.choices([1, 2, 3], weights=[0.58, 0.32, 0.10], k=1)[0]
@@ -7293,68 +8682,270 @@ class Scene3DGPUEngine:
             rng.shuffle(lanes_leg)
             rng_veh = random.Random(rng.getrandbits(64) ^ rng_v5.getrandbits(64))
 
-            n_veh = rng_v5.choices([1, 2, 3, 4, 5, 6], weights=[0.22, 0.24, 0.20, 0.15, 0.11, 0.08], k=1)[0]
-            y_base0 = max(5.0, float(y_spawn[0]))
-            y_base1 = max(y_base0 + 2.8, min(14.5, float(y_spawn[1])))
-            slot_grid: list[tuple[float, float, float]] = [
-                (0.0, y_base0, y_base1),
-                (-3.35, max(5.2, y_base0 + 1.2), min(17.5, y_base1 + 3.2)),
-                (3.35, max(5.2, y_base0 + 1.8), min(18.0, y_base1 + 3.8)),
-                (-1.75, max(15.5, y_base0 + 10.5), min(25.5, y_base1 + 12.5)),
-                (1.75, max(16.5, y_base0 + 11.5), min(26.5, y_base1 + 13.5)),
-                (0.0, max(25.5, y_base0 + 19.5), 34.5),
-                (-3.35, max(24.0, y_base0 + 18.0), 35.5),
-                (3.35, max(24.5, y_base0 + 18.5), 36.0),
-            ]
-            lead_slot = slot_grid[0]
-            tail_slots = slot_grid[1:]
-            rng_veh.shuffle(tail_slots)
-            ordered_slots = [lead_slot] + tail_slots if rng_veh.random() < 0.65 else (tail_slots[:2] + [lead_slot] + tail_slots[2:])
+            if is_train and sobol_u is not None:
+                if cam_mode == "red_light_intersection" or (is_hard_tail and hard_tail_sub == 0):
+                    n_veh = rng_v5.choices([3, 4, 5, 6], weights=[0.30, 0.32, 0.22, 0.16], k=1)[0]
+                elif cam_mode == "smartphone_closeup":
+                    n_veh = rng_v5.choices([1, 2, 3], weights=[0.48, 0.36, 0.16], k=1)[0]
+                else:
+                    n_veh = rng_v5.choices([1, 2, 3, 4, 5, 6], weights=[0.18, 0.26, 0.22, 0.16, 0.10, 0.08], k=1)[0]
 
-            for vi in range(n_veh):
-                for attempt in range(28):
-                    sl_idx = (vi + attempt) % len(ordered_slots)
-                    lane_base, yr_lo, yr_hi = ordered_slots[sl_idx]
-                    tier_push = (attempt // len(ordered_slots)) * 3.2
-                    lx_cand = lane_base + rng_veh.uniform(-0.24, 0.24)
-                    yr_cand = (min(33.5, yr_lo + tier_push), min(36.0, max(yr_lo + tier_push + 2.2, yr_hi + tier_push)))
-                    cand_vs = self._sample_vehicle_spec(
-                        rng_veh,
-                        track_id=vi + 1,
-                        lane_x=lx_cand,
-                        y_range=yr_cand,
-                        stationary=(stationary_all or (vi > 0 and rng_veh.random() < 0.28)),
-                        veh_struct_prod=combo[1], marking_prod=combo[3], radial_dn_n=radial_order,
+                y_min_floor = 3.4 if cam_mode == "smartphone_closeup" else (7.6 if ego_fwd_mps > 0.0 else 5.0)
+                y_base0 = max(y_min_floor, float(y_spawn[0]))
+                y_base1 = max(y_base0 + 2.2, min(16.5, float(y_spawn[1])))
+                if cam_mode == "red_light_intersection":
+                    # Tight staggered intersection queue & cross-traffic slots -> 35–70% multi-car occlusion!
+                    slot_grid = [
+                        (0.0, y_base0, y_base0 + 3.2),
+                        (-1.55, y_base0 + 2.2, y_base0 + 6.2),
+                        (1.55, y_base0 + 2.4, y_base0 + 6.4),
+                        (0.0, y_base0 + 6.5, y_base0 + 11.5),
+                        (-2.85, y_base0 + 4.8, y_base0 + 10.2),
+                        (2.85, y_base0 + 5.2, y_base0 + 10.8),
+                        (-1.65, y_base0 + 11.5, min(34.0, y_base0 + 18.0)),
+                        (1.65, y_base0 + 12.0, min(35.0, y_base0 + 18.5)),
+                    ]
+                else:
+                    slot_grid = [
+                        (0.0, y_base0, y_base1),
+                        (-3.15, max(y_min_floor + 0.4, y_base0 + 1.0), min(18.5, y_base1 + 3.2)),
+                        (3.15, max(y_min_floor + 0.4, y_base0 + 1.4), min(19.0, y_base1 + 3.8)),
+                        (-1.70, max(13.5, y_base0 + 8.5), min(25.5, y_base1 + 11.5)),
+                        (1.70, max(14.5, y_base0 + 9.5), min(26.5, y_base1 + 12.5)),
+                        (0.0, max(23.5, y_base0 + 17.5), 34.5),
+                        (-3.20, max(22.5, y_base0 + 16.5), 35.5),
+                        (3.20, max(23.0, y_base0 + 17.0), 36.0),
+                    ]
+                lead_slot = slot_grid[0]
+                tail_slots = slot_grid[1:]
+                rng_veh.shuffle(tail_slots)
+                ordered_slots = [lead_slot] + tail_slots if rng_veh.random() < 0.68 else (tail_slots[:2] + [lead_slot] + tail_slots[2:])
+
+                t_chk_lo = -0.6 * exp_s
+                do_fleet_clones = (n_veh >= 2) and (float(sobol_u[11]) < 0.30)
+                do_edge_trunc = float(sobol_u[10]) < 0.25
+                used_plate_ids: set[int] = set()
+                fleet_paint_choice = rng_veh.choice(
+                    (
+                        (0.90, 0.91, 0.93),  # Fleet white
+                        (0.72, 0.74, 0.77),  # Fleet metallic silver
+                        (0.04, 0.04, 0.05),  # Fleet jet black
                     )
-                    t_chk_lo = -0.6 * exp_s
-                    if not self._trajectories_clear(cand_vs, veh_specs, duration_s=clip_span_s, t_start_s=t_chk_lo):
-                        continue
-                    obs_ok = True
-                    if static_obs:
-                        v_c_obs = max(0.5, self._max_planar_point_speed_mps(cand_vs, t_chk_lo, clip_span_s))
-                        dt_obs = (2.0 * 0.10) / v_c_obs
-                        n_obs = max(16, int(math.ceil((clip_span_s - t_chk_lo) / max(1e-4, dt_obs))))
-                        for si_chk in range(n_obs + 1):
-                            t_chk = t_chk_lo + (clip_span_s - t_chk_lo) * (si_chk / float(n_obs))
-                            c_obbs = self._vehicle_planar_obbs_at(cand_vs, t_chk, pad_w=0.18, pad_l=0.22)
-                            for cc, cyaw, chw, chl in c_obbs:
-                                rc_o = math.hypot(chw, chl)
-                                for obs_xy, obs_hw, obs_hl in static_obs:
-                                    r_so = rc_o + math.hypot(obs_hw, obs_hl)
-                                    dx_o = float(obs_xy[0]) - float(cc[0])
-                                    dy_o = float(obs_xy[1]) - float(cc[1])
-                                    if (dx_o * dx_o + dy_o * dy_o) > (r_so * r_so):
-                                        continue
-                                    if self._obb2d_overlap(cc, cyaw, chw, chl, obs_xy, 0.0, obs_hw, obs_hl):
-                                        obs_ok = False
-                                        break
-                                if not obs_ok:
-                                    break
-                            if not obs_ok:
+                )
+                force_dark_clip = bool(is_hard_tail and hard_tail_sub == 0)
+                force_comm_recess_clip = bool(is_hard_tail and hard_tail_sub == 1)
+
+                # Optional 25% frame-edge truncated foreground/side-lane vehicle (`25–70%` body truncated by border!)
+                next_tid = 1
+                if do_edge_trunc:
+                    for tr_att in range(14):
+                        use_bot_edge = (ego_fwd_mps == 0.0) and (tr_att < 4) and (rng_veh.random() < 0.32)
+                        if use_bot_edge:
+                            y_tr = max(2.6, min(5.4, y_min_floor + rng_veh.uniform(-0.8, 0.9)))
+                            lx_tr = float(cam_o[0]) + rng_veh.uniform(-1.1, 1.1)
+                            yaw_tr = rng_veh.choice([0.0, math.pi]) + math.radians(rng_veh.uniform(-14.0, 14.0))
+                        else:
+                            y_tr = max(y_min_floor, min(9.2, float(cam_o[1]) + rng_veh.uniform(3.8, 7.8)))
+                            zc_est = max(2.2, float((np.array([cam_o[0], y_tr, 0.8], dtype=np.float32) - cam_o) @ R_cam[:, 2]))
+                            half_span_x = zc_est * (0.5 * float(w)) / max(45.0, float(fx))
+                            side_lr = rng_veh.choice([-1.0, 1.0])
+                            lx_tr = float(cam_o[0]) + side_lr * max(1.5, min(4.2, half_span_x + rng_veh.uniform(-0.22, 0.24)))
+                            yaw_tr = rng_veh.choice([0.0, math.pi]) + math.radians(rng_veh.uniform(-12.0, 12.0))
+                        stat_tr = stationary_all or cam_mode == "red_light_intersection" or (rng_veh.random() < 0.45)
+                        cand_tr = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=next_tid,
+                            lane_x=lx_tr,
+                            y_range=(y_tr, y_tr + 0.35),
+                            stationary=stat_tr,
+                            veh_struct_prod=combo[1],
+                            marking_prod=combo[3],
+                            radial_dn_n=radial_order,
+                            sobol_vec=sobol_u,
+                            forced_yaw_rad=yaw_tr,
+                            forced_speed_mps=0.0 if stat_tr else rng_veh.uniform(1.2, 4.5),
+                            force_dark_car=force_dark_clip,
+                            force_comm_plate=force_comm_recess_clip,
+                            force_recessed_ao=force_comm_recess_clip,
+                            exclude_plate_indices=used_plate_ids,
+                        )
+                        if (
+                            self._trajectories_clear(cand_tr, veh_specs, duration_s=clip_span_s, t_start_s=t_chk_lo, pad_w=0.08, pad_l=0.12)
+                            and _static_obs_clear(cand_tr, t_chk_lo, clip_span_s, pw_c=0.10, pl_c=0.14)
+                        ):
+                            veh_specs.append(cand_tr)
+                            used_plate_ids.add(cand_tr.front_plate_idx)
+                            used_plate_ids.add(cand_tr.rear_plate_idx)
+                            next_tid += 1
+                            break
+
+                fleet_anchor: _VehiclePassSpec | None = None
+                n_clones_target = rng_veh.choice([1, 2]) if do_fleet_clones else 0
+                clones_spawned = 0
+
+                while len(veh_specs) < n_veh and next_tid <= n_veh + 4:
+                    vi_cur = len(veh_specs)
+                    spawned_one = False
+
+                    # 30% Multi-Vehicle Same-CAD + Fleet-Paint Proximate Clones (`dx=1.8..2.8m` or `dy=1.6..3.2m`)
+                    if fleet_anchor is not None and clones_spawned < n_clones_target:
+                        for cl_att in range(18):
+                            if cl_att % 2 == 0:
+                                dx_min = max(1.80, float(fleet_anchor.width_m) + 0.28)
+                                dx_max = max(dx_min + 0.15, 2.85)
+                                s_dir = -1.0 if (float(fleet_anchor.p0[0]) > 0.4 or (cl_att % 4 == 0 and float(fleet_anchor.p0[0]) > -1.2)) else 1.0
+                                lx_cl = float(fleet_anchor.p0[0]) + s_dir * rng_veh.uniform(dx_min, dx_max)
+                                y_cl = float(np.clip(float(fleet_anchor.p0[1]) + rng_veh.uniform(-2.4, 2.8), y_min_floor, 34.5))
+                            else:
+                                lx_cl = float(fleet_anchor.p0[0]) + rng_veh.uniform(-0.35, 0.35)
+                                gap_dy = rng_veh.uniform(1.6, 3.2)
+                                dir_y = 1.0 if float(fleet_anchor.p0[1]) < 22.0 else -1.0
+                                y_cl = float(np.clip(float(fleet_anchor.p0[1]) + dir_y * (float(fleet_anchor.length_m) + gap_dy), y_min_floor, 35.0))
+                            cand_cl = self._sample_vehicle_spec(
+                                rng_veh,
+                                track_id=next_tid,
+                                lane_x=lx_cl,
+                                y_range=(y_cl, y_cl + 0.05),
+                                stationary=(fleet_anchor.motion_mode == "stationary"),
+                                veh_struct_prod=fleet_anchor.veh_struct_prod,
+                                marking_prod=fleet_anchor.marking_prod,
+                                radial_dn_n=fleet_anchor.radial_dn_n,
+                                sobol_vec=sobol_u,
+                                forced_arch=fleet_anchor.archetype,
+                                forced_dims=(fleet_anchor.length_m, fleet_anchor.width_m, fleet_anchor.cab_h_m, fleet_anchor.body_h_m),
+                                forced_paint_lin=fleet_anchor.paint_lin,
+                                forced_secondary_lin=fleet_anchor.secondary_lin,
+                                forced_yaw_rad=float(fleet_anchor.yaw0_rad) + rng_veh.uniform(-0.04, 0.04),
+                                forced_speed_mps=float(fleet_anchor.speed0_mps),
+                                force_comm_plate=force_comm_recess_clip,
+                                force_recessed_ao=force_comm_recess_clip,
+                                exclude_plate_indices=used_plate_ids,
+                            )
+                            if (
+                                self._trajectories_clear(cand_cl, veh_specs, duration_s=clip_span_s, t_start_s=t_chk_lo, pad_w=0.05, pad_l=0.08)
+                                and _static_obs_clear(cand_cl, t_chk_lo, clip_span_s, pw_c=0.10, pl_c=0.14)
+                            ):
+                                veh_specs.append(cand_cl)
+                                used_plate_ids.add(cand_cl.front_plate_idx)
+                                used_plate_ids.add(cand_cl.rear_plate_idx)
+                                clones_spawned += 1
+                                next_tid += 1
+                                spawned_one = True
                                 break
-                    if obs_ok:
-                        veh_specs.append(cand_vs)
-                        break
+                        if spawned_one:
+                            continue
+                        clones_spawned = n_clones_target  # fallback to general slot if tight clone blocked
+
+                    for attempt in range(28):
+                        sl_idx = (vi_cur + attempt) % len(ordered_slots)
+                        lane_base, yr_lo, yr_hi = ordered_slots[sl_idx]
+                        tier_push = (attempt // len(ordered_slots)) * 3.0
+                        lx_cand = lane_base + rng_veh.uniform(-0.28, 0.28)
+                        yr_cand = (min(33.5, yr_lo + tier_push), min(36.0, max(yr_lo + tier_push + 2.0, yr_hi + tier_push)))
+
+                        # Stopped queue / turning / cross-traffic kinematics on `red_light_intersection`
+                        forced_yaw_v: float | None = None
+                        forced_spd_v: float | None = None
+                        if cam_mode == "red_light_intersection":
+                            stat_v = stationary_all or (vi_cur == 0) or (rng_veh.random() < 0.58)
+                            r_int = rng_veh.random()
+                            if r_int < 0.24 and yr_cand[0] >= 7.5 and abs(lx_cand) <= 2.2:
+                                # Cross-traffic (`+-90°`)
+                                forced_yaw_v = rng_veh.choice([-0.5 * math.pi, 0.5 * math.pi]) + math.radians(rng_veh.uniform(-16.0, 16.0))
+                                forced_spd_v = 0.0 if stat_v else rng_veh.uniform(1.5, 3.4)
+                            elif r_int < 0.54:
+                                # 3/4 intersection turning (`+-32°..+-64°` or `+-116°..+-148°`)
+                                base_dir = 0.0 if rng_veh.random() < 0.5 else math.pi
+                                turn_sgn = rng_veh.choice([-1.0, 1.0])
+                                forced_yaw_v = base_dir + turn_sgn * math.radians(rng_veh.uniform(30.0, 62.0))
+                                forced_spd_v = 0.0 if stat_v else rng_veh.uniform(1.2, 4.2)
+                        else:
+                            stat_v = stationary_all or (float(sobol_u[9]) < 0.26) or (vi_cur > 0 and rng_veh.random() < 0.25)
+                            if cam_mode == "highway_tunnel" and not stat_v:
+                                forced_spd_v = rng_veh.uniform(7.5, 18.5)
+
+                        want_fleet_lead = do_fleet_clones and (fleet_anchor is None)
+                        forced_arch_lead = (
+                            rng_veh.choice(("hiace_van", "sedan", "minivan_1box_jp", "box_wing_truck", "kei_tall_wagon", "hatchback_compact"))
+                            if want_fleet_lead
+                            else None
+                        )
+                        cand_vs = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=next_tid,
+                            lane_x=lx_cand,
+                            y_range=yr_cand,
+                            stationary=stat_v,
+                            veh_struct_prod=combo[1],
+                            marking_prod=combo[3],
+                            radial_dn_n=radial_order,
+                            sobol_vec=sobol_u,
+                            forced_arch=forced_arch_lead,
+                            forced_paint_lin=fleet_paint_choice if want_fleet_lead else None,
+                            forced_yaw_rad=forced_yaw_v,
+                            forced_speed_mps=forced_spd_v,
+                            force_dark_car=(force_dark_clip and not want_fleet_lead),
+                            force_comm_plate=force_comm_recess_clip,
+                            force_recessed_ao=force_comm_recess_clip,
+                            exclude_plate_indices=used_plate_ids,
+                        )
+                        pad_w_use = 0.10 if cam_mode == "red_light_intersection" else 0.22
+                        pad_l_use = 0.16 if cam_mode == "red_light_intersection" else 0.30
+                        if not self._trajectories_clear(
+                            cand_vs, veh_specs, duration_s=clip_span_s, t_start_s=t_chk_lo, pad_w=pad_w_use, pad_l=pad_l_use
+                        ):
+                            continue
+                        if _static_obs_clear(cand_vs, t_chk_lo, clip_span_s, pw_c=0.14, pl_c=0.18):
+                            veh_specs.append(cand_vs)
+                            used_plate_ids.add(cand_vs.front_plate_idx)
+                            used_plate_ids.add(cand_vs.rear_plate_idx)
+                            if want_fleet_lead and cand_vs.archetype not in _ARTICULATED_ARCHETYPES:
+                                fleet_anchor = cand_vs
+                            next_tid += 1
+                            spawned_one = True
+                            break
+                    if not spawned_one:
+                        next_tid += 1
+            else:
+                n_veh = rng_v5.choices([1, 2, 3, 4, 5, 6], weights=[0.22, 0.24, 0.20, 0.15, 0.11, 0.08], k=1)[0]
+                y_base0 = max(5.0, float(y_spawn[0]))
+                y_base1 = max(y_base0 + 2.8, min(14.5, float(y_spawn[1])))
+                slot_grid = [
+                    (0.0, y_base0, y_base1),
+                    (-3.35, max(5.2, y_base0 + 1.2), min(17.5, y_base1 + 3.2)),
+                    (3.35, max(5.2, y_base0 + 1.8), min(18.0, y_base1 + 3.8)),
+                    (-1.75, max(15.5, y_base0 + 10.5), min(25.5, y_base1 + 12.5)),
+                    (1.75, max(16.5, y_base0 + 11.5), min(26.5, y_base1 + 13.5)),
+                    (0.0, max(25.5, y_base0 + 19.5), 34.5),
+                    (-3.35, max(24.0, y_base0 + 18.0), 35.5),
+                    (3.35, max(24.5, y_base0 + 18.5), 36.0),
+                ]
+                lead_slot = slot_grid[0]
+                tail_slots = slot_grid[1:]
+                rng_veh.shuffle(tail_slots)
+                ordered_slots = [lead_slot] + tail_slots if rng_veh.random() < 0.65 else (tail_slots[:2] + [lead_slot] + tail_slots[2:])
+
+                for vi in range(n_veh):
+                    for attempt in range(28):
+                        sl_idx = (vi + attempt) % len(ordered_slots)
+                        lane_base, yr_lo, yr_hi = ordered_slots[sl_idx]
+                        tier_push = (attempt // len(ordered_slots)) * 3.2
+                        lx_cand = lane_base + rng_veh.uniform(-0.24, 0.24)
+                        yr_cand = (min(33.5, yr_lo + tier_push), min(36.0, max(yr_lo + tier_push + 2.2, yr_hi + tier_push)))
+                        cand_vs = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=vi + 1,
+                            lane_x=lx_cand,
+                            y_range=yr_cand,
+                            stationary=(stationary_all or (vi > 0 and rng_veh.random() < 0.28)),
+                            veh_struct_prod=combo[1], marking_prod=combo[3], radial_dn_n=radial_order,
+                        )
+                        t_chk_lo = -0.6 * exp_s
+                        if not self._trajectories_clear(cand_vs, veh_specs, duration_s=clip_span_s, t_start_s=t_chk_lo):
+                            continue
+                        if _static_obs_clear(cand_vs, t_chk_lo, clip_span_s, pw_c=0.18, pl_c=0.22):
+                            veh_specs.append(cand_vs)
+                            break
 
         # Exposure-proportional signal scale & causal 1-frame-delayed Auto-Exposure (AE) initialization
         ref_exp_s = (1.0 / 35.0) if is_night else (1.0 / 150.0)
@@ -7469,7 +9060,8 @@ class Scene3DGPUEngine:
                 for sd in sign_defs:
                     sq_i, sp_i = self._eval_sign_at(sd, t_inst)
                     quads_inst.append(sq_i)
-                    prims_inst.append(sp_i)
+                    if sp_i is not None:
+                        prims_inst.append(sp_i)
 
                 cam_s, rot_s, fx_s, fy_s = camera_path.eval_at(t_inst)
                 hdr_s, v_b, role_b, q_b, trans_b = self._render_substep_hdr(
@@ -7687,7 +9279,8 @@ class Scene3DGPUEngine:
                     [
                         vs.paint_lin[0], vs.paint_lin[1], vs.paint_lin[2],
                         vs.secondary_lin[0], vs.secondary_lin[1], vs.secondary_lin[2],
-                        vs.length_m / 14.0, float(vs.subtype) / 8.0,
+                        vs.length_m / 14.0,
+                        min(1.0, float(vs.subtype) / 8.0) if is_train else (float(vs.subtype) / 8.0),
                     ],
                     dtype=np.float32,
                 )
@@ -7722,7 +9315,10 @@ class Scene3DGPUEngine:
                     else:
                         ord_k = veh_hn_ordinal.get(qd.veh_idx, 0)
                         veh_hn_ordinal[qd.veh_idx] = ord_k + 1
-                        p_tid = vs_p.track_id * 10 + 2 + min(7, ord_k)
+                        if is_train and ord_k >= 8:
+                            p_tid = 2000 + vs_p.track_id * 32 + ord_k
+                        else:
+                            p_tid = vs_p.track_id * 10 + 2 + min(7, ord_k)
                 else:
                     v_tid = 0
                     si_idx = max(0, q_idx - num_veh_quads)

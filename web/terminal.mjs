@@ -70,13 +70,14 @@ export function terminalDecision(readout, memory, frames, support, table, policy
   if (!precision.every(x=>x>0)) jointP=0;
   const fields=Object.keys(probabilities).filter(f=>(cfg.field_wrong_costs?.[f]??cfg.C_wrong)*(1-probabilities[f])<(cfg.field_abstain_costs?.[f]??cfg.C_abstain));
   const full=cfg.C_wrong_full*(1-jointP)<cfg.C_abstain_full;
-  const accepted=fields.includes('serial')||full;
+  const upperOk=Math.max(probabilities.region,probabilities.classification,probabilities.hiragana)>=0.05;
+  const accepted=full||(fields.includes('serial')&&upperOk);
   const serial=String(iz+1).padStart(4,'0');
   const shownSerial=iz+1>=1000?`${serial.slice(0,2)}-${serial.slice(2)}`:'・'.repeat(4-String(iz+1).length)+String(iz+1);
   const values={region:table.region_names[ir],classification:table.class_strings[ic],hiragana:table.kana_chars[ik],serial:shownSerial};
   const masks={region:'??',classification:'???',hiragana:'?',serial:'??-??'};
   return {
-    status:accepted?'ACCEPTED':mixed>1-mixed-event?'TRACK_MIXED':'UNREADABLE',
+    status:accepted?'ACCEPTED':mixed>Math.max(1-mixed-event,0.35)?'TRACK_MIXED':'UNREADABLE',
     confidence_tier:accepted?(full?'FULL_4FIELD':'CORE_VERIFIED'):'NONE',
     verified_fields:accepted?fields:[],
     text:accepted?Object.keys(values).map(f=>full||fields.includes(f)?values[f]:masks[f]).join(' '):null,

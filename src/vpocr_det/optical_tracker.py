@@ -106,7 +106,7 @@ def extract_roi_gray(
     y0 = max(0, int(math.floor(cy - half_h - 4.0)))
     x1 = min(w, int(math.ceil(cx + half_w + 4.0)))
     y1 = min(h, int(math.ceil(cy + half_h + 4.0)))
-    if x1 - x0 < 8 or y1 - y0 < 6:
+    if x1 - x0 < 6 or y1 - y0 < 4:
         return None
     sub = frame_rgb[y0:y1, x0:x1]
     gray = (
@@ -138,7 +138,7 @@ def create_optical_ref(frame_rgb: np.ndarray, corners_xy: np.ndarray) -> Optical
     if not np.all(np.isfinite(c)):
         return None
     basis = quad_basis(c)
-    if basis.width < 16.0 or basis.height < 8.5:
+    if basis.width < 10.0 or basis.height < 4.8:
         return None
 
     roi = extract_roi_gray(frame_rgb, basis.mx, basis.my, 0.85 * basis.width, 0.85 * basis.height)
@@ -152,7 +152,7 @@ def create_optical_ref(frame_rgb: np.ndarray, corners_xy: np.ndarray) -> Optical
     patch = _sample_bilinear_grid(gray, ox, oy, px, py)  # (20, 40)
 
     std = float(np.std(patch))
-    if std < 5.5:
+    if std < 2.8:
         return None
     tpl_2d = ((patch - float(np.mean(patch))) / std).astype(np.float32)
 
@@ -197,7 +197,8 @@ def create_optical_ref(frame_rgb: np.ndarray, corners_xy: np.ndarray) -> Optical
 
     h_mat = (jac.T.astype(np.float64)) @ jac.astype(np.float64)
     # Reject pure horizontal stripes (bumper grilles/hoods lacking vertical character strokes)
-    if float(h_mat[0, 0]) < 14.0 or float(h_mat[0, 0]) < 0.11 * float(h_mat[1, 1]):
+    min_h0 = 5.5 if basis.width < 18.0 else 14.0
+    if float(h_mat[0, 0]) < min_h0 or float(h_mat[0, 0]) < 0.09 * float(h_mat[1, 1]):
         return None
     sharpness = float(h_mat[0, 0] + 0.5 * h_mat[1, 1])
 
@@ -272,15 +273,15 @@ def track_plate_optical(
         patch_c = _sample_bilinear_grid(gray, ox, oy, px, py).reshape(-1)
         d = patch_c - float(np.mean(patch_c))
         sq = float(np.dot(d, d))
-        if sq < 12.0 * float(_CW * _CH):
+        if sq < 6.25 * float(_CW * _CH):
             return -1.0
         return float(np.dot(d, ref.coarse) / math.sqrt(sq))
 
     if eff_rad_x > 1.5:
         rad_u = float(np.clip(eff_rad_x / max(8.0, basis.width * OPT_SPAN), 0.02, 1.6))
         rad_v = float(np.clip(eff_rad_y / max(6.0, basis.height * OPT_SPAN), 0.02, 1.3))
-        steps_u = min(6, max(2, int(round(eff_rad_x / max(3.5, 0.14 * basis.width)))))
-        steps_v = min(5, max(2, int(round(eff_rad_y / max(2.5, 0.18 * basis.height)))))
+        steps_u = min(10, max(2, int(round(eff_rad_x / max(1.1, 0.14 * basis.width)))))
+        steps_v = min(8, max(2, int(round(eff_rad_y / max(0.9, 0.18 * basis.height)))))
         step_u = rad_u / float(steps_u)
         step_v = rad_v / float(steps_v)
 
@@ -341,7 +342,7 @@ def track_plate_optical(
         samp = _sample_bilinear_grid(gray, ox, oy, px, py).reshape(-1)
         d = samp - float(np.mean(samp))
         std = math.sqrt(float(np.dot(d, d)) / n_fine)
-        if std < 4.5:
+        if std < 2.4:
             return False, -1.0, None
         norm_i = d / std
         err = (norm_i - ref.tpl).astype(np.float64)
@@ -375,7 +376,7 @@ def track_plate_optical(
     samp = _sample_bilinear_grid(gray, ox, oy, px, py).reshape(-1)
     d = samp - float(np.mean(samp))
     sq = float(np.dot(d, d))
-    final_zncc = float(np.dot(d, ref.tpl) / math.sqrt(sq * n_fine)) if sq > 16.0 * n_fine else -1.0
+    final_zncc = float(np.dot(d, ref.tpl) / math.sqrt(sq * n_fine)) if sq > 5.76 * n_fine else -1.0
 
     if final_zncc < float(min_zncc):
         return False, final_zncc, None

@@ -156,29 +156,28 @@ def synthesize_gpu_garbage_frames_v2(
         g4 = diag * col_a + (1.0 - diag) * col_b + 0.04 * torch.randn((n4, 3, h, w), device=device)
         parts.append(torch.clamp(g4, 0.0, 1.0))
 
-    # 5. Stenciled single-band industrial / dump-truck `表示番号` pseudo-text bars (non-MLIT layout)
+    # 5. Real Japanese text-bearing non-plate stencils (`319`, `スケルトン車`, `最大積載量`, `春日 2503`, `50`)
+    from vpocr_synth.plate.surface_25d import get_default_nonplate_stencil_atlas
+
     if n5 > 0:
-        bg_c = 0.25 + 0.45 * torch.rand((n5, 3, 1, 1), device=device)
-        g5 = bg_c.expand(n5, 3, h, w).clone()
-        fg_c = torch.where(bg_c.mean(dim=1, keepdim=True) > 0.48, torch.full_like(bg_c, 0.10), torch.full_like(bg_c, 0.92))
-        # Single central horizontal bar / stencil blocks (unlike 2-row MLIT plate)
-        y0 = int(h * 0.30)
-        y1 = int(h * 0.70)
-        for idx_b in range(6):
-            bx0 = int(w * (0.08 + 0.14 * idx_b))
-            bx1 = min(w, bx0 + max(3, int(w * 0.08)))
-            on_b = (torch.rand((n5, 1, 1, 1), device=device) > 0.25).float()
-            g5[:, :, y0:y1, bx0:bx1] = on_b * fg_c + (1.0 - on_b) * g5[:, :, y0:y1, bx0:bx1]
-        g5 = torch.clamp(g5 + 0.04 * torch.randn_like(g5), 0.0, 1.0)
+        stencil_atlas = get_default_nonplate_stencil_atlas()
+        g5 = stencil_atlas.sample_crops(n5, (h, w), device)
         parts.append(g5)
 
-    # 6. Kaneko 2D Coupled-Map-Lattice (CML) chaotic dappled urban foliage / shop-window mullion clutter
+    # 6. Kaneko 2D Coupled-Map-Lattice (CML) + extra text-bearing stencil mix
     if n6 > 0:
-        cml_low = coupled_map_lattice_2d(n6, max(8, h // 4), max(16, w // 4), steps=6, r=3.97, coupling=0.28, device=device)
-        cml = F.interpolate(cml_low, size=(h, w), mode="bilinear", align_corners=False)
-        tint = 0.75 + 0.45 * torch.rand((n6, 3, 1, 1), device=device)
-        g6 = torch.clamp(cml * tint + 0.04 * torch.randn((n6, 3, h, w), device=device), 0.0, 1.0)
-        parts.append(g6)
+        n6_st = n6 // 2
+        n6_cml = n6 - n6_st
+        if n6_st > 0:
+            parts.append(get_default_nonplate_stencil_atlas().sample_crops(n6_st, (h, w), device))
+        if n6_cml > 0:
+            cml_low = coupled_map_lattice_2d(
+                n6_cml, max(8, h // 4), max(16, w // 4), steps=6, r=3.97, coupling=0.28, device=device
+            )
+            cml = F.interpolate(cml_low, size=(h, w), mode="bilinear", align_corners=False)
+            tint = 0.75 + 0.45 * torch.rand((n6_cml, 3, 1, 1), device=device)
+            g6 = torch.clamp(cml * tint + 0.04 * torch.randn((n6_cml, 3, h, w), device=device), 0.0, 1.0)
+            parts.append(g6)
 
     # 7. Glowing red LED brake-light / amber reflector housing false-positive crops
     if n7 > 0:
@@ -254,7 +253,7 @@ class OCRLossV2(nn.Module):
         vocab_size: int = 254,
         pad_id: int = 0,
         weights: LossWeightsV2 | None = None,
-        label_smoothing: float = 0.02,
+        label_smoothing: float = 0.006,
         terminal_risk_config=None,
         vocab=None,
     ) -> None:
@@ -319,20 +318,26 @@ class OCRLossV2(nn.Module):
 
         primary_read = eff_read * is_primary_frame.unsqueeze(-1).float()
         seq_max_read = primary_read.max(dim=1).values  # (B, 12)
+        sr_seq_gain = 1.85 if seq_len >= 4 else (1.35 if seq_len >= 2 else 1.0)
+        seq_int_read = torch.maximum(
+            seq_max_read,
+            (sr_seq_gain * torch.linalg.vector_norm(primary_read, ord=2, dim=1)).clamp(0.0, 1.0),
+        )  # (B, 12)
         non_mixed_seq = target_status != 2  # (B,)
+        is_readable_seq = target_status == 0  # (B,)
 
         zero_anchor = seq_out.slot_logits.float().sum() * 0.0
 
         # ------------------------------------------------------------------
         # 1. Final Sequence Slot CE + Per-Frame Auxiliary Slot CE + Status CE
         # ------------------------------------------------------------------
-        # Shannon prior-entropy / spatial-channel-capacity slot weights + detached self-information focal CE:
-        # Boosts 45-way 32mm Hiragana (slot 7 -> 2.25x) and 138-way 40mm Region Kanji (slots 0..1 -> 3.05x)
-        # while preserving exact Bayes-optimal argmax & probabilistic calibration stationary points.
         slot_base_mult = shannon_slot_capacity_weights(dev)
         seq_slot_mult = slot_base_mult.unsqueeze(0).expand(bsz, 12)
 
-        seq_slot_readable = (seq_max_read >= 0.30) & non_mixed_seq.unsqueeze(1)
+        seq_slot_readable = (
+            ((seq_int_read >= 0.16) & is_readable_seq.unsqueeze(1))
+            | ((seq_int_read >= 0.30) & non_mixed_seq.unsqueeze(1))
+        )
         slot_ce = focal_self_information_ce(
             seq_out.slot_logits.float(),
             target_slots,
@@ -340,11 +345,27 @@ class OCRLossV2(nn.Module):
             floor_mix=0.72,
             label_smoothing=self.label_smoothing,
         )
-        slot_w = seq_max_read * seq_slot_readable.float() * seq_slot_mult
+        slot_w = seq_int_read.clamp_min(0.20) * seq_slot_readable.float() * seq_slot_mult
         if slot_w.sum() > 1e-6:
             loss_seq_slots = (slot_ce * slot_w).sum() / slot_w.sum()
         else:
             loss_seq_slots = zero_anchor
+
+        # Vault-Door Bypass `<PAD>` supervision (`weight = 0.30`): when `target_status == 1` (`UNREADABLE`)
+        # accumulates `mem_P > 0` (including the 50% training vault-door bypass!), explicitly train
+        # `memory_readout` `slot_logits -> pad_id` so leaked non-plate text (`319`, `スケルトン車`) abstains!
+        unread_leak_mask = (target_status == 1) & (
+            seq_out.memory.mem_P.float().mean(dim=(1, 2)) > 1e-4
+        )
+        if bool(unread_leak_mask.any()):
+            n_ul = int(unread_leak_mask.sum().item())
+            pad_tgt_ul = torch.full((n_ul * 12,), self.pad_id, dtype=torch.long, device=dev)
+            loss_vault_pad = F.cross_entropy(
+                seq_out.slot_logits[unread_leak_mask].float().reshape(-1, self.vocab_size),
+                pad_tgt_ul,
+            )
+        else:
+            loss_vault_pad = zero_anchor
 
         aux_logits = model.decode_slot_features(seq_out.frame_z.to(dtype=model.readout_slot_embed.dtype))
         valid_ft = valid_frame_bool.unsqueeze(-1) & (frame_slot_targets >= 0) & (eff_read >= 0.25)
@@ -371,13 +392,18 @@ class OCRLossV2(nn.Module):
         if has_pref_ro:
             pref_prim_read = primary_read[:, :k_pref]                     # (B, k_pref, 12)
             pref_max_read = pref_prim_read.max(dim=1).values              # (B, 12)
+            sr_pref_gain = 1.85 if k_pref >= 4 else (1.35 if k_pref >= 2 else 1.0)
+            pref_int_read = torch.maximum(
+                pref_max_read,
+                (sr_pref_gain * torch.linalg.vector_norm(pref_prim_read, ord=2, dim=1)).clamp(0.0, 1.0),
+            )
             has_prim_pref = is_primary_frame[:, :k_pref].any(dim=1)       # (B,)
             has_other_pref = (
                 valid_frame_bool[:, :k_pref] & (~same_as_primary[:, :k_pref])
             ).any(dim=1)                                                  # (B,)
             pref_is_mixed = (target_status == 2) & has_prim_pref & has_other_pref
             pref_core_readable = (
-                (pref_max_read[:, [7, 8, 9, 10, 11]].mean(dim=-1) >= 0.30)
+                (pref_int_read[:, [7, 8, 9, 10, 11]].mean(dim=-1) >= 0.24)
                 & (target_status != 1)
                 & (~pref_is_mixed)
             )
@@ -391,14 +417,14 @@ class OCRLossV2(nn.Module):
             loss_status_pref = F.cross_entropy(pref_ro.status_logits.float(), pref_target_status)
             loss_status = 0.65 * loss_status_final + 0.35 * loss_status_pref
 
-            pref_slot_readable = (pref_max_read >= 0.30) & (~pref_is_mixed).unsqueeze(1)
+            pref_slot_readable = (pref_int_read >= 0.24) & (target_status != 1).unsqueeze(1) & (~pref_is_mixed).unsqueeze(1)
             pref_slot_ce = F.cross_entropy(
                 pref_ro.slot_logits.float().reshape(-1, self.vocab_size),
                 target_slots.clamp(0, self.vocab_size - 1).reshape(-1),
                 reduction="none",
                 label_smoothing=self.label_smoothing,
             ).reshape(bsz, 12)
-            pref_slot_w = pref_max_read * pref_slot_readable.float() * seq_slot_mult
+            pref_slot_w = pref_int_read * pref_slot_readable.float() * seq_slot_mult
             if pref_slot_w.sum() > 1e-6:
                 loss_pref_slots = (pref_slot_ce * pref_slot_w).sum() / pref_slot_w.sum()
                 loss_seq_slots = 0.80 * loss_seq_slots + 0.20 * loss_pref_slots
@@ -423,7 +449,7 @@ class OCRLossV2(nn.Module):
             non_pad_f.sum() * 12.0
         ).clamp_min(1.0)
 
-        seq_read_target = (seq_max_read >= 0.30).float()
+        seq_read_target = ((seq_int_read >= 0.24) & (target_status != 1).unsqueeze(1)).float()
         if non_mixed_seq.any():
             sr_bce = _safe_bce_prob_v2(
                 seq_out.slot_readability_pred[non_mixed_seq], seq_read_target[non_mixed_seq]
@@ -438,7 +464,7 @@ class OCRLossV2(nn.Module):
 
         if has_pref_ro:
             pref_non_mixed = ~pref_is_mixed
-            pref_read_target = (pref_max_read >= 0.30).float()
+            pref_read_target = ((pref_int_read >= 0.24) & (target_status != 1).unsqueeze(1)).float()
             if pref_non_mixed.any():
                 psr_bce = _safe_bce_prob_v2(
                     pref_ro.slot_readability_pred[pref_non_mixed],
@@ -464,7 +490,7 @@ class OCRLossV2(nn.Module):
             color_losses.append(
                 F.cross_entropy(frame_col_logits[rgb_frame_mask], exp_pt[rgb_frame_mask])
             )
-        seq_has_rgb = non_mixed_seq & rgb_frame_mask.any(dim=1) & (seq_max_read.max(dim=1).values >= 0.25)
+        seq_has_rgb = non_mixed_seq & rgb_frame_mask.any(dim=1) & (seq_int_read.max(dim=1).values >= 0.20)
         if seq_has_rgb.any():
             color_losses.append(
                 F.cross_entropy(
@@ -527,38 +553,56 @@ class OCRLossV2(nn.Module):
             zc_clean = seq_out.frame_z_color.float().detach().mean(dim=1)
             has_clean_ref = False
 
-        prim_slot_w = primary_read * (primary_read >= 0.20).float()  # (B, T, 12)
-        if prim_slot_w.sum() > 1e-6:
-            z_pred = seq_out.frame_z.float()
-            z_ref_exp = z_clean.unsqueeze(1)  # (B, 1, 12, D)
+        # Supervise `loss_unc_cal` across 100% of valid primary frames (including blurry `primary_read < 0.20`
+        # low-res frames!) so sharp frames (`~20..24`) outweigh sub-Nyquist frames (`~0.3..0.5`) by >30:1
+        # while coherent multi-frame low-res observations constructively integrate to high posterior SNR!
+        unc_slot_w = is_primary_frame.unsqueeze(-1).float().expand(bsz, seq_len, 12)
+        mv_slot_w = primary_read * (primary_read >= 0.20).float()  # (B, T, 12)
+        z_pred = seq_out.frame_z.float()
+        z_ref_exp = z_clean.unsqueeze(1)  # (B, 1, 12, D)
 
-            # Anisotropic Gaussian NLL coupled with per-slot classification inaccuracy so receding/blurry
-            # frames with high character confusion automatically predict lower write precision `lambda_prec`.
+        if unc_slot_w.sum() > 1e-6:
             probs_aux_det = F.softmax(aux_logits.float().detach(), dim=-1)
             p_gt_det = probs_aux_det.gather(-1, safe_ft.unsqueeze(-1)).squeeze(-1)
-            cls_inacc = ((1.0 - p_gt_det).pow(2) * valid_ft.float()).unsqueeze(-1)
+            inacc_term = (
+                (1.0 - p_gt_det).pow(2) * is_primary_frame.unsqueeze(-1).float()
+                + 1.85 * (1.0 - primary_read).pow(2)
+            ).unsqueeze(-1)
             err2_det = (
-                torch.clamp((z_pred.detach() - z_ref_exp).pow(2), max=4.0)
-                + 1.35 * cls_inacc
-                + (1.0 / 6.0)
+                torch.clamp((z_pred.detach() - z_ref_exp).pow(2), max=6.0)
+                + 1.45 * inacc_term
+                + (1.0 / 24.0)
             )
-            lam_pos = torch.clamp(seq_out.frame_lambda_prec.float(), min=0.04, max=6.0)
-            nll_elem = 0.5 * (lam_pos * err2_det - torch.log(lam_pos) + math.log(6.0) - 1.0)
-            loss_unc_cal = (nll_elem.mean(dim=-1) * prim_slot_w).sum() / prim_slot_w.sum()
+            lam_pos = torch.clamp(seq_out.frame_lambda_prec.float(), min=0.02, max=24.0)
+            nll_elem = 0.5 * (lam_pos * err2_det - torch.log(lam_pos) + math.log(24.0) - 1.0)
+            loss_unc_cal = (nll_elem.mean(dim=-1) * unc_slot_w).sum() / unc_slot_w.sum()
 
-            # Multi-view latent consistency (L1/SmoothL1 + cosine alignment)
+            # Sharp-Frame Dominance Margin Loss: enforce sharp frames (`read >= 0.58`) to command >=18x
+            # higher write precision than sub-Nyquist blurry frames (`read <= 0.26`) on the same plate!
+            sharp_f = is_primary_frame.unsqueeze(-1) & (primary_read >= 0.58)
+            blur_f = is_primary_frame.unsqueeze(-1) & (primary_read <= 0.26)
+            both_sb = sharp_f.any(dim=1) & blur_f.any(dim=1)  # (B, 12)
+            if bool(both_sb.any()):
+                log_lam_m = torch.log(lam_pos.mean(dim=-1).clamp_min(1e-4))  # (B, T, 12)
+                log_hi = torch.where(sharp_f, log_lam_m, torch.full_like(log_lam_m, -20.0)).amax(dim=1)
+                log_lo = torch.where(blur_f, log_lam_m, torch.full_like(log_lam_m, -20.0)).amax(dim=1)
+                dom_margin = F.relu(math.log(18.0) - (log_hi[both_sb] - log_lo[both_sb])).mean()
+                loss_unc_cal = loss_unc_cal + 0.35 * dom_margin
+        else:
+            loss_unc_cal = zero_anchor
+
+        if mv_slot_w.sum() > 1e-6:
             l1_mv = F.smooth_l1_loss(z_pred, z_ref_exp.expand_as(z_pred), reduction="none", beta=0.15).mean(dim=-1)
             zn_p = z_pred / (torch.norm(z_pred, p=2, dim=-1, keepdim=True) + 1e-6)
             zn_r = z_ref_exp / (torch.norm(z_ref_exp, p=2, dim=-1, keepdim=True) + 1e-6)
             cos_mv = 1.0 - (zn_p * zn_r).sum(dim=-1)
-            loss_mv_cons = ((l1_mv + 0.5 * cos_mv) * prim_slot_w).sum() / prim_slot_w.sum()
+            loss_mv_cons = ((l1_mv + 0.5 * cos_mv) * mv_slot_w).sum() / mv_slot_w.sum()
 
             if has_clean_ref and rgb_frame_mask.any():
                 zc_pred = seq_out.frame_z_color.float()[rgb_frame_mask]
                 zc_ref = zc_clean.unsqueeze(1).expand(bsz, seq_len, -1)[rgb_frame_mask]
                 loss_mv_cons = loss_mv_cons + 0.25 * F.smooth_l1_loss(zc_pred, zc_ref, beta=0.15)
         else:
-            loss_unc_cal = zero_anchor
             loss_mv_cons = zero_anchor
 
         # ------------------------------------------------------------------
@@ -746,6 +790,7 @@ class OCRLossV2(nn.Module):
 
         total_loss = (
             self.weights.seq_slots * loss_seq_slots
+            + 0.30 * loss_vault_pad
             + self.weights.aux_frames * loss_aux_frames
             + self.weights.status * loss_status
             + self.weights.calibration * loss_calibration
@@ -767,6 +812,7 @@ class OCRLossV2(nn.Module):
             "loss_innovation_nll": float(loss_innovation.detach().item()),
             "loss_terminal_risk": float(loss_risk.detach().item()),
             "loss_seq_slots": float(loss_seq_slots.detach().item()),
+            "loss_vault_pad": float(loss_vault_pad.detach().item()),
             "loss_aux_frames": float(loss_aux_frames.detach().item()),
             "loss_status": float(loss_status.detach().item()),
             "loss_calibration": float(loss_calibration.detach().item()),

@@ -39,6 +39,11 @@ HIRAGANA_CONFUSABLE_GROUPS: list[tuple[str, ...]] = [
     ("た", "な"),
     ("す", "む"),
     ("す", "そ"),
+    ("て", "す", "そ", "と"),
+    ("う", "ら", "ち"),
+    ("き", "ぎ", "さ", "ち"),
+    ("は", "ば", "ほ", "け", "に"),
+    ("み", "む", "ぬ"),
 ]
 KANJI_CONFUSABLE_GROUPS: list[tuple[str, ...]] = [
     ("長崎", "岡山", "宮崎", "宮城"),
@@ -49,6 +54,10 @@ KANJI_CONFUSABLE_GROUPS: list[tuple[str, ...]] = [
     ("岐阜", "滋賀"),
     ("千葉", "所沢"),
     ("佐世保", "久留米", "佐賀"),
+    ("越谷", "仙台", "熊谷", "世田谷", "川越", "上越"),
+    ("大阪", "上越", "大分", "大宮", "和泉", "京都"),
+    ("岩手", "平泉", "盛岡", "青森"),
+    ("姫路", "釧路", "高知", "高崎", "高松"),
 ]
 CONFUSABLE_GROUPS: list[tuple[str, ...]] = DIGIT_LATIN_CONFUSABLE_GROUPS + HIRAGANA_CONFUSABLE_GROUPS
 
@@ -252,8 +261,8 @@ class StratifiedPlateSampler:
             "熊本",
         ]
         boost_extras = kanji_conf_unique + [r for r in special_extras if r in self._region_name_set]
-        # Keep total cycle <= 179 (prime <= 200) so any 200 consecutive samples cover 100% of regions
-        max_extras = max(0, 179 - len(base_perm))
+        # Keep total cycle <= 199 (prime <= 200) so any 200 consecutive samples cover 100% of regions
+        max_extras = max(0, 199 - len(base_perm))
         boost_extras = boost_extras[:max_extras]
 
         self._region_perm: list[str] = []
@@ -631,26 +640,28 @@ class StratifiedPlateSampler:
                         hiragana=rng.choice(valid),
                         serial=pt.serial,
                     )
-        if choice == "classification" and len(pt.classification) >= 2:
+        if choice == "classification" and len(pt.classification) >= 1:
             cls = pt.classification
-            # Mutate a non-leading digit to a confusable digit (0/8/6/9, 1/7/4, 2/3/5) without adding fake Latin
+            # Mutate any digit position (including pos == 0 leading digit!) to a confusable digit
             digit_positions = [
                 pos
-                for pos in range(1, len(cls))
+                for pos in range(0, len(cls))
                 if cls[pos].isdigit() and not (cls[0] == "0" and pos == 1 and len(cls) == 3)
             ]
             if digit_positions:
                 pos = rng.choice(digit_positions)
-                alts = _DIGIT_CONF_MAP.get(cls[pos], list("0345689172"))
-                new_cls = cls[:pos] + rng.choice(alts) + cls[pos + 1 :]
-                cand = PlateText(
-                    region=pt.region,
-                    classification=new_cls,
-                    hiragana=pt.hiragana,
-                    serial=pt.serial,
-                )
-                if not PlateValidator.validate(cand, plate_type, plate_type == PlateType.GRAPHIC):
-                    return cand
+                alts = list(_DIGIT_CONF_MAP.get(cls[pos], list("0345689172")))
+                rng.shuffle(alts)
+                for alt_d in alts:
+                    new_cls = cls[:pos] + alt_d + cls[pos + 1 :]
+                    cand = PlateText(
+                        region=pt.region,
+                        classification=new_cls,
+                        hiragana=pt.hiragana,
+                        serial=pt.serial,
+                    )
+                    if not PlateValidator.validate(cand, plate_type, plate_type == PlateType.GRAPHIC):
+                        return cand
         # serial focus: set a safe digit to a confusable digit (including 3/4/5/6/8/9/0/1/7)
         s = str(pt.serial)
         if len(s) == 1:

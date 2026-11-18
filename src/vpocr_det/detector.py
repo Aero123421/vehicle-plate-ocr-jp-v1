@@ -107,9 +107,13 @@ class ConvBNAct(nn.Module):
         k: int = 3,
         s: int = 1,
         g: int = 1,
+        d: int = 1,
     ) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=k // 2, groups=g, bias=False)
+        pad = (k // 2) * d
+        self.conv = nn.Conv2d(
+            in_ch, out_ch, kernel_size=k, stride=s, padding=pad, dilation=d, groups=g, bias=False
+        )
         self.bn = nn.BatchNorm2d(out_ch)
         self.act = nn.SiLU(inplace=True)
 
@@ -379,6 +383,31 @@ def compute_box_iou_ciou(
     return iou, ciou
 
 
+def compute_box_giou(
+    boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-7
+) -> torch.Tensor:
+    """Elementwise `GIoU` between aligned boxes `(..., 4)` `[x0, y0, x1, y1]`."""
+    b1_x0, b1_y0, b1_x1, b1_y1 = boxes1.float().unbind(-1)
+    b2_x0, b2_y0, b2_x1, b2_y1 = boxes2.float().unbind(-1)
+
+    inter_w = (torch.minimum(b1_x1, b2_x1) - torch.maximum(b1_x0, b2_x0)).clamp_min(0.0)
+    inter_h = (torch.minimum(b1_y1, b2_y1) - torch.maximum(b1_y0, b2_y0)).clamp_min(0.0)
+    inter = inter_w * inter_h
+
+    w1 = (b1_x1 - b1_x0).clamp_min(eps)
+    h1 = (b1_y1 - b1_y0).clamp_min(eps)
+    w2 = (b2_x1 - b2_x0).clamp_min(eps)
+    h2 = (b2_y1 - b2_y0).clamp_min(eps)
+
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    cw = (torch.maximum(b1_x1, b2_x1) - torch.minimum(b1_x0, b2_x0)).clamp_min(eps)
+    ch = (torch.maximum(b1_y1, b2_y1) - torch.minimum(b1_y0, b2_y0)).clamp_min(eps)
+    enclose = cw * ch + eps
+    return iou - (enclose - union) / enclose
+
+
 def compute_box_nwd(
     boxes1: torch.Tensor, boxes2: torch.Tensor, const_c: float = 11.0, eps: float = 1e-6
 ) -> torch.Tensor:
@@ -420,6 +449,17 @@ def pairwise_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e
     area1 = ((boxes1[:, 2] - boxes1[:, 0]).clamp_min(0.0)) * ((boxes1[:, 3] - boxes1[:, 1]).clamp_min(0.0))
     area2 = ((boxes2[:, 2] - boxes2[:, 0]).clamp_min(0.0)) * ((boxes2[:, 3] - boxes2[:, 1]).clamp_min(0.0))
     return inter / (area1[:, None] + area2[None, :] - inter + eps)
+
+
+def pairwise_box_iomin(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Pairwise `IoMin = |A n B| / min(|A|, |B|)` matrix `(M, N)` between `boxes1 (M, 4)` and `boxes2 (N, 4)`."""
+    lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+    rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    wh = (rb - lt).clamp_min(0.0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    area1 = ((boxes1[:, 2] - boxes1[:, 0]).clamp_min(0.0)) * ((boxes1[:, 3] - boxes1[:, 1]).clamp_min(0.0))
+    area2 = ((boxes2[:, 2] - boxes2[:, 0]).clamp_min(0.0)) * ((boxes2[:, 3] - boxes2[:, 1]).clamp_min(0.0))
+    return inter / torch.minimum(area1[:, None], area2[None, :]).clamp_min(eps)
 
 
 class TaskAlignedDetLoss(nn.Module):
@@ -1024,15 +1064,15 @@ class TemporalDetModelConfig:
             return cls(
                 preset="nano",
                 dfine_variant="nano",
-                c1=16,
-                c2=32,
-                c3=48,
-                c4=64,
+                c1=24,
+                c2=48,
+                c3=80,
+                c4=112,
                 neck_ch=36,
-                head_ch=36,
-                veh_roi_ch=36,
+                head_ch=56,
+                veh_roi_ch=56,
                 cutout_ch=32,
-                depth_mult=1,
+                depth_mult=2,
                 strides=(4, 8, 16),
                 num_classes=int(num_classes),
                 num_subtypes=int(num_subtypes),
@@ -1064,8 +1104,8 @@ class TemporalDetModelConfig:
     def from_dict(cls, d: dict[str, Any]) -> TemporalDetModelConfig:
         preset_s = str(d.get("preset", "base"))
         default_variant = "nano" if preset_s == "nano" else "small"
-        default_roi_ch = 36 if preset_s == "nano" else 64
-        default_cut_ch = 24 if preset_s == "nano" else 32
+        default_roi_ch = 56 if preset_s == "nano" else 64
+        default_cut_ch = 32
         return cls(
             arch=str(d.get("arch", "TemporalPlateDetNet")),
             preset=preset_s,
@@ -1181,12 +1221,11 @@ class LocalPhotometricDetStem(nn.Module):
 
 
 class DWConvGRUCell(nn.Module):
-    """Motion-compensated depthwise-separable ConvGRU pyramid memory cell.
+    """Motion-compensated depthwise-separable ConvGRU pyramid memory cell with `d=1` + `d=2` context.
 
     Aligns `h_prev` to `x_t` via bounded sub-cell flow warping (`F.grid_sample(..., padding_mode='zeros')`),
-    updates gated spatial state `h_new`, and injects residual memory `x_t + mem_proj(h_new)` so single-frame
-    (`K=1`, `h_prev = 0`) spatial acuity is 100% preserved while multi-frame (`K > 1`) S/N accumulates
-    cleanly across chain-link fence gaps and long-shutter motion blur.
+    captures larger inter-frame motion via parallel `k=3, d=1` + `k=3, d=2` depthwise spatial context,
+    updates gated spatial state `h_new`, and injects residual memory `x_t + mem_proj(h_new)`.
     """
 
     def __init__(self, ch: int, max_disp_cells: float = 2.5) -> None:
@@ -1194,25 +1233,24 @@ class DWConvGRUCell(nn.Module):
         self.ch = int(ch)
         self.max_disp_cells = float(max_disp_cells)
         mid = max(16, ch // 2)
-        self.flow_stem = nn.Sequential(
-            ConvBNAct(ch * 2, ch, k=1, s=1),
-            ConvBNAct(ch, mid, k=3, s=1, g=math.gcd(ch, mid)),
-        )
+        self.flow_pw = ConvBNAct(ch * 2, mid, k=1, s=1)
+        self.flow_dw1 = ConvBNAct(mid, mid, k=3, s=1, g=mid, d=1)
+        self.flow_dw2 = ConvBNAct(mid, mid, k=3, s=1, g=mid, d=2)
         self.flow_pred = nn.Conv2d(mid, 2, kernel_size=3, padding=1)
         nn.init.normal_(self.flow_pred.weight, std=1e-4)
         nn.init.zeros_(self.flow_pred.bias)
 
-        self.gate_dw = ConvBNAct(ch * 2, ch * 2, k=3, s=1, g=ch * 2)
+        self.gate_dw = ConvBNAct(ch * 2, ch * 2, k=3, s=1, g=ch * 2, d=1)
+        self.gate_dw_d2 = ConvBNAct(ch * 2, ch * 2, k=3, s=1, g=ch * 2, d=2)
         self.gate_pw = nn.Conv2d(ch * 2, ch * 2, kernel_size=1)
         nn.init.normal_(self.gate_pw.weight, std=0.01)
         nn.init.zeros_(self.gate_pw.bias)
         with torch.no_grad():
             self.gate_pw.bias[ch:].fill_(-0.45)  # initial update gate ~0.39
 
-        self.cand_net = nn.Sequential(
-            ConvBNAct(ch * 2, ch, k=1, s=1),
-            ConvBNAct(ch, ch, k=3, s=1, g=ch),
-        )
+        self.cand_pw = ConvBNAct(ch * 2, ch, k=1, s=1)
+        self.cand_dw1 = ConvBNAct(ch, ch, k=3, s=1, g=ch, d=1)
+        self.cand_dw2 = ConvBNAct(ch, ch, k=3, s=1, g=ch, d=2)
         self.mem_proj = nn.Sequential(
             nn.Conv2d(ch, ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(ch),
@@ -1228,7 +1266,8 @@ class DWConvGRUCell(nn.Module):
         elif not (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()) and h_prev.shape[-2:] != (hl, wl):
             h_prev = F.interpolate(h_prev, size=(hl, wl), mode="bilinear", align_corners=False)
 
-        delta_cells = torch.tanh(self.flow_pred(self.flow_stem(torch.cat([x_t, h_prev], dim=1)))) * self.max_disp_cells
+        flow_in = self.flow_pw(torch.cat([x_t, h_prev], dim=1))
+        delta_cells = torch.tanh(self.flow_pred(self.flow_dw1(flow_in) + self.flow_dw2(flow_in))) * self.max_disp_cells
         inv_w = 2.0 / float(max(1, wl))
         inv_h = 2.0 / float(max(1, hl))
         xs = ((torch.arange(wl, device=x_t.device, dtype=x_t.dtype) + 0.5) * inv_w - 1.0).view(1, 1, wl)
@@ -1244,12 +1283,17 @@ class DWConvGRUCell(nn.Module):
             align_corners=False,
         )
 
-        gates = torch.sigmoid(self.gate_pw(self.gate_dw(torch.cat([x_t, h_aligned], dim=1))))
+        gx = torch.cat([x_t, h_aligned], dim=1)
+        gates = torch.sigmoid(self.gate_pw(self.gate_dw(gx) + self.gate_dw_d2(gx)))
         r_gate, u_gate = gates.chunk(2, dim=1)
-        cand = self.cand_net(torch.cat([x_t, r_gate * h_aligned], dim=1))
+        cx = self.cand_pw(torch.cat([x_t, r_gate * h_aligned], dim=1))
+        cand = self.cand_dw1(cx) + self.cand_dw2(cx)
         h_new = (1.0 - u_gate) * h_aligned + u_gate * cand
         out_feat = x_t + self.mem_proj(h_new)
         return out_feat, h_new
+
+
+ConvGRUCell = DWConvGRUCell
 
 
 class PlateTemporalScaleHead(nn.Module):
@@ -1372,11 +1416,10 @@ class VehicleQueryHead(nn.Module):
         # All observation attributes share one learned query representation.
         self.attr_mlp = nn.Sequential(nn.Linear(attn_dim, hidden_dim), nn.SiLU())
         self.subtype_pred = nn.Linear(hidden_dim, num_subtypes + 1)
-        self.vehicle_evidence = nn.Linear(80, 1)
-        with torch.no_grad():
-            self.vehicle_evidence.weight.zero_()
-            self.vehicle_evidence.weight[:, [2, 3, 5, 6, 7]] = 1.0 / 5.0
-            self.vehicle_evidence.bias.zero_()
+        coco_veh = torch.tensor([2, 3, 5, 7], dtype=torch.long)
+        coco_non_veh = torch.tensor([i for i in range(80) if i not in (2, 3, 5, 7)], dtype=torch.long)
+        self.register_buffer("coco_veh_idx", coco_veh, persistent=False)
+        self.register_buffer("coco_non_veh_idx", coco_non_veh, persistent=False)
         self.register_buffer("cal_temp", torch.tensor(1.0))
         self.register_buffer("cal_bias", torch.tensor(0.0))
         self.cov_pred = nn.Linear(attn_dim, 10)
@@ -1393,7 +1436,7 @@ class VehicleQueryHead(nn.Module):
         self.footprint_pred = nn.Linear(hidden_dim, 9)  # [valid_logit, 4*(dx, dy)]
         self.plate_mount_pred = nn.Linear(hidden_dim, 5)  # [mcx, mcy, mw, mh, mount_vis_logit]
 
-        nn.init.zeros_(self.synth_cls_pred.bias)
+        nn.init.constant_(self.synth_cls_pred.bias, -1.25)
         nn.init.zeros_(self.synth_cls_pred.weight)
         nn.init.zeros_(self.box_polish_pred.bias)
         nn.init.zeros_(self.box_polish_pred.weight)
@@ -1461,18 +1504,23 @@ class VehicleQueryHead(nn.Module):
         scale_xyxy = raw_xyxy_norm.new_tensor([img_w, img_h, img_w, img_h])
         raw_boxes_px = raw_xyxy_norm * scale_xyxy
 
-        # Linear pretrained evidence initializes ONE trainable observation path.
-        # All 80 logits also enter the learned residual; there is no veto or rescue.
-        dfine_veh_logit = self.vehicle_evidence(logits_80).squeeze(-1)
+        # Anchor classification to exact COCO vehicle ([2, 3, 5, 7]) vs non-vehicle log-odds
+        # with bounded learned residual + ROI feature dropout so synthetic PBR textures cannot suppress real vehicles.
+        coco_veh_llr = (
+            torch.logsumexp(logits_80.index_select(-1, self.coco_veh_idx), dim=-1, keepdim=True)
+            - torch.logsumexp(logits_80.index_select(-1, self.coco_non_veh_idx), dim=-1, keepdim=True)
+        )
+        dfine_veh_logit = coco_veh_llr.squeeze(-1)
         roi_emb = self._pool_rois(veh_feat_s8, raw_xyxy_norm)  # (B, Q, D_h)
+        roi_emb = F.dropout(roi_emb, p=0.20, training=self.training)
         cx_n, cy_n, bw_n, bh_n = boxes_cxcywh.clamp(1e-3, 1.0).unbind(-1)
         log_ar = torch.log(bw_n / bh_n).clamp(-3.0, 3.0)
         geom_5 = torch.stack([cx_n, cy_n, bw_n, bh_n, log_ar], dim=-1)
 
         q_in = torch.cat([q_embeds, roi_emb, geom_5, logits_80], dim=-1)
         q_ctx = self.query_self_attn(self.query_in_proj(q_in))
-        residual_logit = self.synth_cls_pred(q_ctx).squeeze(-1)
-        raw_log_odds = dfine_veh_logit + residual_logit
+        learned_residual = self.synth_cls_pred(q_ctx)
+        raw_log_odds = (0.85 * coco_veh_llr + 3.5 * torch.tanh(learned_residual / 3.5)).squeeze(-1)
         veh_logit_q = raw_log_odds / self.cal_temp + self.cal_bias
 
         # Zero-init box residual, independent of classification confidence.
@@ -1711,7 +1759,13 @@ class TemporalPlateDetNet(nn.Module):
         self.lat2 = ConvBNAct(cfg.c2 + df_c2_ch, nc, k=1, s=1)
 
         self.td3 = nn.Sequential(ConvBNAct(nc * 2, nc, k=1, s=1), DWConvBlock(nc, k=5))
-        self.td2 = nn.Sequential(ConvBNAct(nc * 2, nc, k=1, s=1), DWConvBlock(nc, k=5))
+        self.p2_temp_gate = nn.Sequential(
+            ConvBNAct(nc, nc, k=3, s=1, g=nc),
+            nn.Conv2d(nc, nc, kernel_size=1),
+        )
+        nn.init.normal_(self.p2_temp_gate[1].weight, std=0.01)
+        nn.init.zeros_(self.p2_temp_gate[1].bias)
+        self.p2_out = nn.Sequential(DWConvBlock(nc, k=5), DWConvBlock(nc, k=3))
 
         # Motion-compensated recurrent temporal memory on P3 (stride 8) & P4 (stride 16)
         self.gru_p3 = DWConvGRUCell(nc, max_disp_cells=cfg.max_disp_cells)
@@ -1810,14 +1864,22 @@ class TemporalPlateDetNet(nn.Module):
 
         hp3_in = h_prev[0] if h_prev is not None else None
         hp4_in = h_prev[1] if h_prev is not None else None
-        p3_mem, hp3_next = self.gru_p3(p3_td, hp3_in)
+        p3_temporal, hp3_next = self.gru_p3(p3_td, hp3_in)
         p4_mem, hp4_next = self.gru_p4(p4_td, hp4_in)
 
-        l2 = self.lat2(torch.cat([c2, df_c2.to(dtype=c2.dtype)], dim=1))
-        p2 = self.td2(torch.cat([l2, F.interpolate(p3_mem, size=c2.shape[-2:], mode="nearest")], dim=1))
+        c1_lat = self.lat2(torch.cat([c2, df_c2.to(dtype=c2.dtype)], dim=1))
+        if (
+            torch.jit.is_tracing()
+            or torch.onnx.is_in_onnx_export()
+            or c1_lat.shape[-2:] == (p3_temporal.shape[-2] * 2, p3_temporal.shape[-1] * 2)
+        ):
+            p3_up = F.interpolate(p3_temporal, scale_factor=2.0, mode="nearest")
+        else:
+            p3_up = F.interpolate(p3_temporal, size=c1_lat.shape[-2:], mode="nearest")
+        p2 = self.p2_out(c1_lat + p3_up * torch.sigmoid(self.p2_temp_gate(p3_up)))
 
         n2 = p2
-        n3 = self.bu3(torch.cat([p3_mem, self.down2_3(n2)], dim=1))
+        n3 = self.bu3(torch.cat([p3_temporal, self.down2_3(n2)], dim=1))
         n4 = self.bu4(torch.cat([p4_mem, self.down3_4(n3)], dim=1))
 
         veh_feat_s8 = self.veh_roi_neck(
@@ -1961,6 +2023,9 @@ class TemporalPlateDetNet(nn.Module):
         if "pred_q_mount_boxes" in q_out:
             out_d["pred_q_mount_boxes"] = q_out["pred_q_mount_boxes"]
             out_d["pred_q_mount_vis_logit"] = q_out["pred_q_mount_vis_logit"]
+        if not (torch.jit.is_tracing() or torch.onnx.is_in_onnx_export()):
+            out_d["p3_feat"] = feats[1]
+            out_d["p4_feat"] = feats[2]
         return out_d
 
     def predict_vehicle_cutouts(
@@ -2142,6 +2207,7 @@ class TemporalTaskAlignedDetLoss(nn.Module):
         pyr_qual_2ch = torch.zeros_like(pyr_pos_2ch)
         pyr_ignore_2ch = torch.zeros((bsz, a_pyr, 2), device=device, dtype=torch.bool)
         pyr_hardneg_boost = torch.ones((bsz, a_pyr), device=device, dtype=torch.float32)
+        pyr_pos_boost = torch.ones((bsz, a_pyr), device=device, dtype=torch.float32)
         pyr_fg_mask = torch.zeros((bsz, a_pyr), device=device, dtype=torch.bool)
         pyr_gt_cls = torch.full((bsz, a_pyr), -1, device=device, dtype=torch.long)
         pyr_gt_boxes = torch.zeros((bsz, a_pyr, 4), device=device, dtype=torch.float32)
@@ -2151,6 +2217,7 @@ class TemporalTaskAlignedDetLoss(nn.Module):
         # Query buffers (1-to-1 whole-vehicle matching on 300 D-FINE queries)
         q_target_score = torch.zeros((bsz, max(1, num_q)), device=device, dtype=torch.float32)
         q_fg_mask = torch.zeros((bsz, max(1, num_q)), device=device, dtype=torch.bool)
+        q_cls_weight = torch.ones((bsz, max(1, num_q)), device=device, dtype=torch.float32)
         q_gt_boxes = torch.zeros((bsz, max(1, num_q), 4), device=device, dtype=torch.float32)
         q_gt_subtypes = torch.zeros((bsz, max(1, num_q)), device=device, dtype=torch.long)
         q_gt_cab_val = torch.zeros((bsz, max(1, num_q)), device=device, dtype=torch.float32)
@@ -2238,6 +2305,16 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                 gt_masks = targets[b].get("visible_masks", targets[b].get("cutout_masks"))
                 gt_amodal = targets[b].get("amodal_boxes", gt_boxes).to(device, dtype=torch.float32)
                 gt_ids = targets[b].get("identity_ids", torch.full((num_raw,), -1)).to(device, dtype=torch.long)
+                gt_box_vis = (
+                    targets[b]["box_visibility"].to(device, dtype=torch.float32).reshape(-1)
+                    if "box_visibility" in targets[b] and targets[b]["box_visibility"].numel() == num_raw
+                    else torch.ones((num_raw,), device=device, dtype=torch.float32)
+                )
+                gt_shadow = (
+                    targets[b]["overhang_shadow"].to(device, dtype=torch.float32).reshape(-1)
+                    if "overhang_shadow" in targets[b] and targets[b]["overhang_shadow"].numel() == num_raw
+                    else torch.zeros((num_raw,), device=device, dtype=torch.float32)
+                )
 
                 valid_cls = (gt_labels >= 0) & (gt_labels < num_cls)
                 if not valid_cls.all():
@@ -2251,11 +2328,23 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                     gt_cab_b = gt_cab_b[valid_cls]
                     gt_fp_v = gt_fp_v[valid_cls]
                     gt_fp_q = gt_fp_q[valid_cls]
+                    gt_box_vis = gt_box_vis[valid_cls]
+                    gt_shadow = gt_shadow[valid_cls]
                     if gt_masks is not None and gt_masks.shape[0] == num_raw:
                         gt_masks = gt_masks[valid_cls.to(gt_masks.device)]
 
                 # A. Vehicle GT -> Cutout ROIs + Strict 1-to-1 D-FINE Query Matching
-                veh_idx = torch.nonzero(gt_labels == CLS_VEHICLE, as_tuple=False).squeeze(1)
+                veh_all_idx = torch.nonzero(gt_labels == CLS_VEHICLE, as_tuple=False).squeeze(1)
+                veh_ig_idx = (
+                    veh_all_idx[gt_box_vis.index_select(0, veh_all_idx) < 0.15]
+                    if veh_all_idx.numel() > 0
+                    else veh_all_idx
+                )
+                veh_idx = (
+                    veh_all_idx[gt_box_vis.index_select(0, veh_all_idx) >= 0.15]
+                    if veh_all_idx.numel() > 0
+                    else veh_all_idx
+                )
                 if veh_idx.numel() > 0:
                     vb = gt_boxes.index_select(0, veh_idx)
                     vw_m = vb[:, 2] - vb[:, 0]
@@ -2329,6 +2418,33 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                                 cutout_gt_list.append(gt_masks[mask_index].to(device).reshape(1, 1, 64, 64))
                                 cutout_query_indices.append((b, qj))
 
+                        # 2.5x negative weight on unmatched interior sub-box queries (e.g. bus rear windows inside bus)
+                        q_area = (q_pol_b[:, 2] - q_pol_b[:, 0]).clamp_min(0.0) * (q_pol_b[:, 3] - q_pol_b[:, 1]).clamp_min(0.0)
+                        for ref_v in (amodal_vb, vb):
+                            v_area = (ref_v[:, 2] - ref_v[:, 0]).clamp_min(0.0) * (ref_v[:, 3] - ref_v[:, 1]).clamp_min(0.0)
+                            iou_qv = pairwise_box_iou(q_pol_b, ref_v)
+                            iomin_qv = pairwise_box_iomin(q_pol_b, ref_v)
+                            is_sub = (iomin_qv >= 0.80) & (iou_qv < 0.45) & (q_area[:, None] <= v_area[None, :])
+                            sub_q_mask = (~q_fg_mask[b]) & is_sub.any(dim=1)
+                            if sub_q_mask.any():
+                                q_cls_weight[b] = torch.where(
+                                    sub_q_mask, torch.full_like(q_cls_weight[b], 2.5), q_cls_weight[b]
+                                )
+
+                # Mask severely occluded sliver vehicles (box_visibility < 0.15) as ignore on queries with IoU >= 0.5
+                if num_q > 0 and veh_ig_idx.numel() > 0:
+                    q_pol_ig = pred_boxes[b, a_pyr:].detach()
+                    vb_ig = gt_boxes.index_select(0, veh_ig_idx)
+                    amodal_ig = gt_amodal.index_select(0, veh_ig_idx)
+                    ig_hit = (pairwise_box_iou(q_pol_ig, vb_ig).amax(dim=1) >= 0.50) | (
+                        pairwise_box_iou(q_pol_ig, amodal_ig).amax(dim=1) >= 0.50
+                    )
+                    ig_q_mask = (~q_fg_mask[b]) & ig_hit
+                    if ig_q_mask.any():
+                        q_cls_weight[b] = torch.where(
+                            ig_q_mask, torch.zeros_like(q_cls_weight[b]), q_cls_weight[b]
+                        )
+
                 # B. Plate & Signboard Hard-Negative GT -> Dense Pyramid TAL (strides 4, 8, 16)
                 ps_idx = torch.nonzero(
                     (gt_labels == CLS_PLATE) | (gt_labels == CLS_SIGNBOARD_HARDNEG), as_tuple=False
@@ -2339,6 +2455,7 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                 ps_labels = gt_labels.index_select(0, ps_idx)
                 ps_boxes = gt_boxes.index_select(0, ps_idx)
                 ps_corners = gt_corners.index_select(0, ps_idx)
+                ps_shadow = gt_shadow.index_select(0, ps_idx)
                 num_ps = int(ps_labels.shape[0])
 
                 gx0, gy0, gx1, gy1 = ps_boxes.unbind(-1)
@@ -2427,14 +2544,27 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                 pyr_gt_corners[b, fg_idx] = ps_corners[gt_sel]
 
                 gt_w = (ps_boxes[gt_sel, 2] - ps_boxes[gt_sel, 0]).clamp_min(4.0)
-                small_boost = torch.where(
-                    (cls_sel == CLS_PLATE) & (gt_w < 38.0),
-                    torch.full_like(qual_sel, 2.15),
+                gt_h = (ps_boxes[gt_sel, 3] - ps_boxes[gt_sel, 1]).clamp_min(2.0)
+                is_small_or_shadow_pl = (cls_sel == CLS_PLATE) & (
+                    (gt_w < 18.0) | (torch.sqrt(gt_w * gt_h) < 18.0) | (ps_shadow[gt_sel] > 0.60)
+                )
+                pyr_pos_boost[b, fg_idx] = torch.where(
+                    is_small_or_shadow_pl,
+                    torch.full_like(qual_sel, 2.0),
                     torch.ones_like(qual_sel),
+                )
+                small_boost = torch.where(
+                    is_small_or_shadow_pl,
+                    torch.full_like(qual_sel, 2.0),
+                    torch.where(
+                        (cls_sel == CLS_PLATE) & (gt_w < 38.0),
+                        torch.full_like(qual_sel, 1.6),
+                        torch.ones_like(qual_sel),
+                    ),
                 )
                 pyr_weights[b, fg_idx] = qual_sel * small_boost
 
-        # 1. Pyramid Classification Loss (`CLS_PLATE` + `CLS_SIGNBOARD_HARDNEG`)
+        # 1. Pyramid Classification Loss (`CLS_PLATE` + `CLS_SIGNBOARD_HARDNEG` + explicit margin)
         pyr_logits_2ch = torch.stack(
             [cls_logits[:, :a_pyr, CLS_PLATE], cls_logits[:, :a_pyr, CLS_SIGNBOARD_HARDNEG]],
             dim=-1,
@@ -2442,16 +2572,29 @@ class TemporalTaskAlignedDetLoss(nn.Module):
         pyr_prob_2ch = torch.sigmoid(pyr_logits_2ch)
         neg_w_2ch = 1.35 * (pyr_prob_2ch.detach() ** 2.0)
         neg_w_2ch[:, :, 0] = neg_w_2ch[:, :, 0] * pyr_hardneg_boost
-        focal_pyr = torch.where(pyr_pos_2ch > 0.0, pyr_qual_2ch, neg_w_2ch)
+        pos_w_2ch = pyr_qual_2ch * pyr_pos_boost.unsqueeze(-1)
+        focal_pyr = torch.where(pyr_pos_2ch > 0.0, pos_w_2ch, neg_w_2ch)
         if pyr_ignore_2ch.any():
             neg_ig = (pyr_pos_2ch <= 0.0) & pyr_ignore_2ch
             focal_pyr = torch.where(neg_ig, torch.zeros_like(focal_pyr), focal_pyr)
         bce_pyr = F.binary_cross_entropy_with_logits(pyr_logits_2ch, pyr_pos_2ch, reduction="none")
         loss_cls_pyr = (bce_pyr * focal_pyr).sum() / pyr_qual_2ch.sum().clamp_min(3.0)
+        hn_pos_mask = pyr_pos_2ch[:, :, 1] > 0.0
+        if hn_pos_mask.any():
+            pyr_cls_f = cls_logits[:, :a_pyr].float()
+            loss_hn_margin = 0.5 * F.softplus(
+                pyr_cls_f[:, :, CLS_PLATE][hn_pos_mask]
+                - pyr_cls_f[:, :, CLS_SIGNBOARD_HARDNEG][hn_pos_mask]
+                + 1.5
+            ).mean()
+            loss_cls_pyr = loss_cls_pyr + loss_hn_margin
 
-        # Bernoulli vehicle/background NLL, including every unmatched query.
+        # Bernoulli vehicle/background NLL (with 2.5x interior sub-box penalty and sliver ignore mask).
         if num_q > 0 and synth_veh_logits is not None:
-            loss_cls_q = F.binary_cross_entropy_with_logits(synth_veh_logits.float(), q_fg_mask.float(), reduction="sum") / float(max(1, bsz) * 6.0)
+            bce_q = F.binary_cross_entropy_with_logits(
+                synth_veh_logits.float(), q_fg_mask.float(), reduction="none"
+            )
+            loss_cls_q = (bce_q * q_cls_weight).sum() / float(max(1, bsz) * 6.0)
         else:
             loss_cls_q = cls_logits.sum() * 0.0
         loss_teacher_kl = cls_logits.sum() * 0.0
@@ -2486,7 +2629,7 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                 (g_boxes_fg[:, 3] - g_boxes_fg[:, 1]).clamp_min(4.0),
             ).view(-1, 1, 1)
             per_q = F.smooth_l1_loss(p_quad / diag, g_quad / diag, beta=0.08, reduction="none").mean(dim=(1, 2))
-            q_w = torch.where(is_pl_fg, torch.ones_like(per_q), torch.full_like(per_q, 0.25))
+            q_w = torch.where(is_pl_fg, pyr_pos_boost[pyr_fg_mask], torch.full_like(per_q, 0.25))
             loss_quad = (per_q * q_w).sum() / q_w.sum().clamp_min(1e-6)
 
         loss_appearance = zero
@@ -2710,13 +2853,30 @@ def extract_rgba_cutout(
     return np.dstack([rgb_patch, alpha_u8])
 
 
+class TemporalDetKDAdapter(nn.Module):
+    """Training-only `1x1` FPN feature adapters (`Student neck_ch -> Teacher neck_ch`) stored outside Student."""
+
+    def __init__(self, student_ch: int, teacher_ch: int) -> None:
+        super().__init__()
+        self.projs = nn.ModuleDict(
+            {
+                key: nn.Conv2d(int(student_ch), int(teacher_ch), kernel_size=1, bias=True)
+                for key in ("p2_feat", "p3_feat", "p4_feat")
+            }
+        )
+        for m in self.projs.values():
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="linear")
+            nn.init.zeros_(m.bias)
+
+
 def compute_temporal_det_kd_loss(
     student_out: dict[str, Any],
     teacher_out: dict[str, Any],
     *,
     temperature: float = 2.0,
+    kd_adapter: TemporalDetKDAdapter | nn.Module | None = None,
 ) -> torch.Tensor:
-    """Synthetic-only `Base -> Nano` distillation loss (spatial pyramid + IoU-matched vehicle queries)."""
+    """Synthetic-only `Base -> Nano` distillation loss (pyramid + FPN `p2/p3/p4` + Teacher vehicle/mount queries)."""
     s_cls_all = student_out["cls_logits"].float()
     t_cls_all = teacher_out["cls_logits"].detach().float()
     num_q_s = int(student_out.get("num_vehicle_queries", 300))
@@ -2731,7 +2891,6 @@ def compute_temporal_det_kd_loss(
     t_pyr = t_cls_all[:, :a_pyr, pyr_idx]
     t_prob_pyr = torch.sigmoid(t_pyr)
     s_prob_pyr = torch.sigmoid(s_pyr.detach())
-    # Information-theoretic surprise focus: emphasize anchors where EITHER teacher detects OR student hallucinates!
     focus = (torch.maximum(t_prob_pyr, 0.65 * s_prob_pyr).amax(dim=-1, keepdim=True).clamp_min(0.02)) ** 0.75
     t_soft = torch.sigmoid(t_pyr / temperature)
     kd_cls = F.binary_cross_entropy_with_logits(s_pyr / temperature, t_soft, reduction="none")
@@ -2750,75 +2909,177 @@ def compute_temporal_det_kd_loss(
             sp_c / diag_t, tp_c / diag_t, beta=0.06
         )
 
-    # 2. Permutation-invariant IoU matching + unmatched false-positive suppression on `D-FINE` vehicle queries
+    # 2. Multi-scale FPN feature distillation (`p2, p3, p4`) via external 1x1 adapters (or spatial energy fallback)
+    fpn_terms: list[torch.Tensor] = []
+    projs = getattr(kd_adapter, "projs", None) if kd_adapter is not None else None
+    for f_key in ("p2_feat", "p3_feat", "p4_feat"):
+        sf = student_out.get(f_key)
+        tf = teacher_out.get(f_key)
+        if not isinstance(sf, torch.Tensor) or not isinstance(tf, torch.Tensor):
+            continue
+        tf_det = tf.detach().float()
+        if tf_det.shape[-2:] != sf.shape[-2:]:
+            tf_det = F.interpolate(tf_det, size=sf.shape[-2:], mode="bilinear", align_corners=False)
+        if projs is not None and f_key in projs:
+            sf_proj = projs[f_key](sf).float()
+        elif sf.shape[1] == tf_det.shape[1]:
+            sf_proj = sf.float()
+        else:
+            sf_proj = None
+        if sf_proj is not None:
+            t_rms = tf_det.square().mean(dim=1, keepdim=True).add(1e-6).sqrt()
+            s_rms = sf_proj.square().mean(dim=1, keepdim=True).add(1e-6).sqrt()
+            sp_weight = (t_rms / t_rms.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)).clamp(0.4, 3.0)
+            cos_term = 1.0 - F.cosine_similarity(sf_proj, tf_det, dim=1, eps=1e-6).unsqueeze(1)
+            l1_term = F.smooth_l1_loss(sf_proj / s_rms, tf_det / t_rms, beta=0.10, reduction="none").mean(dim=1, keepdim=True)
+            fpn_terms.append(((0.60 * cos_term + 0.40 * l1_term) * sp_weight).mean())
+        else:
+            s_att = F.normalize(sf.float().square().mean(dim=1).flatten(1), dim=-1, eps=1e-6)
+            t_att = F.normalize(tf_det.square().mean(dim=1).flatten(1), dim=-1, eps=1e-6)
+            fpn_terms.append(F.smooth_l1_loss(s_att, t_att, beta=0.05) * float(s_att.shape[-1]) * 0.05)
+    if fpn_terms:
+        loss_kd = loss_kd + 0.35 * (sum(fpn_terms) / float(len(fpn_terms)))
+
+    # 3. Teacher (`dfine-small` stride-8/16/32) confident vehicle queries (`prob >= 0.35`, matched by IoU + center dist)
     if num_q_s > 0 and num_q_t > 0 and s_cls_all.shape[1] > a_pyr_s and t_cls_all.shape[1] > a_pyr_t:
-        t_q_prob = torch.sigmoid(t_cls_all[:, a_pyr_t:, CLS_VEHICLE])
+        t_v_raw = teacher_out.get("veh_log_odds")
+        s_v_raw = student_out.get("veh_log_odds")
+        t_veh_logits = (
+            t_v_raw.detach().float().reshape(t_cls_all.shape[0], -1)
+            if isinstance(t_v_raw, torch.Tensor)
+            else t_cls_all[:, a_pyr_t:, CLS_VEHICLE]
+        )
+        s_veh_logits = (
+            s_v_raw.float().reshape(s_cls_all.shape[0], -1)
+            if isinstance(s_v_raw, torch.Tensor)
+            else s_cls_all[:, a_pyr_s:, CLS_VEHICLE]
+        )
+        t_q_prob = torch.sigmoid(t_veh_logits)
         s_q_boxes_live = student_out["pred_boxes"][:, a_pyr_s:].float()
         s_q_boxes = s_q_boxes_live.detach()
         t_q_boxes = teacher_out["pred_boxes"][:, a_pyr_t:].detach().float()
         s_q_sub = student_out["pred_subtype_logits"][:, a_pyr_s:].float()
         t_q_sub = teacher_out["pred_subtype_logits"][:, a_pyr_t:].detach().float()
-        s_synth = student_out.get("synth_veh_logits")
-        t_synth = teacher_out.get("synth_veh_logits")
+        s_m_boxes = student_out.get("pred_q_mount_boxes")
+        t_m_boxes = teacher_out.get("pred_q_mount_boxes")
+        s_m_vis = student_out.get("pred_q_mount_vis_logit")
+        t_m_vis = teacher_out.get("pred_q_mount_vis_logit")
+
+        p2_ref = student_out.get("p2_feat")
+        if isinstance(p2_ref, torch.Tensor):
+            img_h_f = float(p2_ref.shape[-2] * 4)
+            img_w_f = float(p2_ref.shape[-1] * 4)
+        else:
+            img_h_f = float(max(64.0, float(t_q_boxes[..., 3].max().item())))
+            img_w_f = float(max(64.0, float(t_q_boxes[..., 2].max().item())))
+        img_whwh = s_q_boxes_live.new_tensor([img_w_f, img_h_f, img_w_f, img_h_f]).clamp_min(32.0)
 
         matched_s_sub: list[torch.Tensor] = []
         matched_t_sub: list[torch.Tensor] = []
-        matched_s_syn: list[torch.Tensor] = []
-        matched_t_syn: list[torch.Tensor] = []
+        matched_s_vlogit: list[torch.Tensor] = []
+        matched_t_vlogit: list[torch.Tensor] = []
         matched_s_box: list[torch.Tensor] = []
         matched_t_box: list[torch.Tensor] = []
-        neg_s_syn: list[torch.Tensor] = []
+        matched_s_mvis: list[torch.Tensor] = []
+        matched_t_mvis: list[torch.Tensor] = []
+        matched_s_mbox: list[torch.Tensor] = []
+        matched_t_mbox: list[torch.Tensor] = []
+        neg_s_vlogit: list[torch.Tensor] = []
+
         for b in range(s_cls_all.shape[0]):
-            t_valid = t_q_prob[b] > 0.28
-            if isinstance(s_synth, torch.Tensor):
-                s_syn_b = s_synth.reshape(s_cls_all.shape[0], -1)[b].float()
-            else:
-                s_syn_b = None
+            t_valid = t_q_prob[b] >= 0.35
+            s_vb = s_veh_logits[b]
             if not t_valid.any():
-                if s_syn_b is not None:
-                    fp_q = torch.sigmoid(s_syn_b.detach()) > 0.16
-                    if fp_q.any():
-                        neg_s_syn.append(s_syn_b[fp_q])
+                fp_q = torch.sigmoid(s_vb.detach()) > 0.16
+                if fp_q.any():
+                    neg_s_vlogit.append(s_vb[fp_q])
                 continue
+
             tb = t_q_boxes[b, t_valid]
             tsub = t_q_sub[b, t_valid]
-            ious = pairwise_box_iou(s_q_boxes[b], tb)
-            best_iou, best_t = ious.max(dim=1)
-            keep_q = best_iou >= 0.52
-            if s_syn_b is not None:
-                fp_q = (best_iou < 0.22) & (torch.sigmoid(s_syn_b.detach()) > 0.16)
-                if fp_q.any():
-                    neg_s_syn.append(s_syn_b[fp_q])
-            if not keep_q.any():
-                continue
-            matched_s_sub.append(s_q_sub[b, keep_q])
-            matched_t_sub.append(tsub[best_t[keep_q]])
-            matched_s_box.append(s_q_boxes_live[b, keep_q])
-            matched_t_box.append(tb[best_t[keep_q]])
-            if s_syn_b is not None and isinstance(t_synth, torch.Tensor):
-                t_syn_2d = t_synth.reshape(t_cls_all.shape[0], -1)
-                tsyn_valid = t_syn_2d[b, t_valid].detach().float()
-                matched_s_syn.append(s_syn_b[keep_q])
-                matched_t_syn.append(tsyn_valid[best_t[keep_q]])
+            tvl = t_veh_logits[b, t_valid]
+            sb = s_q_boxes[b]
 
+            ious_ts = pairwise_box_iou(tb, sb)  # (M_t, Q_s)
+            tcx = 0.5 * (tb[:, 0:1] + tb[:, 2:3])
+            tcy = 0.5 * (tb[:, 1:2] + tb[:, 3:4])
+            scx = 0.5 * (sb[:, 0] + sb[:, 2]).unsqueeze(0)
+            scy = 0.5 * (sb[:, 1] + sb[:, 3]).unsqueeze(0)
+            t_diag = torch.hypot((tb[:, 2:3] - tb[:, 0:1]).clamp_min(24.0), (tb[:, 3:4] - tb[:, 1:2]).clamp_min(24.0))
+            center_dist = torch.hypot(tcx - scx, tcy - scy) / (2.0 * t_diag)
+            match_cost = 2.0 * (1.0 - ious_ts) + center_dist - 0.15 * torch.sigmoid(s_vb.detach()).unsqueeze(0)
+
+            ti_np, si_np = _match_query_nll(match_cost.cpu().numpy())
+            ti_t = torch.as_tensor(ti_np, device=sb.device, dtype=torch.long)
+            si_t = torch.as_tensor(si_np, device=sb.device, dtype=torch.long)
+            valid_pair = (ious_ts[ti_t, si_t] >= 0.05) | (center_dist[ti_t, si_t] <= 1.25)
+            ti_t = ti_t[valid_pair]
+            si_t = si_t[valid_pair]
+
+            s_matched_mask = torch.zeros((sb.shape[0],), device=sb.device, dtype=torch.bool)
+            if si_t.numel() > 0:
+                s_matched_mask[si_t] = True
+                matched_s_vlogit.append(s_vb[si_t])
+                matched_t_vlogit.append(tvl[ti_t])
+                matched_s_box.append(s_q_boxes_live[b, si_t])
+                matched_t_box.append(tb[ti_t])
+                matched_s_sub.append(s_q_sub[b, si_t])
+                matched_t_sub.append(tsub[ti_t])
+                if (
+                    isinstance(s_m_vis, torch.Tensor)
+                    and isinstance(t_m_vis, torch.Tensor)
+                    and isinstance(s_m_boxes, torch.Tensor)
+                    and isinstance(t_m_boxes, torch.Tensor)
+                ):
+                    smv_b = s_m_vis[b, :, 0].float()[si_t]
+                    tmv_b = t_m_vis[b, t_valid, 0].detach().float()[ti_t]
+                    matched_s_mvis.append(smv_b)
+                    matched_t_mvis.append(tmv_b)
+                    m_active = torch.sigmoid(tmv_b) >= 0.35
+                    if m_active.any():
+                        matched_s_mbox.append(s_m_boxes[b].float()[si_t[m_active]])
+                        matched_t_mbox.append(t_m_boxes[b, t_valid].detach().float()[ti_t[m_active]])
+
+            max_iou_s = ious_ts.amax(dim=0)
+            fp_q = (~s_matched_mask) & (max_iou_s < 0.22) & (torch.sigmoid(s_vb.detach()) > 0.16)
+            if fp_q.any():
+                neg_s_vlogit.append(s_vb[fp_q])
+
+        if matched_s_vlogit:
+            sv_cat = torch.cat(matched_s_vlogit, dim=0)
+            tv_cat = torch.cat(matched_t_vlogit, dim=0)
+            tv_soft = torch.sigmoid(tv_cat / temperature)
+            loss_kd = loss_kd + 0.55 * F.binary_cross_entropy_with_logits(
+                sv_cat / temperature, tv_soft, reduction="mean"
+            ) * (temperature * temperature)
+        if matched_s_box:
+            sb_cat = torch.cat(matched_s_box, dim=0)
+            tb_cat = torch.cat(matched_t_box, dim=0)
+            v_giou = compute_box_giou(sb_cat, tb_cat)
+            v_l1 = F.l1_loss(sb_cat / img_whwh, tb_cat / img_whwh, reduction="mean")
+            loss_kd = loss_kd + 0.65 * (1.0 - v_giou).mean() + 2.5 * v_l1
+        if matched_s_mvis:
+            smv_cat = torch.cat(matched_s_mvis, dim=0)
+            tmv_cat = torch.cat(matched_t_mvis, dim=0)
+            loss_kd = loss_kd + 0.30 * F.binary_cross_entropy_with_logits(
+                smv_cat / temperature, torch.sigmoid(tmv_cat / temperature), reduction="mean"
+            ) * (temperature * temperature)
+        if matched_s_mbox:
+            smb_cat = torch.cat(matched_s_mbox, dim=0)
+            tmb_cat = torch.cat(matched_t_mbox, dim=0)
+            m_giou = compute_box_giou(smb_cat, tmb_cat)
+            m_nwd = compute_box_nwd(smb_cat, tmb_cat)
+            m_l1 = F.l1_loss(smb_cat / img_whwh, tmb_cat / img_whwh, reduction="mean")
+            loss_kd = loss_kd + 0.35 * (0.65 * (1.0 - m_giou) + 0.35 * (1.0 - m_nwd)).mean() + 1.5 * m_l1
         if matched_s_sub:
             s_sub_cat = F.log_softmax(torch.cat(matched_s_sub, dim=0) / temperature, dim=-1)
             t_sub_cat = F.softmax(torch.cat(matched_t_sub, dim=0) / temperature, dim=-1)
             loss_kd = loss_kd + 0.25 * F.kl_div(s_sub_cat, t_sub_cat, reduction="batchmean") * (
                 temperature * temperature
             )
-        if matched_s_box:
-            _, v_ciou = compute_box_iou_ciou(torch.cat(matched_s_box, dim=0), torch.cat(matched_t_box, dim=0))
-            loss_kd = loss_kd + 0.30 * (1.0 - v_ciou).mean()
-        if matched_s_syn:
-            s_syn_cat = torch.cat(matched_s_syn, dim=0)
-            t_syn_soft = torch.sigmoid(torch.cat(matched_t_syn, dim=0) / temperature)
+        if neg_s_vlogit:
+            s_neg_cat = torch.cat(neg_s_vlogit, dim=0)
             loss_kd = loss_kd + 0.25 * F.binary_cross_entropy_with_logits(
-                s_syn_cat / temperature, t_syn_soft, reduction="mean"
-            ) * (temperature * temperature)
-        if neg_s_syn:
-            s_neg_cat = torch.cat(neg_s_syn, dim=0)
-            loss_kd = loss_kd + 0.22 * F.binary_cross_entropy_with_logits(
                 s_neg_cat, torch.full_like(s_neg_cat, 0.01), reduction="mean"
             )
 
@@ -2927,6 +3188,14 @@ def decode_temporal_det_predictions(
                 if a_area > 1.85 * b_area and (inter / b_area) >= 0.78 and bsc >= 0.85 * asc:
                     wrapped_cnt += 1
                 if b_area > 1.75 * a_area and (inter / a_area) >= 0.86 and bsc >= asc + 0.14:
+                    drop_sub = True
+                    break
+                if (
+                    b_area > 1.65 * a_area
+                    and (inter / a_area) >= 0.82
+                    and ay1 < by0 + 0.76 * (by1 - by0)
+                    and bsc >= 0.55 * asc
+                ):
                     drop_sub = True
                     break
             if not drop_sub and wrapped_cnt < 2:
@@ -3051,9 +3320,12 @@ def decode_temporal_det_predictions(
     all_p_corners = [corners[p_mask]]
     all_p_provenance = [np.full(int(p_mask.sum()), provenance.value, dtype=object)]
 
-    # Pass-2: Gen-5 Vehicle-First + 2x2 Mosaic Multi-Vehicle + Standalone-Peak Native-Resolution Smart-Zoom
+    # Pass-2: Gen-5 Vehicle-First + 2x2 Mosaic Multi-Vehicle + Standalone-Peak Smart-Zoom (active on low-res too!)
     zoom_tile_hw = (256, 384)
-    if enable_far_zoom and scale < 0.92 and max_zoom_rois > 0:
+    max_zoom_mag = 3.2
+    if isinstance(model, UnifiedTemporalDetORT):
+        max_zoom_rois = min(max_zoom_rois, 2)
+    if enable_far_zoom and max_zoom_rois > 0:
         cur_p_boxes = all_p_boxes[0]
         cur_p_scores = all_p_scores[0]
         zoom_crops: list[np.ndarray] = []
@@ -3069,11 +3341,55 @@ def decode_temporal_det_predictions(
         tw_quad_lim = max(24, int(math.floor(float(qw_half - 2) / max(1e-6, g_min * scale))))
         th_quad_lim = max(24, int(math.floor(float(qh_half - 2) / max(1e-6, g_min * scale))))
 
-        def _clip_and_dedup_window(rx0: int, ry0: int, rx1: int, ry1: int) -> tuple[int, int, int, int] | None:
-            rx0_c = max(0, min(w_orig - 24, int(rx0)))
-            ry0_c = max(0, min(h_orig - 24, int(ry0)))
-            rx1_c = min(w_orig, max(rx0_c + 24, int(rx1)))
-            ry1_c = min(h_orig, max(ry0_c + 24, int(ry1)))
+        def _letterbox_zoom_roi(
+            sub_rgb: np.ndarray,
+            target_hw: tuple[int, int],
+            pad_val: int = 114,
+        ) -> tuple[np.ndarray, float, int, int]:
+            sh, sw = sub_rgb.shape[:2]
+            ht, wt = target_hw
+            z_sc = min(wt / float(max(1, sw)), ht / float(max(1, sh)), max_zoom_mag)
+            nw = max(1, min(wt, int(round(sw * z_sc))))
+            nh = max(1, min(ht, int(round(sh * z_sc))))
+            interp = cv2.INTER_AREA if z_sc < 1.0 else cv2.INTER_CUBIC
+            resized = cv2.resize(sub_rgb, (nw, nh), interpolation=interp)
+            if nh == ht and nw == wt:
+                return resized, z_sc, 0, 0
+            canvas_z = np.full((ht, wt, 3), pad_val, dtype=np.uint8)
+            z_px = (wt - nw) // 2
+            z_py = (ht - nh) // 2
+            canvas_z[z_py : z_py + nh, z_px : z_px + nw] = resized
+            return canvas_z, z_sc, z_px, z_py
+
+        def _expand_for_mag_cap(
+            rx0: int, ry0: int, rx1: int, ry1: int, target_hw: tuple[int, int]
+        ) -> tuple[int, int, int, int]:
+            min_w = min(w_orig, max(24, int(math.ceil(float(target_hw[1]) / max_zoom_mag))))
+            min_h = min(h_orig, max(24, int(math.ceil(float(target_hw[0]) / max_zoom_mag))))
+            cur_w = max(1, rx1 - rx0)
+            cur_h = max(1, ry1 - ry0)
+            if cur_w < min_w:
+                cx_w = 0.5 * (rx0 + rx1)
+                rx0 = int(round(cx_w - 0.5 * min_w))
+                rx1 = rx0 + min_w
+            if cur_h < min_h:
+                cy_h = 0.5 * (ry0 + ry1)
+                ry0 = int(round(cy_h - 0.5 * min_h))
+                ry1 = ry0 + min_h
+            return rx0, ry0, rx1, ry1
+
+        def _clip_and_dedup_window(
+            rx0: int, ry0: int, rx1: int, ry1: int, target_hw: tuple[int, int] = zoom_tile_hw
+        ) -> tuple[int, int, int, int] | None:
+            if w_orig < 24 or h_orig < 24:
+                return None
+            rx0, ry0, rx1, ry1 = _expand_for_mag_cap(rx0, ry0, rx1, ry1, target_hw)
+            win_w_req = min(w_orig, max(24, rx1 - rx0))
+            win_h_req = min(h_orig, max(24, ry1 - ry0))
+            rx0_c = max(0, min(w_orig - win_w_req, int(rx0)))
+            ry0_c = max(0, min(h_orig - win_h_req, int(ry0)))
+            rx1_c = min(w_orig, rx0_c + win_w_req)
+            ry1_c = min(h_orig, ry0_c + win_h_req)
             if rx1_c - rx0_c < 24 or ry1_c - ry0_c < 24:
                 return None
             area_new = float((rx1_c - rx0_c) * (ry1_c - ry0_c))
@@ -3087,12 +3403,12 @@ def decode_temporal_det_predictions(
         def _try_enqueue_window(rx0: int, ry0: int, rx1: int, ry1: int) -> None:
             if len(zoom_crops) >= max_zoom_rois:
                 return
-            win = _clip_and_dedup_window(rx0, ry0, rx1, ry1)
+            win = _clip_and_dedup_window(rx0, ry0, rx1, ry1, zoom_tile_hw)
             if win is None:
                 return
             rx0_c, ry0_c, rx1_c, ry1_c = win
             sub_rgb = frame_rgb[ry0_c:ry1_c, rx0_c:rx1_c]
-            z_img, z_sc, z_px, z_py = letterbox_rgb(sub_rgb, target_hw=zoom_tile_hw)
+            z_img, z_sc, z_px, z_py = _letterbox_zoom_roi(sub_rgb, target_hw=zoom_tile_hw)
             if (z_sc / max(1e-6, scale)) < (g_min - 1e-3):
                 return
             zoom_crops.append(z_img)
@@ -3106,6 +3422,8 @@ def decode_temporal_det_predictions(
             vw = vx1 - vx0
             vh = vy1 - vy0
             if vw * scale < 10.0 or vh * scale < 10.0:
+                continue
+            if scale >= 0.92 and vw * scale >= 260.0:
                 continue
             has_strong = False
             for pb, ps in zip(cur_p_boxes, cur_p_scores):
@@ -3127,6 +3445,7 @@ def decode_temporal_det_predictions(
         mosaic_cands: list[tuple[int, int, int, int]] = []
         regular_vehs: list[VehicleDetection] = []
         use_mosaic_pack = len(vehicles_detailed) >= 4
+        quad_target_hw = (qh_half - 1, qw_half - 1)
         for vd in veh_need_zoom:
             vx0, vy0, vx1, vy1 = vd.bbox_xyxy
             vw = vx1 - vx0
@@ -3139,6 +3458,7 @@ def decode_temporal_det_predictions(
                     int(math.floor(vy0 - my)),
                     int(math.ceil(vx1 + mx)),
                     int(math.ceil(vy1 + my)),
+                    quad_target_hw,
                 )
                 if win_m is not None:
                     mosaic_cands.append(win_m)
@@ -3159,13 +3479,8 @@ def decode_temporal_det_predictions(
                 chunk = mosaic_cands[m_start : m_start + 4]
                 if len(chunk) == 1:
                     rx0_1, ry0_1, rx1_1, ry1_1 = chunk[0]
-                    sub_1 = frame_rgb[ry0_1:ry1_1, rx0_1:rx1_1]
-                    z_img1, z_sc1, z_px1, z_py1 = letterbox_rgb(sub_1, target_hw=zoom_tile_hw)
-                    if (z_sc1 / max(1e-6, scale)) >= (g_min - 1e-3):
-                        zoom_crops.append(z_img1)
-                        zoom_tile_regions.append(
-                            [(0, 0, zoom_tile_hw[1], zoom_tile_hw[0], z_sc1, z_px1, z_py1, rx0_1, ry0_1, rx1_1, ry1_1)]
-                        )
+                    enqueued_src_windows.remove(chunk[0])
+                    _try_enqueue_window(rx0_1, ry0_1, rx1_1, ry1_1)
                     continue
                 canvas = np.full((zoom_tile_hw[0], zoom_tile_hw[1], 3), 114, dtype=np.uint8)
                 regs_m: list[tuple[int, int, int, int, float, int, int, int, int, int, int]] = []
@@ -3174,7 +3489,7 @@ def decode_temporal_det_predictions(
                     qw_s = qx1 - qx0
                     qh_s = qy1 - qy0
                     sub_q = frame_rgb[ry0_q:ry1_q, rx0_q:rx1_q]
-                    q_img, q_sc, q_px, q_py = letterbox_rgb(sub_q, target_hw=(qh_s, qw_s))
+                    q_img, q_sc, q_px, q_py = _letterbox_zoom_roi(sub_q, target_hw=(qh_s, qw_s))
                     if (q_sc / max(1e-6, scale)) < (g_min - 1e-3):
                         continue
                     canvas[qy0:qy1, qx0:qx1] = q_img

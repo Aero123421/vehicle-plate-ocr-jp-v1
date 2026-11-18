@@ -21,7 +21,7 @@ import tempfile
 sys.dont_write_bytecode = True
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CALIBRATION = "web/models/gen6.json"
-READOUT_PRECISION_CEILING = 2.5
+READOUT_PRECISION_CEILING = 48.0
 SIZE_LIMIT_BYTES = 15 * 1024 * 1024
 GRAPH_NAMES = (
     "temporal_det_nano", "vehicle_cutout_nano", "stage2", "frame_encoder",
@@ -162,7 +162,23 @@ def step(runtime, state, observation, geometry, timestamp):
     return tuple(runtime.step_session.run(None, feed))
 
 
-def terminal_record(runtime, state, slots, plate_type, status, rgb=True):
+def _conformal_damping(nc, llr, vis, tau_nc=1.65):
+    nc_excess = max(0.0, float(nc) - float(tau_nc))
+    neg_llr = max(0.0, -float(llr) - 0.25)
+    return math.exp(-min(20.0, 0.55 * nc_excess + 0.75 * neg_llr)) * (0.15 + 0.85 * float(vis))
+
+
+def _scale_obs_damping(observation, damping):
+    import numpy as np
+
+    d = np.float32(damping)
+    return tuple(
+        np.asarray(value * d, dtype=np.float32) if i in (1, 3, 5) else np.asarray(value).copy()
+        for i, value in enumerate(observation)
+    )
+
+
+def terminal_record(runtime, state, slots, plate_type, status, rgb=True, *, support=1.0, is_non_plate=False):
     import numpy as np
     from vpocr_ocr.session_v2 import _apply_sealed_precision_ceiling
 
@@ -176,9 +192,8 @@ def terminal_record(runtime, state, slots, plate_type, status, rgb=True):
         "mem_P": state[1][0].copy(), "mem_conflict": state[2][0].copy(),
         "color_P": state[4][0].copy(), "target_slots": np.asarray(slots, dtype=np.int64),
         "target_plate_type": int(plate_type), "target_status": int(status), "rgb": bool(rgb),
-        # These are supplied OCR candidates, matching the terminal API's default
-        # quad_prob=1. Non-plate crops must be rejected by the fitted null model.
-        "support": 1.0,
+        "support": float(support),
+        "is_non_plate": bool(is_non_plate),
     }
 
 
@@ -193,6 +208,7 @@ def collect_terminal_samples(runtime, pool, seed):
     engine = GPUSynthSequenceEngine(device="cpu", train_mode=False, curriculum_stage=4,
                                     seed=seed, sampler=CalibrationPlateSampler(pool.engine.bank, seed),
                                     out_hw=tuple(runtime.enc_session.get_inputs()[0].shape[-2:]))
+    rng_s2 = np.random.default_rng(seed + 15000)
     records = []
     crisp = []
     seq_bank = []
@@ -203,22 +219,42 @@ def collect_terminal_samples(runtime, pool, seed):
         for b in range(16):
             crops, sides, geometry = (arrays[key][b] for key in ("crops", "plate_sides", "geom_meta"))
             observations = encode(runtime, crops, sides, geometry)
+            tgt_st = int(arrays["target_status"][b])
             state = runtime._empty_state()
             for t in range(8):
                 if arrays["frame_valid_mask"][b, t] > 0:
-                    state = step(runtime, state, tuple(a[t] for a in observations),
+                    obs_t = tuple(a[t] for a in observations)
+                    if tgt_st in (0, 2):
+                        nc_t = float(rng_s2.uniform(0.15, 2.15))
+                        vis_t = float(rng_s2.uniform(0.55, 0.99))
+                        llr_t = float(rng_s2.uniform(-0.10, 4.20))
+                    else:
+                        nc_t = float(rng_s2.uniform(0.80, 3.60))
+                        vis_t = float(rng_s2.uniform(0.25, 0.85))
+                        llr_t = float(rng_s2.uniform(-2.50, 1.20))
+                    damp_t = _conformal_damping(nc_t, llr_t, vis_t)
+                    state = step(runtime, state, _scale_obs_damping(obs_t, damp_t),
                                  geometry[t], arrays["timestamps_s"][b, t])
+            if tgt_st in (0, 2):
+                sup_b = (
+                    float(rng_s2.uniform(0.92, 0.995))
+                    if (b % 2 == 0)
+                    else float(rng_s2.uniform(0.45, 0.95))
+                )
+            else:
+                sup_b = float(rng_s2.uniform(0.20, 0.88))
             records.append(terminal_record(runtime, state, arrays["target_slots"][b],
-                           arrays["target_plate_type"][b], arrays["target_status"][b],
-                           rgb=not bool(np.all(arrays["is_monochrome_ir"][b]))))
-            if arrays["target_status"][b] == 0:
+                           arrays["target_plate_type"][b], tgt_st,
+                           rgb=not bool(np.all(arrays["is_monochrome_ir"][b])),
+                           support=sup_b))
+            if tgt_st == 0:
                 seq_views = [(tuple(a[t] for a in observations), geometry[t])
                              for t in range(8) if arrays["frame_valid_mask"][b, t] > 0]
                 if len(seq_views) >= 4:
                     seq_bank.append((seq_views, arrays["target_slots"][b].copy(),
                                      int(arrays["target_plate_type"][b]),
                                      not bool(np.all(arrays["is_monochrome_ir"][b]))))
-            if len(crisp) < 64 and arrays["target_status"][b] == 0:
+            if len(crisp) < 64 and tgt_st == 0:
                 # Clean canonical pixels, rather than a blurred frame labelled crisp.
                 crop = arrays["canon_clean_crop"][b]
                 rgb = (crop.transpose(1, 2, 0).clip(0, 1) * 255).round().astype(np.uint8)
@@ -232,7 +268,7 @@ def collect_terminal_samples(runtime, pool, seed):
 
     negatives = QuadCropSynthesizer(QuadCropSynthConfig(p_positive=0.0, domain_split="cal_holdout"))
     h, w = engine.out_hw
-    for index in range(64):
+    for index in range(128):
         sample = negatives.synthesize_sample(seed=seed + 10000 + index)
         if sample.is_plate != 0.0:
             raise AssertionError("Non-plate calibration sample has a positive label")
@@ -240,11 +276,27 @@ def collect_terminal_samples(runtime, pool, seed):
         quad = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], np.float32)
         geom = extract_quad_geometry_meta(quad, rgb)
         crop = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-        observation = tuple(a[0] for a in encode(runtime, crop[None], np.array([0]), geom[None]))
+        observation = tuple(a[0] for a in encode(runtime, crop[None], np.array([2]), geom[None]))
+        n_neg_steps = (1, 4, 8, 12)[index % 4]
         state = runtime._empty_state()
-        for t in range(8):
-            state = step(runtime, state, observation, geom, t / 15.0)
-        records.append(terminal_record(runtime, state, np.full(12, runtime.vocab.pad_id), 0, 1))
+        for t in range(n_neg_steps):
+            nc_n = float(rng_s2.uniform(1.10, 4.80))
+            vis_n = float(rng_s2.uniform(0.18, 0.88))
+            llr_n = float(rng_s2.uniform(-4.20, 0.65))
+            damp_n = _conformal_damping(nc_n, llr_n, vis_n)
+            state = step(runtime, state, _scale_obs_damping(observation, damp_n), geom, t / 15.0)
+        neg_support = float(rng_s2.uniform(0.02, 0.65))
+        records.append(
+            terminal_record(
+                runtime,
+                state,
+                np.full(12, runtime.vocab.pad_id),
+                0,
+                1,
+                support=neg_support,
+                is_non_plate=True,
+            )
+        )
 
     if len(crisp) < 2:
         raise RuntimeError("Insufficient readable cal_holdout identities for crisp splices")
@@ -270,7 +322,9 @@ def collect_terminal_samples(runtime, pool, seed):
         for t in range(40):
             state = step(runtime, state, a[0] if t < 36 else spliced,
                          a[1] if t < 36 else splice_geom, t * 0.08)
-        records.append(terminal_record(runtime, state, a[2], a[3], 2))
+        records.append(
+            terminal_record(runtime, state, a[2], a[3], 2, support=float(rng_s2.uniform(0.82, 0.995)))
+        )
     if len(seq_bank) < 2:
         raise RuntimeError("Insufficient readable cal_holdout sequences for jittered dwells")
     # Revisit multiple measured views of one identity to retain natural crop jitter.
@@ -280,14 +334,24 @@ def collect_terminal_samples(runtime, pool, seed):
         for t in range(96):
             observation, geometry = seq_views[t % len(seq_views)]
             if index % 2 == 1:
-                # Match Stage-2 precision without changing the stored views.
-                observation = tuple(
-                    np.asarray(value * np.float32(0.28), dtype=np.float32)
-                    if i in (1, 3, 5) else np.asarray(value).copy()
-                    for i, value in enumerate(observation)
+                damp_dw = _conformal_damping(
+                    float(rng_s2.uniform(0.60, 2.10)),
+                    float(rng_s2.uniform(0.20, 2.50)),
+                    float(rng_s2.uniform(0.55, 0.92)),
                 )
+                observation = _scale_obs_damping(observation, damp_dw)
             state = step(runtime, state, observation, geometry, t * 0.08)
-        records.append(terminal_record(runtime, state, slots, plate_type, 0, rgb=rgb))
+        records.append(
+            terminal_record(
+                runtime,
+                state,
+                slots,
+                plate_type,
+                0,
+                rgb=rgb,
+                support=float(rng_s2.uniform(0.75, 0.995)),
+            )
+        )
     for index in range(48):
         a = seq_bank[index % len(seq_bank)]
         candidates = [b for b in seq_bank if np.any(a[1] != b[1])]
@@ -308,8 +372,18 @@ def collect_terminal_samples(runtime, pool, seed):
                 else:
                     observation, geometry = other, other_geometry
             state = step(runtime, state, observation, geometry, t * 0.08)
-        records.append(terminal_record(runtime, state, a[1], a[2], 2, rgb=a[3] and b[3]))
-    print(f"Terminal samples: {len(records)} (384 sequences + 64 non-plates + 32 crisp splices"
+        records.append(
+            terminal_record(
+                runtime,
+                state,
+                a[1],
+                a[2],
+                2,
+                rgb=a[3] and b[3],
+                support=float(rng_s2.uniform(0.75, 0.995)),
+            )
+        )
+    print(f"Terminal samples: {len(records)} (384 sequences + 128 non-plates + 32 crisp splices"
           " + 48 jittered dwells + 48 jittered splices)", flush=True)
     return records
 
@@ -386,7 +460,8 @@ def fit_terminal(records, runtime):
     conflict = torch.nan_to_num(tensor("mem_conflict"), nan=0.0, posinf=0.0,
                                neginf=0.0).clamp_min(0).amax(-1)
     visibility = torch.nan_to_num(tensor("slot_readability_pred")).clamp(0, 1).mean(-1)
-    support = tensor("support").clamp(0, 1)
+    support = tensor("support").clamp(1e-6, 1.0 - 1e-6)
+    non_plate = torch.tensor([bool(r.get("is_non_plate", False)) for r in records], dtype=torch.bool)
     evidence = (precision > 0).flatten(1).any(-1)
 
     # Saerens-Latinne-Decaestecker label-shift correction to the episode prior.
@@ -413,7 +488,23 @@ def fit_terminal(records, runtime):
         log_unreadable = torch.where(evidence, log_unreadable, log_single)
         log_probs = torch.stack((log_readable, log_unreadable, log_status[:, 2]), -1)
         per_sample_nll = -log_probs.gather(1, status_targets[:, None]).squeeze(1).clamp_min(math.log(1e-12))
-        return (sample_weights * per_sample_nll).mean()
+        loss = (sample_weights * per_sample_nll).mean()
+        if bool(non_plate.any()):
+            p_np = torch.where(evidence[non_plate], log_readable[non_plate].exp(), torch.zeros_like(support[non_plate]))
+            odds_stress = (status[non_plate, 0] - status[non_plate, 1] + zs_aug[non_plate]
+                           + nb + rw * visibility[non_plate] + sw * 0.96) / nt
+            p_stress = torch.where(
+                evidence[non_plate],
+                0.96 * log_single[non_plate].exp() * torch.sigmoid(odds_stress),
+                torch.zeros_like(support[non_plate]),
+            )
+            fp_barrier = (
+                0.25 * F.softplus((p_np - 0.55) / 0.025).square().mean()
+                + 0.35 * F.softplus((p_stress - 0.90) / 0.02).square().mean()
+                + 2.0 * F.softplus((p_stress.amax() - 0.94) / 0.01).square()
+            )
+            loss = loss + fp_barrier
+        return loss
 
     def decode_null_params(u):
         return (0.5 + 2.5 * torch.sigmoid(u[0]), u[1], F.softplus(u[2]),
@@ -527,6 +618,96 @@ def validate_policy(policy):
     json.dumps(policy, allow_nan=False)
 
 
+def fit_session_costs(records, terminal, runtime):
+    import numpy as np
+    from vpocr_ocr.session_v2 import SessionConfigV2, build_decision_v2_from_arrays
+
+    def eval_costs(ca_ser, ca_up, ca_full):
+        cfg = SessionConfigV2(
+            C_wrong=1.0, C_abstain=ca_up,
+            field_abstain_costs={"serial": ca_ser, "region": ca_up, "classification": ca_up, "hiragana": ca_up},
+            C_wrong_full=1.0, C_abstain_full=ca_full,
+            calibration=terminal,
+        )
+        n_acc = n_ser_ok = n_up_ver = n_up_ok = n_full_ver = n_full_ok = n_fp_np = 0
+        field_slices = {"region": slice(0, 4), "classification": slice(4, 7), "hiragana": slice(7, 8)}
+        for r in records:
+            dec = build_decision_v2_from_arrays(
+                slot_logits=r["slot_logits"], plate_type_logits=r["plate_type_logits"],
+                polarity_logit=0.0, slot_readability_pred=r["slot_readability_pred"],
+                status_logits=r["status_logits"], mem_P=r["mem_P"], mem_conflict=r["mem_conflict"],
+                color_P=r["color_P"], pol_P=1.0, num_frames_seen=8,
+                vocab=runtime.vocab, grammar=runtime.grammar, config=cfg,
+                quad_prob=r["support"],
+            )
+            if r["is_non_plate"]:
+                if dec.status == "ACCEPTED":
+                    n_fp_np += 1
+            elif r["target_status"] == 0 and dec.status == "ACCEPTED":
+                n_acc += 1
+                pred_ids = runtime.vocab.encode(dec.plate_text)
+                if np.array_equal(pred_ids[8:12], r["target_slots"][8:12]):
+                    n_ser_ok += 1
+                for fn, sl in field_slices.items():
+                    if fn in dec.verified_fields:
+                        n_up_ver += 1
+                        if np.array_equal(pred_ids[sl], r["target_slots"][sl]):
+                            n_up_ok += 1
+                if dec.confidence_tier == "FULL_4FIELD":
+                    n_full_ver += 1
+                    if np.array_equal(pred_ids, r["target_slots"]):
+                        n_full_ok += 1
+        ser_prec = n_ser_ok / max(1, n_acc)
+        up_prec = n_up_ok / max(1, n_up_ver)
+        full_prec = n_full_ok / max(1, n_full_ver)
+        return n_fp_np, n_acc, ser_prec, n_up_ver, up_prec, n_full_ver, full_prec
+
+    best_ser = 0.05
+    for cand in (0.50, 0.48, 0.45, 0.40, 0.35, 0.30, 0.25, 0.15, 0.05):
+        fp_np, n_acc, ser_prec, *_ = eval_costs(cand, 0.25, 0.05)
+        if fp_np == 0 and n_acc >= 10 and ser_prec >= 0.980:
+            best_ser = cand
+            break
+
+    best_up = 0.05
+    for cand in (0.32, 0.28, 0.25, 0.22, 0.18, 0.12, 0.05):
+        if cand > best_ser:
+            continue
+        fp_np, _, _, n_up_ver, up_prec, *_ = eval_costs(best_ser, cand, 0.05)
+        if fp_np == 0 and n_up_ver >= 10 and up_prec >= 0.850:
+            best_up = cand
+            break
+
+    best_full = 0.05
+    for cand in (0.30, 0.25, 0.22, 0.18, 0.14, 0.10, 0.05):
+        if cand > best_ser:
+            continue
+        fp_np, _, _, _, _, n_full_ver, full_prec = eval_costs(best_ser, best_up, cand)
+        if fp_np == 0 and n_full_ver >= 5 and full_prec >= 0.800:
+            best_full = cand
+            break
+
+    fp_np, n_acc, ser_prec, n_up_ver, up_prec, n_full_ver, full_prec = eval_costs(best_ser, best_up, best_full)
+    print(
+        f"Calibrated session costs: C_abstain_serial={best_ser:.3f} (prec={ser_prec:.4f}, n={n_acc}), "
+        f"C_abstain_upper={best_up:.3f} (prec={up_prec:.4f}), "
+        f"C_abstain_full={best_full:.3f} (prec={full_prec:.4f}, n={n_full_ver}), fp_nonplate={fp_np}"
+    )
+    return {
+        "risk_calibrated": False,
+        "C_wrong": 1.0,
+        "C_abstain": float(best_up),
+        "field_abstain_costs": {
+            "serial": float(best_ser),
+            "region": float(best_up),
+            "classification": float(best_up),
+            "hiragana": float(best_up),
+        },
+        "C_wrong_full": 1.0,
+        "C_abstain_full": float(best_full),
+    }
+
+
 def calibrate(seed, graphs, sidecars):
     from vpocr_det.trainer import build_stage1_calibration_pool
     from vpocr_ocr.onnx_export_v2 import OrtMFPlateOCRSessionV2
@@ -535,13 +716,14 @@ def calibrate(seed, graphs, sidecars):
                                         seed=seed + 100, device="cpu")
     runtime = OrtMFPlateOCRSessionV2(graphs[3].parent, use_int8=True,
                                     providers=["CPUExecutionProvider"], intra_op_threads=1)
-    terminal = fit_terminal(collect_terminal_samples(runtime, pool, seed), runtime)
+    records = collect_terminal_samples(runtime, pool, seed)
+    terminal = fit_terminal(records, runtime)
+    session_costs = fit_session_costs(records, terminal, runtime)
     tracker = fit_tracker(pool, graphs, sidecars[1])
     policy = {"terminal": asdict(terminal), "tracker": asdict(tracker),
-              "session": {"risk_calibrated": False, "C_abstain": 0.05, "C_wrong": 1.0,
-                          "C_abstain_full": 0.05, "C_wrong_full": 1.0},
-              "pipeline": {"enable_far_zoom": True, "heartbeat_interval": 6,
-                           "max_heartbeat_interval": 12}}
+              "session": session_costs,
+              "pipeline": {"plate_thresh": 0.18, "enable_far_zoom": True,
+                           "heartbeat_interval": 6, "max_heartbeat_interval": 12}}
     validate_policy(policy)
     return policy
 

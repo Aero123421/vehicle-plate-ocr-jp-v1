@@ -2,7 +2,7 @@
 
 Japanese vehicle detection, tracking & terminal multi-frame plate OCR — **v0.6.5 / Apache-2.0**
 
-日本の車両・ナンバープレートを検出し、複数フレームの光学的な特徴量から車番を読み出すモデルです。配布する **7 個の INT8 ONNX グラフと 3 個の校正 JSON は合計 10,643,833 bytes（10.15 MiB）**。`web/models/` に同梱し、実写評価データや学習チェックポイントを取得せずに利用できます。
+日本の車両・ナンバープレートを検出し、複数フレームの光学的な特徴量から車番を読み出すモデルです。配布する **7 個の INT8 ONNX グラフと 3 個の校正 JSON は合計 12,978,992 bytes（12.38 MiB）**。`web/models/` に同梱し、実写評価データや学習チェックポイントを取得せずに利用できます。
 
 ## 推論の構成
 
@@ -125,7 +125,7 @@ python tools/calibrate_policy.py --audit-only
 python tools/calibrate_policy.py
 ```
 
-学習スクリプトはチェックポイント、FP32 / INT8 ONNX、数値 parity 検証、ソース・フォント・教師モデルのハッシュ記録まで実行します。短縮実行は性能検証の代わりにはなりません。`calibrate_policy.py` は CPU で終端判定と追跡方策を校正し、公開 `create_predictor()` による短い手続き生成 MP4 の smoke test と `__pycache__` の掃除を行います。`--audit-only` は指定した校正 JSON を再利用し、校正値・モデルを更新しません。配布バンドルの既存合計は **10.15 MiB** です。
+学習スクリプトはチェックポイント、FP32 / INT8 ONNX、数値 parity 検証、ソース・フォント・教師モデルのハッシュ記録まで実行します。短縮実行は性能検証の代わりにはなりません。`calibrate_policy.py` は CPU で終端判定と追跡方策を校正し、公開 `create_predictor()` による短い手続き生成 MP4 の smoke test と `__pycache__` の掃除を行います。`--audit-only` は指定した校正 JSON を再利用し、校正値・モデルを更新しません。配布バンドルの合計は **12.38 MiB** です。
 
 再学習の成果物は `web/models/` に自動コピーしません。ブラウザー用に配布するときは、Nano の検出・cutout（`out/models/onnx_temporal_det_nano/`）、`stage2.int8.onnx`（`out/models/onnx_det_v4/`）、OCR の 4 個の INT8 グラフ（`out/models/onnx_v2_nano/`）、3 個の校正 JSON（`out/calibration/`）を明示的に `web/models/` へコピーし、`--audit-only` で再確認してください。文法表は上記の再生成コマンドで更新できます。
 

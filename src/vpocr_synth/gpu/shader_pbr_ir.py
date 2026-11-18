@@ -25,7 +25,16 @@ from vpocr_synth.gpu.homography_fast import (
     TrajectoryBatch,
     project_plate_ray_grid_roi,
 )
-from vpocr_synth.plate.surface_25d import EXT_H, EXT_W, PAD_X, PAD_Y, PLATE_H, PLATE_W, PlateSurface25DPacket
+from vpocr_synth.plate.surface_25d import (
+    EXT_H,
+    EXT_W,
+    PAD_X,
+    PAD_Y,
+    PLATE_H,
+    PLATE_W,
+    PlateSurface25DPacket,
+    get_default_nonplate_stencil_atlas,
+)
 
 
 @dataclass
@@ -149,7 +158,7 @@ def _secant_refine_impl(
     hs_all = hs_raw.reshape(bsz, seq_len, 4, SENSOR_ROI_H, SENSOR_ROI_W)
     front_no_seal = ((plate_sides == 0) & has_seal[:, None])[:, :, None, None, None]
     hs_all = torch.where(
-        front_no_seal & (hs_all > 4.2) & (xh_all < 76.0) & (yh_all < 42.0),
+        front_no_seal & (hs_all > 4.2) & (xh_all < 92.0) & (yh_all < 46.0),
         4.0,
         hs_all,
     )
@@ -238,6 +247,7 @@ def _brdf_core_impl(
     night_bt: torch.Tensor,        # (N,) bool
     sides_bt: torch.Tensor,        # (N,) int64
     illum_flat: torch.Tensor,      # (N,) bool
+    base_pol_flat: torch.Tensor,   # (N,) float32 (+1 bright bg, -1 dark bg)
     ir_pow: torch.Tensor,          # (N, 1, 1, 1)
     g_amp: torch.Tensor,           # (N, 1, 1, 1)
     rand_u: torch.Tensor,          # (N, 6) float32 in [0, 1)
@@ -323,15 +333,30 @@ def _brdf_core_impl(
     diffuse_and_retro = alb_rgb * illum_tint * (
         amb_level + dir_level * ndotl * shadow_mult + retro * retro_rgb_gain
     )
+    # Glossy dark-plate sky-sheen + white/yellow stroke HDR radiance push on commercial green/black plates
+    is_dark_pol = (base_pol_flat < 0.0)[:, None, None, None].float()
+    day_vis_f = (~night_bt)[:, None, None, None].float()
+    stroke_bright = (alb_rgb.amax(dim=1, keepdim=True) > 0.62).float()
+    diffuse_and_retro = diffuse_and_retro * (1.0 + 0.24 * is_dark_pol * stroke_bright * (1.0 - 0.5 * night_bt[:, None, None, None].float()))
+
+    gloss_factor = ((0.40 - rough) / 0.30).clamp(0.0, 1.0)
+    dark_sky_sheen = (
+        day_vis_f
+        * is_dark_pol
+        * (0.14 + 0.16 * cool_sky_w[:, :, None, None])
+        * (1.0 - 0.32 * ndotv)
+        * gloss_factor
+        * c_sky[:, :, None, None]
+    )
     # Cool sky-dome / open-shade Fresnel sheen on glossy painted plates under overcast/ferry/gate skies
     cool_sheen = (
-        ((~night_bt)[:, None, None, None].float())
+        day_vis_f
         * cool_sky_w[:, :, None, None]
         * (0.14 * (1.0 - 0.40 * ndotv) * (1.0 - 0.55 * rough))
         * c_sky[:, :, None, None]
     )
     emis_gain = torch.where(night_bt[:, None, None, None], 1.15, 0.08)
-    hdr_vis = diffuse_and_retro + spec_term * spec_tint + cool_sheen + emis_rgb * emis_gain + brake_spill
+    hdr_vis = diffuse_and_retro + spec_term * spec_tint + cool_sheen + dark_sky_sheen + emis_rgb * emis_gain + brake_spill
 
     is_940 = (ir_bt == 2)[:, None, None, None]
     qe_nir = torch.where(is_940, 0.58, 0.92)
@@ -424,9 +449,17 @@ def _shader_slot_tail_impl(
         sensor_ir_mode > 0,
         torch.ones_like(base_pol_bt),
         torch.where(
-            night_illum_active | is_glare_reg.reshape(bsz, seq_len),
-            torch.full_like(base_pol_bt, 0.75),
-            torch.full_like(base_pol_bt, 0.25),
+            polarity_target < 0.0,
+            torch.where(
+                night_illum_active | is_glare_reg.reshape(bsz, seq_len),
+                torch.full_like(base_pol_bt, 0.85),
+                torch.full_like(base_pol_bt, 0.68),
+            ),
+            torch.where(
+                night_illum_active | is_glare_reg.reshape(bsz, seq_len),
+                torch.full_like(base_pol_bt, 0.75),
+                torch.full_like(base_pol_bt, 0.25),
+            ),
         ),
     )
     return slot_glare, contrast_surv, is_mono_ir, polarity_target, ir_hal_gain
@@ -590,14 +623,43 @@ class ReliefPBRShaderGPU:
             y_hit_bt,
         )
 
-        sampled_b = (
-            F.grid_sample(
-                gbuf_pri, grid_hit_b, mode="bilinear", padding_mode="border", align_corners=False
+        # Pre-filter 2.5D G-buffer by projected sensor footprint scale_uv = max(1.0, 160.0 / w_target_px)
+        if traj.w_target_px is not None:
+            w_t_px = traj.w_target_px.float()
+        else:
+            w_top = torch.linalg.norm(traj.corners_roi_gt[:, :, 1] - traj.corners_roi_gt[:, :, 0], dim=-1)
+            w_bot = torch.linalg.norm(traj.corners_roi_gt[:, :, 2] - traj.corners_roi_gt[:, :, 3], dim=-1)
+            w_t_px = 0.5 * (w_top + w_bot)
+        scale_uv = (160.0 / w_t_px.clamp_min(10.0)).clamp(1.0, 16.0)
+        lod_bt = torch.log2(scale_uv)  # (B, T) in [0.0, 4.0]
+
+        def _mip_sample(gbuf: torch.Tensor, g_hit: torch.Tensor, lod: torch.Tensor) -> torch.Tensor:
+            nb, ch_g = gbuf.shape[:2]
+            g1 = F.avg_pool2d(gbuf, kernel_size=2, stride=2)
+            g2 = F.avg_pool2d(g1, kernel_size=2, stride=2)
+            g3 = F.avg_pool2d(g2, kernel_size=2, stride=2)
+            g4 = F.avg_pool2d(g3, kernel_size=2, stride=2)
+            s0 = F.grid_sample(gbuf, g_hit, mode="bilinear", padding_mode="border", align_corners=False)
+            s1 = F.grid_sample(g1, g_hit, mode="bilinear", padding_mode="border", align_corners=False)
+            s2 = F.grid_sample(g2, g_hit, mode="bilinear", padding_mode="border", align_corners=False)
+            s3 = F.grid_sample(g3, g_hit, mode="bilinear", padding_mode="border", align_corners=False)
+            s4 = F.grid_sample(g4, g_hit, mode="bilinear", padding_mode="border", align_corners=False)
+            lf = lod.clamp(0.0, 4.0).to(dtype=gbuf.dtype)[:, None, :, None, None]
+            w0 = (1.0 - lf).clamp(0.0, 1.0)
+            w1 = (1.0 - (lf - 1.0).abs()).clamp(0.0, 1.0)
+            w2 = (1.0 - (lf - 2.0).abs()).clamp(0.0, 1.0)
+            w3 = (1.0 - (lf - 3.0).abs()).clamp(0.0, 1.0)
+            w4 = (lf - 3.0).clamp(0.0, 1.0)
+            blended = (
+                w0 * s0.reshape(nb, ch_g, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
+                + w1 * s1.reshape(nb, ch_g, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
+                + w2 * s2.reshape(nb, ch_g, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
+                + w3 * s3.reshape(nb, ch_g, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
+                + w4 * s4.reshape(nb, ch_g, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
             )
-            .reshape(bsz, 13, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
-            .permute(0, 2, 1, 3, 4)
-            .contiguous()
-        )
+            return blended.permute(0, 2, 1, 3, 4).contiguous()
+
+        sampled_b = _mip_sample(gbuf_pri, grid_hit_b, lod_bt)
         del gbuf_pri
 
         base_pol_bt = surface.base_polarity[:, None].expand(bsz, seq_len).clone()
@@ -623,13 +685,7 @@ class ReliefPBRShaderGPU:
             )
             gbuf_sec = gbuf_sec_full[:n_sec]
             g_hit_sec = grid_hit_b.index_select(0, idx_t)
-            samp_sec = (
-                F.grid_sample(
-                    gbuf_sec, g_hit_sec, mode="bilinear", padding_mode="border", align_corners=False
-                )
-                .reshape(n_sec, 13, seq_len, SENSOR_ROI_H, SENSOR_ROI_W)
-                .permute(0, 2, 1, 3, 4)
-            )
+            samp_sec = _mip_sample(gbuf_sec, g_hit_sec, lod_bt.index_select(0, idx_t))
             sp_sub = traj.splice_second_plate.index_select(0, idx_t)
             sampled_b[idx_t] = torch.where(sp_sub[:, :, None, None, None], samp_sec, sampled_b[idx_t])
             base_pol_bt[idx_t] = torch.where(
@@ -746,6 +802,7 @@ class ReliefPBRShaderGPU:
             night_bt,
             traj.plate_sides.reshape(n_bt),
             illum_bt.reshape(n_bt),
+            base_pol_bt.reshape(n_bt),
             ir_pow,
             g_amp,
             rand_pack[:, 7:13].contiguous(),
@@ -759,16 +816,17 @@ class ReliefPBRShaderGPU:
         )
         del sampled, x_hit, y_hit, h_hit_flat, h_lblk
 
-        # Sparse CPU-indexed negative_garbage ROI synthesis (zero GPU sync!)
+        # Sparse CPU-indexed negative_garbage ROI synthesis (68% NonPlateStencilAtlas text-bearing signs/decals + 32% procedural grilles!)
         garb_seq_idx = [i for i, tag in enumerate(traj.regime_tags) if tag == "negative_garbage"]
         if garb_seq_idx:
             hdr_bt = hdr_roi.reshape(bsz, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W)
             idx_g = torch.from_numpy(np.asarray(garb_seq_idx, dtype=np.int64)).to(dev)
-            n_g = len(garb_seq_idx) * seq_len
+            n_g_seq = len(garb_seq_idx)
+            n_g = n_g_seq * seq_len
             is_ir_g = (traj.sensor_ir_mode.index_select(0, idx_g) > 0).reshape(n_g)
             r_garb = torch.rand((n_g, 3), generator=gen, device=dev)
             low_tex_g = torch.rand((n_g, 3, 7, 11), generator=gen, device=dev)
-            hdr_bt[idx_g] = _dispatch_cuda(
+            proc_garb = _dispatch_cuda(
                 "garbage",
                 _garbage_roi_impl,
                 yy_roi,
@@ -776,7 +834,46 @@ class ReliefPBRShaderGPU:
                 r_garb,
                 low_tex_g,
                 is_ir_g,
-            ).reshape(len(garb_seq_idx), seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W)
+            ).reshape(n_g_seq, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W)
+
+            stencil_bank = get_default_nonplate_stencil_atlas().to_torch(dev)
+            st_idx = torch.randint(0, stencil_bank.shape[0], (n_g_seq,), generator=gen, device=dev)
+            st_seq = stencil_bank.index_select(0, st_idx)  # (G, 3, 96, 160)
+            # Project text-bearing non-plate stencil across T trajectory frames with consistent drift
+            st_u = torch.rand((n_g_seq, 6), generator=gen, device=dev)
+            t_lin_g = (
+                torch.linspace(-0.5, 0.5, seq_len, device=dev, dtype=torch.float32)[None, :]
+                if seq_len > 1
+                else torch.zeros((1, 1), device=dev, dtype=torch.float32)
+            )
+            sx_g = (0.78 + 0.42 * st_u[:, 0:1]).expand(n_g_seq, seq_len).reshape(n_g, 1)
+            sy_g = (0.78 + 0.42 * st_u[:, 1:2]).expand(n_g_seq, seq_len).reshape(n_g, 1)
+            sh_g = (-0.12 + 0.24 * st_u[:, 2:3]).expand(n_g_seq, seq_len).reshape(n_g, 1)
+            tx_g = ((-0.14 + 0.28 * st_u[:, 3:4]) + (-0.08 + 0.16 * st_u[:, 4:5]) * t_lin_g).reshape(n_g, 1)
+            ty_g = ((-0.12 + 0.24 * st_u[:, 4:5]) + (-0.06 + 0.12 * st_u[:, 3:4]) * t_lin_g).reshape(n_g, 1)
+            theta_g = torch.stack(
+                [
+                    torch.cat([sx_g, sh_g, tx_g], dim=1),
+                    torch.cat([torch.zeros_like(sx_g), sy_g, ty_g], dim=1),
+                ],
+                dim=1,
+            )
+            grid_g = F.affine_grid(theta_g, size=[n_g, 3, SENSOR_ROI_H, SENSOR_ROI_W], align_corners=False)
+            st_bt = F.grid_sample(
+                st_seq[:, None].expand(n_g_seq, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W).reshape(n_g, 3, SENSOR_ROI_H, SENSOR_ROI_W),
+                grid_g,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+            gain_g = (0.52 + 0.68 * st_u[:, 5:6])[:, :, None, None, None].expand(n_g_seq, seq_len, 1, 1, 1).reshape(n_g, 1, 1, 1)
+            st_bt = st_bt * gain_g
+            st_mono = (0.299 * st_bt[:, 0:1] + 0.587 * st_bt[:, 1:2] + 0.114 * st_bt[:, 2:3]).expand_as(st_bt)
+            st_bt = torch.where(is_ir_g[:, None, None, None], st_mono, st_bt).reshape(
+                n_g_seq, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W
+            )
+            use_stencil = (torch.rand((n_g_seq, 1, 1, 1, 1), generator=gen, device=dev) < 0.68)
+            hdr_bt[idx_g] = torch.where(use_stencil, st_bt, proc_garb)
             hdr_roi = hdr_bt.reshape(n_bt, 3, SENSOR_ROI_H, SENSOR_ROI_W)
 
         # 5. Fused Per-Slot Glare, Polarity & Readability Survival Tail

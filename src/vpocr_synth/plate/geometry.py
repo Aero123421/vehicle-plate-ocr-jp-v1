@@ -192,10 +192,10 @@ class PlateGeometry:
             cls_cw = base_cls_cw
         elif cls_len == 2:
             cls_cw = 29.0
-            base_gap += 6.0
+            base_gap += 9.0
         else:
             cls_cw = 30.0
-            base_gap += 14.0
+            base_gap += 18.0
 
         if jitter_rng is not None:
             up_scale_h = jitter_rng.uniform(0.94, 1.05)
@@ -209,7 +209,13 @@ class PlateGeometry:
             elif reg_len >= 3:
                 inter_reg_gap = max(0.0, inter_reg_gap + jitter_rng.uniform(-1.0, 1.5))
             cls_cw = cls_cw * jitter_rng.uniform(0.95, 1.04)
-            gap = max(6.5, base_gap + jitter_rng.uniform(-2.5, 8.0))
+            if cls_len == 3:
+                gap_lo, gap_hi = -2.5, 8.0
+            elif cls_len == 2:
+                gap_lo, gap_hi = -7.0, 16.0
+            else:
+                gap_lo, gap_hi = -12.0, 24.0
+            gap = max(6.5, base_gap + jitter_rng.uniform(gap_lo, gap_hi))
             x_shift = jitter_rng.uniform(-8.0, 4.5) if reg_len == 1 else jitter_rng.uniform(-4.0, 5.0)
             reg_x0 = base_reg_x0 + x_shift
         else:
@@ -432,10 +438,10 @@ class PlateGeometry:
             cls_cw = base_cls_cw
         elif cls_len == 2:
             cls_cw = 35.0
-            base_gap += 8.0
+            base_gap += 11.5
         else:
             cls_cw = 37.0
-            base_gap += 16.0
+            base_gap += 22.0
 
         if jitter_rng is not None:
             up_scale_h = jitter_rng.uniform(0.94, 1.05)
@@ -449,7 +455,13 @@ class PlateGeometry:
             elif reg_len >= 3:
                 inter_reg_gap = max(0.0, inter_reg_gap + jitter_rng.uniform(-1.0, 1.5))
             cls_cw = cls_cw * jitter_rng.uniform(0.95, 1.04)
-            gap = max(8.0, base_gap + jitter_rng.uniform(-3.0, 8.0))
+            if cls_len == 3:
+                gap_lo, gap_hi = -3.0, 8.0
+            elif cls_len == 2:
+                gap_lo, gap_hi = -8.5, 20.0
+            else:
+                gap_lo, gap_hi = -15.0, 30.0
+            gap = max(8.0, base_gap + jitter_rng.uniform(gap_lo, gap_hi))
             x_shift = jitter_rng.uniform(-9.0, 5.0) if reg_len == 1 else jitter_rng.uniform(-3.0, 6.0)
             reg_x0 = base_reg_x0 + x_shift
         else:

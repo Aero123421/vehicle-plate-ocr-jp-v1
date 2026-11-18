@@ -154,7 +154,7 @@ function invert4x4(m) {
 export function createOpticalRef(patchU8, corners) {
   if (!patchU8 || patchU8.length !== N_FINE) return null;
   const basis = quadBasis(corners);
-  if (basis.width < 18 || basis.height < 9) return null;
+  if (basis.width < 10.0 || basis.height < 4.8) return null;
   let sum = 0;
   for (let i = 0; i < N_FINE; i++) sum += patchU8[i];
   const mean = sum / N_FINE;
@@ -164,7 +164,7 @@ export function createOpticalRef(patchU8, corners) {
     sq += d * d;
   }
   const std = Math.sqrt(sq / N_FINE);
-  if (std < 5.5) return null; // Insufficient contrast for optical lock.
+  if (std < 2.8) return null; // Insufficient contrast for optical lock.
 
   const tpl = new Float32Array(N_FINE);
   const invStd = 1 / std;
@@ -225,7 +225,8 @@ export function createOpticalRef(patchU8, corners) {
     }
   }
   // Reject pure horizontal stripes (grilles/hoods lacking vertical character strokes).
-  if (H[0] < 14.0 || H[0] < 0.11 * H[5]) return null;
+  const minH0 = basis.width < 18.0 ? 5.5 : 14.0;
+  if (H[0] < minH0 || H[0] < 0.09 * H[5]) return null;
 
   // Symmetrize & add Tikhonov damping on scale DOFs so pure 1D stripes never cause ill-conditioning.
   H[4] = H[1]; H[8] = H[2]; H[12] = H[3];
@@ -279,7 +280,7 @@ function evalCoarseZncc(ref, sampleFn, w, h, tu, tv, su, sv) {
     sq += d * d;
     dot += d * tplC[i];
   }
-  if (sq < 12 * N_COARSE) return -1;
+  if (sq < 6.25 * N_COARSE) return -1;
   return dot / Math.sqrt(sq);
 }
 
@@ -302,8 +303,8 @@ export function trackPlateOpticalCore(
   if (effRadX > 1.5) {
     const radU = clamp(effRadX / Math.max(8, basis.width * OPT_SPAN), 0.02, 1.6);
     const radV = clamp(effRadY / Math.max(6, basis.height * OPT_SPAN), 0.02, 1.3);
-    const stepsU = Math.min(6, Math.max(2, Math.round(effRadX / Math.max(3.5, 0.14 * basis.width))));
-    const stepsV = Math.min(5, Math.max(2, Math.round(effRadY / Math.max(2.5, 0.18 * basis.height))));
+    const stepsU = Math.min(10, Math.max(2, Math.round(effRadX / Math.max(1.1, 0.14 * basis.width))));
+    const stepsV = Math.min(8, Math.max(2, Math.round(effRadY / Math.max(0.9, 0.18 * basis.height))));
     const stepU = radU / stepsU;
     const stepV = radV / stepsV;
 
@@ -395,7 +396,7 @@ export function trackPlateOpticalCore(
       sq += d * d;
     }
     const std = Math.sqrt(sq / N_FINE);
-    if (std < 4.5) return { ok: false, zncc: -1 };
+    if (std < 2.4) return { ok: false, zncc: -1 };
     const invStd = 1 / std;
 
     let b0 = 0, b1 = 0, b2 = 0, b3 = 0;
@@ -456,7 +457,7 @@ export function trackPlateOpticalCore(
       sq += d * d;
       dot += d * tpl[i];
     }
-    finalZncc = sq > 16 * N_FINE ? dot / Math.sqrt(sq * N_FINE) : -1;
+    finalZncc = sq > 5.76 * N_FINE ? dot / Math.sqrt(sq * N_FINE) : -1;
   }
 
   if (finalZncc < minZncc) return { ok: false, zncc: finalZncc };

@@ -41,7 +41,9 @@ class TrainConfigV2:
     compute_garbage_invariance: bool = True
     long_horizon_prob: float = 0.28
     approach_batch_prob: float = 0.30
-    approach_seq_len_range: tuple[int, int] = (24, 40)
+    approach_seq_len_range: tuple[int, int] = (20, 24)
+    label_smoothing_start: float = 0.006
+    label_smoothing_end: float = 0.001
     curriculum_fractions: tuple[float, float, float] = (0.20, 0.50, 0.80)
     curriculum_stages: tuple[int, int, int, int] = (1, 2, 3, 4)
     num_workers: int = 0
@@ -993,11 +995,24 @@ class OCRTrainerV2:
         scaler = torch.amp.GradScaler("cuda", enabled=use_fp16_scaler)
 
         next_batch = self._build_batch_iterator(train_source)
-        supports_approach_kw = bool(
-            hasattr(train_source, "sample_batch")
-            and callable(train_source.sample_batch)
-            and "approach_prob" in inspect.signature(train_source.sample_batch).parameters
-            and "seq_len" in inspect.signature(train_source.sample_batch).parameters
+        sample_sig_params = (
+            set(inspect.signature(train_source.sample_batch).parameters.keys())
+            if (hasattr(train_source, "sample_batch") and callable(train_source.sample_batch))
+            else set()
+        )
+        supports_approach_kw = bool("approach_prob" in sample_sig_params and "seq_len" in sample_sig_params)
+        supports_lowres_kw = bool("lowres_sr_prob" in sample_sig_params)
+        seq_time_keys = (
+            "crops",
+            "geom_meta",
+            "camera_ids",
+            "plate_sides",
+            "frame_valid_mask",
+            "slot_readability",
+            "slot_glare",
+            "frame_slot_targets",
+            "is_monochrome_ir",
+            "stroke_mask_gt",
         )
         history: list[dict[str, float]] = []
         curriculum_transitions: list[tuple[int, int]] = []
@@ -1010,6 +1025,12 @@ class OCRTrainerV2:
                 active_stage_idx = new_stage_idx
                 applied_stage = self._apply_curriculum_hook(train_source, active_stage_idx)
                 curriculum_transitions.append((step, applied_stage))
+
+            step_frac = float(step) / float(max(1, num_steps - 1))
+            self.criterion.label_smoothing = float(
+                self.config.label_smoothing_start
+                + (self.config.label_smoothing_end - self.config.label_smoothing_start) * step_frac
+            )
 
             lr_now = self._compute_lr(step, num_steps)
             for pg in optimizer.param_groups:
@@ -1029,8 +1050,43 @@ class OCRTrainerV2:
                 t_app = int(torch.randint(t_lo_i, t_hi_i + 1, (), generator=lh_rng).item())
                 token_budget = max(24, int(self.config.batch_size) * int(self.config.seq_len))
                 bsz_app = max(4, min(int(self.config.batch_size), token_budget // t_app))
-                raw_app = train_source.sample_batch(bsz_app, seq_len=t_app, approach_prob=0.80)
-                batch = _move_batch_v2_to_device(raw_app, self.device)
+                u_traj = float(torch.rand((), generator=lh_rng).item())
+                if supports_lowres_kw and u_traj < 0.28:
+                    raw_app = train_source.sample_batch(
+                        bsz_app, seq_len=t_app, approach_prob=0.0, lowres_sr_prob=1.0
+                    )
+                    batch = _move_batch_v2_to_device(raw_app, self.device)
+                elif u_traj < 0.56:
+                    raw_app = train_source.sample_batch(bsz_app, seq_len=t_app, approach_prob=0.88)
+                    batch = _move_batch_v2_to_device(raw_app, self.device)
+                elif u_traj < 0.80:
+                    # Receding `near -> far` trajectory
+                    raw_app = train_source.sample_batch(bsz_app, seq_len=t_app, approach_prob=0.88)
+                    batch = _move_batch_v2_to_device(raw_app, self.device)
+                    rev_mask = batch["target_status"] != 2
+                    if bool(rev_mask.any()):
+                        for tk in seq_time_keys:
+                            tv = batch.get(tk)
+                            if isinstance(tv, torch.Tensor) and tv.ndim >= 2 and tv.shape[1] == t_app:
+                                m_sh = (-1,) + (1,) * (tv.ndim - 1)
+                                batch[tk] = torch.where(rev_mask.view(m_sh), torch.flip(tv, dims=[1]), tv)
+                else:
+                    # Bell-curve `far -> near -> far` pass-by trajectory
+                    t_half = max(6, (t_app + 1) // 2)
+                    raw_app = train_source.sample_batch(bsz_app, seq_len=t_half, approach_prob=0.92)
+                    b_half = _move_batch_v2_to_device(raw_app, self.device)
+                    t_rem = max(2, t_app - t_half)
+                    batch = dict(b_half)
+                    for tk in seq_time_keys:
+                        tv = b_half.get(tk)
+                        if isinstance(tv, torch.Tensor) and tv.ndim >= 2 and tv.shape[1] == t_half:
+                            tail = torch.flip(tv, dims=[1])[:, :t_rem]
+                            batch[tk] = torch.cat([tv, tail], dim=1)
+                    dt_s = (b_half["timestamps_s"][:, -1:] - b_half["timestamps_s"][:, -2:-1]).clamp_min(0.04)
+                    extra_ts = b_half["timestamps_s"][:, -1:] + dt_s * torch.arange(
+                        1, t_rem + 1, device=self.device, dtype=torch.float32
+                    ).unsqueeze(0)
+                    batch["timestamps_s"] = torch.cat([b_half["timestamps_s"], extra_ts], dim=1)
                 sampled_long_approach = True
             else:
                 batch = next_batch()
@@ -1065,7 +1121,7 @@ class OCRTrainerV2:
                     short_pad = torch.where(is_mix_b.unsqueeze(1), torch.zeros_like(short_pad), short_pad)
                     if "slot_readability" in batch:
                         act_read = batch["slot_readability"] * (~short_pad).unsqueeze(-1).float()
-                        wiped_short = act_read.amax(dim=(1, 2)) < 0.18
+                        wiped_short = torch.linalg.vector_norm(act_read, ord=2, dim=1).amax(dim=-1) < 0.095
                         orig_st = batch["target_status"]
                         recomp_st = torch.where(
                             is_mix_b,
@@ -1094,6 +1150,7 @@ class OCRTrainerV2:
                     compute_prefix_readout=True,
                     compute_stroke_mask=want_stroke,
                     init_state=init_state,
+                    target_status=batch.get("target_status"),
                 )
 
             # Loss always evaluated in FP32 outside autocast for strict NaN immunity

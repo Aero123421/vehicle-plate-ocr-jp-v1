@@ -2,47 +2,54 @@
   "pipeline": {
     "enable_far_zoom": true,
     "heartbeat_interval": 6,
-    "max_heartbeat_interval": 12
+    "max_heartbeat_interval": 12,
+    "plate_thresh": 0.18
   },
   "session": {
-    "C_abstain": 0.05,
-    "C_abstain_full": 0.05,
+    "C_abstain": 0.32,
+    "C_abstain_full": 0.25,
     "C_wrong": 1.0,
     "C_wrong_full": 1.0,
+    "field_abstain_costs": {
+      "classification": 0.32,
+      "hiragana": 0.32,
+      "region": 0.32,
+      "serial": 0.5
+    },
     "risk_calibrated": false
   },
   "terminal": {
-    "conflict_weight": 4.1881196204380806e-06,
+    "conflict_weight": 3.748158924818186e-45,
     "identity_probability": 1.0,
-    "mixed_bias": -1.0029645727598038,
+    "mixed_bias": -1.569940333356147,
     "mixed_logit_scale": 1.0,
-    "null_bias": 0.03280672693503174,
-    "null_temperature": 0.6194891629596111,
-    "readability_weight": 6.914824964372873e-10,
-    "readout_precision_ceiling": 2.5,
-    "support_weight": 0.0181642966397107,
-    "temperature": 0.763360669517779
+    "null_bias": -1.1467334450219335,
+    "null_temperature": 0.5,
+    "readability_weight": 19.939472229359833,
+    "readout_precision_ceiling": 48.0,
+    "support_weight": 0.18030725843169287,
+    "temperature": 0.821096051658762
   },
   "tracker": {
     "acceleration_spectral_density": 100.0,
     "appearance_kappa": 12.0,
     "assignment_node_budget": 20000,
-    "birth_odds": 0.042328900672298345,
+    "birth_odds": 0.0477034985341786,
     "c_false": 19.0,
     "c_retain": 1.0,
     "c_retire": 0.01,
     "c_wait": 1.0,
-    "detection_probability": 0.95,
+    "detection_probability": 0.9056603773584906,
     "dormant_after_s": 0.3,
     "innovation_tau_s": 0.5,
     "max_hypotheses": 32,
     "persistent_birth_ratio": 0.25,
     "plate_clutter_density": 1e-20,
     "policy_birth_odds": {
-      "detector_far_zoom": 0.05765769544709412,
-      "detector_full": 0.042328900672298345,
-      "search_measurement": 0.05474256969124608,
-      "standalone_precrop": 0.045270834189361446
+      "detector_far_zoom": 0.049632738535890376,
+      "detector_full": 0.0477034985341786,
+      "search_measurement": 0.05432898392182847,
+      "standalone_precrop": 0.04833477900810257
     },
     "survival_tau_s": 120.0,
     "vehicle_clutter_density": 1e-12

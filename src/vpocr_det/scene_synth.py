@@ -41,6 +41,24 @@ from vpocr_synth.plate.stratified_sampler import StratifiedPlateSampler
 
 QUAD_ROI_H: int = 96
 QUAD_ROI_W: int = 160
+DUAL_CANVAS_H: int = 320
+DUAL_CANVAS_W: int = 480
+
+
+def _build_dct8_matrix_np() -> np.ndarray:
+    mat = np.empty((8, 8), dtype=np.float32)
+    for k in range(8):
+        scale = math.sqrt(1.0 / 8.0) if k == 0 else math.sqrt(2.0 / 8.0)
+        for n in range(8):
+            mat[k, n] = scale * math.cos(math.pi * (2 * n + 1) * k / 16.0)
+    return mat
+
+
+_DCT8_NP: np.ndarray = _build_dct8_matrix_np()
+_DCT8_NP_T: np.ndarray = np.ascontiguousarray(_DCT8_NP.T)
+_DCT8_FREQ_WEIGHT_NP: np.ndarray = (
+    1.0 + 0.22 * (np.arange(8, dtype=np.float32)[:, None] + np.arange(8, dtype=np.float32)[None, :])
+)
 
 
 def det_worker_init_fn(worker_id: int) -> None:
@@ -134,10 +152,17 @@ class _SceneAssetBank:
         self.banner_patches: list[np.ndarray] = []
         self.asphalt_deltas: list[np.ndarray] = []
         self.facade_deltas: list[np.ndarray] = []
+        self.blue_route_patches: list[np.ndarray] = []
+        self.frameless_decal_rgba: list[np.ndarray] = []
+        self.bordered_decal_patches: list[np.ndarray] = []
+        self.multiline_parking_patches: list[np.ndarray] = []
+        self.stratified_plate_buckets: dict[tuple[str, int, bool], list[tuple[_CachedPlateEntry, int]]] = defaultdict(list)
+        self.temporary_plate_pairs: dict[int, list[tuple[_CachedPlateEntry, int]]] = {SIDE_FRONT: [], SIDE_REAR: []}
 
         self._build_text_assets()
         self._build_surface_textures(seed)
         self._build_plate_bank(seed)
+        self._build_stage2_extended_assets(seed)
 
     @classmethod
     def get(cls, bank_size: int = 1080) -> _SceneAssetBank:
@@ -373,6 +398,316 @@ class _SceneAssetBank:
             lst = self.buckets[("standard", side)]
         return self.entries[rng.choice(lst)]
 
+    @staticmethod
+    def _render_frameless_rgba_stencil(
+        text: str,
+        width: int,
+        height: int,
+        fg_rgb: tuple[int, int, int],
+    ) -> np.ndarray:
+        """Render frameless painted body text as RGBA `(H, W, 4)` with zero backing substrate (`alpha == 0` outside strokes)."""
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        chars = [c for c in text if c != " "]
+        if not chars:
+            return rgba
+        font_path = FastPlatePatchRenderer._DEFAULT_BOLD_PATH
+        margin_x = max(3, int(width * 0.04))
+        slot_w = (width - 2 * margin_x) / float(len(chars))
+        th = max(10, int(height * 0.72))
+        oy = (height - th) // 2
+        alpha_acc = np.zeros((height, width), dtype=np.uint8)
+        for i, ch in enumerate(chars):
+            gm = FastPlatePatchRenderer._get_glyph_mask(font_path, ch, "neutral")
+            tw = max(4, int(round(slot_w * 0.88)))
+            rs = cv2.resize(gm, (tw, th), interpolation=cv2.INTER_AREA)
+            ox = int(round(margin_x + i * slot_w + (slot_w - tw) * 0.5))
+            x0, x1 = max(0, ox), min(width, ox + tw)
+            if x1 > x0:
+                alpha_acc[oy : oy + th, x0:x1] = np.maximum(alpha_acc[oy : oy + th, x0:x1], rs[:, : x1 - x0])
+        rgba[:, :, 0] = fg_rgb[0]
+        rgba[:, :, 1] = fg_rgb[1]
+        rgba[:, :, 2] = fg_rgb[2]
+        rgba[:, :, 3] = alpha_acc
+        return rgba
+
+    @staticmethod
+    def _render_blue_route_sign(
+        route_str: str,
+        width: int,
+        height: int,
+        shield_style: bool,
+    ) -> np.ndarray:
+        """Render MLIT national/prefectural blue highway route sign `RGB=(14, 68, 158)` with white border & bold digits."""
+        blue_c = (14, 68, 158)
+        white_c = (246, 248, 250)
+        if shield_style:
+            patch = np.full((height, width, 3), 132, dtype=np.uint8)
+            pts_outer = np.array(
+                [
+                    [int(width * 0.08), int(height * 0.10)],
+                    [int(width * 0.92), int(height * 0.10)],
+                    [int(width * 0.86), int(height * 0.62)],
+                    [width // 2, int(height * 0.94)],
+                    [int(width * 0.14), int(height * 0.62)],
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(patch, pts_outer, white_c, lineType=cv2.LINE_AA)
+            pts_inner = np.array(
+                [
+                    [int(width * 0.13), int(height * 0.16)],
+                    [int(width * 0.87), int(height * 0.16)],
+                    [int(width * 0.81), int(height * 0.60)],
+                    [width // 2, int(height * 0.87)],
+                    [int(width * 0.19), int(height * 0.60)],
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(patch, pts_inner, blue_c, lineType=cv2.LINE_AA)
+        else:
+            patch = np.empty((height, width, 3), dtype=np.uint8)
+            patch[:] = blue_c
+            cv2.rectangle(patch, (2, 2), (width - 3, height - 3), white_c, 3)
+
+        font_path = FastPlatePatchRenderer._DEFAULT_BOLD_PATH
+        chars = list(route_str)
+        span_w = int(width * (0.60 if shield_style else 0.74))
+        x_start = (width - span_w) // 2
+        slot_w = span_w / float(max(1, len(chars)))
+        th = int(height * (0.46 if shield_style else 0.62))
+        oy = int(height * (0.24 if shield_style else 0.19))
+        fg_f = np.array(white_c, dtype=np.float32)
+        for i, ch in enumerate(chars):
+            gm = FastPlatePatchRenderer._get_glyph_mask(font_path, ch, "neutral")
+            tw = max(6, int(round(slot_w * 0.88)))
+            rs = cv2.resize(gm, (tw, th), interpolation=cv2.INTER_AREA)
+            ox = int(round(x_start + i * slot_w + (slot_w - tw) * 0.5))
+            x0, x1 = max(0, ox), min(width, ox + tw)
+            if x1 > x0 and oy + th <= height:
+                a = (rs[:, : x1 - x0].astype(np.float32) / 255.0)[:, :, None]
+                roi = patch[oy : oy + th, x0:x1].astype(np.float32)
+                patch[oy : oy + th, x0:x1] = np.clip(roi * (1.0 - a) + fg_f * a, 0.0, 255.0).astype(np.uint8)
+        return patch
+
+    @classmethod
+    def _render_multiline_sign_patch(
+        cls,
+        top_text: str,
+        bot_text: str,
+        top_bg: tuple[int, int, int],
+        top_fg: tuple[int, int, int],
+        bot_bg: tuple[int, int, int],
+        bot_fg: tuple[int, int, int],
+        border_rgb: tuple[int, int, int],
+    ) -> np.ndarray:
+        w, h = 168, 76
+        top_h = 36
+        p_top = cls._render_label_patch(top_text, w, top_h, top_bg, top_fg, None)
+        p_bot = cls._render_label_patch(bot_text, w, h - top_h, bot_bg, bot_fg, None)
+        out = np.vstack([p_top, p_bot])
+        cv2.rectangle(out, (1, 1), (w - 2, h - 2), border_rgb, 2)
+        cv2.line(out, (2, top_h), (w - 3, top_h), border_rgb, 1)
+        return out
+
+    def _build_stage2_extended_assets(self, seed: int) -> None:
+        """Build Stage-2 structured hard-negative assets & stratified 4-color x class-length plate buckets."""
+        ext_rng = random.Random(int(seed) + 99199)
+
+        # 1. Blue highway / national-route signs (`"319"`, `"246"`, `"16"`, `"R17"`, `"1"`, `"58"`, `"20"`, `"4"`)
+        for r_txt in ("319", "246", "16", "R17", "1", "58", "20", "4"):
+            self.blue_route_patches.append(self._render_blue_route_sign(r_txt, 144, 76, shield_style=False))
+            if not r_txt.startswith("R"):
+                self.blue_route_patches.append(self._render_blue_route_sign(r_txt, 112, 92, shield_style=True))
+
+        # 2. Frameless painted truck-body text stencils (RGBA with zero rectangular backing or border!)
+        frameless_texts = (
+            "スケルトン車",
+            "最大積載量 2000kg",
+            "産廃収集運搬車",
+            "自家用",
+            "最大積載量 5000kg",
+            "一般廃棄物",
+            "限定積載 3000kg",
+        )
+        ink_colors = (
+            (244, 246, 248),
+            (22, 24, 28),
+            (242, 204, 38),
+            (24, 58, 132),
+            (26, 92, 54),
+        )
+        for txt in frameless_texts:
+            for ink in ink_colors:
+                self.frameless_decal_rgba.append(self._render_frameless_rgba_stencil(txt, 184, 42, ink))
+
+        # 3. Bordered payload, speed-limit, hazard, and bolted-blank decals
+        self.bordered_decal_patches.extend(self.sticker_patches)
+        for label, bg_c, fg_c, bd_c in (
+            ("最大積載量 2000kg", (242, 204, 36), (20, 22, 24), (20, 22, 24)),
+            ("最大積載量 4000kg", (244, 246, 244), (20, 22, 26), (20, 22, 26)),
+            ("制限速度 80km/h", (244, 210, 40), (22, 22, 24), (192, 32, 32)),
+            ("危", (22, 24, 26), (242, 198, 32), (242, 198, 32)),
+            ("産廃収集運搬車", (242, 244, 246), (22, 56, 128), (22, 56, 128)),
+        ):
+            w_d = 92 if label == "危" else 152
+            h_d = 54 if label == "危" else 36
+            self.bordered_decal_patches.append(self._render_label_patch(label, w_d, h_d, bg_c, fg_c, bd_c))
+        # Bolted blank chassis / dealer metal plate (zero glyphs)
+        for blank_c in ((214, 218, 224), (36, 40, 46), (28, 72, 48)):
+            bp = np.empty((44, 92, 3), dtype=np.uint8)
+            bp[:] = blank_c
+            cv2.rectangle(bp, (1, 1), (90, 42), (148, 154, 162), 2)
+            cv2.circle(bp, (16, 10), 3, (176, 180, 186), -1)
+            cv2.circle(bp, (76, 10), 3, (176, 180, 186), -1)
+            self.bordered_decal_patches.append(bp)
+
+        # 4. Multiline shop & coin-parking tariff signs (`"24h 最大800円"`, `"P 空車"`)
+        for t1, t2, bg1, fg1, bg2, fg2, bd in (
+            ("P 空車", "24h 最大800円", (18, 62, 158), (246, 248, 250), (246, 246, 242), (204, 34, 36), (18, 62, 158)),
+            ("24h 最大800円", "60分 200円", (204, 34, 36), (248, 248, 246), (246, 246, 244), (22, 28, 42), (204, 34, 36)),
+            ("P 空車", "月極 契約者専用", (22, 98, 56), (246, 248, 246), (244, 246, 242), (24, 34, 88), (22, 98, 56)),
+            ("COIN PARK 24h", "最大 1200円", (246, 208, 38), (20, 22, 26), (24, 48, 122), (248, 246, 240), (22, 24, 28)),
+            ("P 満車", "24h 最大800円", (196, 30, 34), (248, 248, 248), (244, 244, 240), (26, 36, 96), (32, 52, 124)),
+        ):
+            self.multiline_parking_patches.append(self._render_multiline_sign_patch(t1, t2, bg1, fg1, bg2, fg2, bd))
+
+        # 5. Index existing entries + build paired front/rear supplemental registrations for exact Stage-2 strata
+        rear_idx_set: set[int] = set()
+        for (_, s_k), idx_list in self.buckets.items():
+            if s_k == SIDE_REAR:
+                rear_idx_set.update(idx_list)
+
+        for idx, ent in enumerate(self.entries):
+            side_k = SIDE_REAR if idx in rear_idx_set else SIDE_FRONT
+            pid = idx + 1
+            if ent.is_temporary:
+                self.temporary_plate_pairs[side_k].append((ent, pid))
+                continue
+            parts = ent.plate_text_str.split()
+            cls_str = parts[1] if len(parts) >= 2 else "500"
+            is_short = len(cls_str) in (1, 2)
+            ptype = ent.plate_type_str
+            if ptype == PlateType.STANDARD_COMMERCIAL.value:
+                ckey = "green_comm"
+            elif ptype == PlateType.KEI_COMMERCIAL.value:
+                ckey = "black_kei"
+            elif ptype == PlateType.KEI_PRIVATE.value:
+                ckey = "yellow_kei"
+            else:
+                ckey = "white_priv"
+            self.stratified_plate_buckets[(ckey, side_k, is_short)].append((ent, pid))
+
+        sampler = StratifiedPlateSampler(seed=int(seed) + 55111)
+        type_to_rem = {pt_enum: i for i, pt_enum in enumerate(sampler._plate_types)}
+        n_pt = len(sampler._plate_types)
+        next_pid = len(self.entries) + 1
+        color_specs = (
+            ("green_comm", PlateType.STANDARD_COMMERCIAL, ("1", "2", "8", "11", "22", "88", "14", "83")),
+            ("black_kei", PlateType.KEI_COMMERCIAL, ("40", "41", "48", "4", "6", "47")),
+            ("yellow_kei", PlateType.KEI_PRIVATE, ("50", "58", "40", "5", "7", "55")),
+            ("white_priv", PlateType.STANDARD_PRIVATE, ("3", "5", "33", "55", "77", "88", "11", "34")),
+        )
+        sup_counter = 0
+        for ckey, pt_enum, short_pool in color_specs:
+            for is_short in (True, False):
+                need = max(
+                    18,
+                    36 - min(
+                        len(self.stratified_plate_buckets[(ckey, SIDE_FRONT, is_short)]),
+                        len(self.stratified_plate_buckets[(ckey, SIDE_REAR, is_short)]),
+                    ),
+                )
+                for _ in range(need):
+                    sup_counter += 1
+                    s_seed = (sup_counter * 29 + 7) * n_pt + type_to_rem[pt_enum]
+                    pt, cfg = sampler.sample(seed=s_seed)
+                    want_large = (pt_enum == PlateType.STANDARD_COMMERCIAL and ext_rng.random() < 0.55) or (
+                        pt_enum == PlateType.STANDARD_PRIVATE and ext_rng.random() < 0.16
+                    )
+                    p_size = PlateSize.LARGE if want_large else PlateSize.MEDIUM
+                    if is_short:
+                        cls_tok = ext_rng.choice(short_pool)
+                        if p_size == PlateSize.LARGE and cls_tok[0] not in ("1", "2", "8", "9"):
+                            cls_tok = ext_rng.choice(("1", "2", "8", "11", "22", "88"))
+                        pt = replace(pt, classification=cls_tok)
+                    elif len(pt.classification) != 3:
+                        prefix = ext_rng.choice(("1", "2", "8")) if p_size == PlateSize.LARGE else ext_rng.choice(("3", "5", "4", "8"))
+                        pt = replace(pt, classification=prefix + f"{ext_rng.randint(0, 99):02d}")
+                    elif p_size == PlateSize.LARGE and pt.classification[0] not in ("1", "2", "8", "9", "0"):
+                        pt = replace(pt, classification=ext_rng.choice(("1", "2", "8")) + pt.classification[1:])
+
+                    has_frame = ext_rng.random() < 0.26
+                    frame_style = ("chrome" if ext_rng.random() < 0.55 else "black") if has_frame else None
+                    weath = ext_rng.uniform(0.08, 0.55) if ext_rng.random() < 0.40 else 0.0
+                    mud = ext_rng.uniform(0.06, 0.36) if ext_rng.random() < 0.24 else 0.0
+                    can_seal = pt_enum in (PlateType.STANDARD_PRIVATE, PlateType.STANDARD_COMMERCIAL, PlateType.GRAPHIC)
+                    reg_pid = next_pid
+                    next_pid += 1
+
+                    for is_rear_side, side_k in ((False, SIDE_FRONT), (True, SIDE_REAR)):
+                        rcfg = replace(
+                            cfg,
+                            plate_type=pt_enum,
+                            plate_size=p_size,
+                            with_seal=(is_rear_side and can_seal),
+                            plate_frame=has_frame,
+                            weathering=weath,
+                            mud_level=mud,
+                            is_illuminated=False,
+                            seed=90000 + sup_counter * 2 + int(is_rear_side),
+                        )
+                        p_full, _ = FastPlatePatchRenderer.render_patch(
+                            pt,
+                            rcfg,
+                            scale=0.60,
+                            temporary_plate=False,
+                            frame_style=frame_style,
+                        )
+                        fh, fw = p_full.shape[:2]
+                        ent_s2 = _CachedPlateEntry(
+                            patch_full=p_full,
+                            patch_half=cv2.resize(p_full, (max(32, fw // 2), max(16, fh // 2)), interpolation=cv2.INTER_AREA),
+                            patch_quarter=cv2.resize(p_full, (max(18, fw // 4), max(9, fh // 4)), interpolation=cv2.INTER_AREA),
+                            patch_tiny=cv2.resize(p_full, (28, 14), interpolation=cv2.INTER_AREA),
+                            plate_text_str=pt.full_text,
+                            plate_type_str=pt_enum.value,
+                            is_large=(p_size == PlateSize.LARGE),
+                            with_seal=rcfg.with_seal,
+                            is_temporary=False,
+                            has_frame=has_frame,
+                        )
+                        self.stratified_plate_buckets[(ckey, side_k, is_short)].append((ent_s2, reg_pid))
+
+    def pick_stratified_plate(
+        self,
+        plate_side: int,
+        rng: random.Random,
+        p_temporary: float = 0.03,
+    ) -> tuple[_CachedPlateEntry, int]:
+        """Sample positive plate with exact 28% green / 18% black kei / 18% yellow kei / 36% white & 30% 1/2-digit class."""
+        side = SIDE_REAR if plate_side == SIDE_REAR else SIDE_FRONT
+        if p_temporary > 0.0 and rng.random() < p_temporary:
+            t_lst = self.temporary_plate_pairs.get(side)
+            if t_lst:
+                return rng.choice(t_lst)
+        u_c = rng.random()
+        if u_c < 0.28:
+            ckey = "green_comm"
+        elif u_c < 0.46:
+            ckey = "black_kei"
+        elif u_c < 0.64:
+            ckey = "yellow_kei"
+        else:
+            ckey = "white_priv"
+        is_short = rng.random() < 0.30
+        lst = self.stratified_plate_buckets.get((ckey, side, is_short))
+        if not lst:
+            lst = self.stratified_plate_buckets.get((ckey, side, not is_short))
+        if not lst:
+            ent_fb = self.pick_plate("standard", side, rng, p_temporary=0.0)
+            return ent_fb, 1
+        return rng.choice(lst)
+
 
 @dataclass
 class SceneSynthConfig:
@@ -445,6 +780,152 @@ def _warp_patch_into_canvas(
     roi = canvas[y0:y1, x0:x1]
     a = (mask.astype(np.uint16))[:, :, None]
     canvas[y0:y1, x0:x1] = ((warped.astype(np.uint16) * a + roi.astype(np.uint16) * (255 - a)) >> 8).astype(np.uint8)
+
+
+def _warp_rgba_patch_into_canvas(
+    canvas: np.ndarray,
+    rgba_patch: np.ndarray,
+    dst_corners_xy: np.ndarray,
+    opacity: float = 0.94,
+) -> None:
+    """Perspective-warp frameless RGBA stencil `(H, W, 4)` onto `canvas` with zero rectangular backing or border."""
+    h_img, w_img = canvas.shape[:2]
+    x0 = max(0, int(math.floor(float(np.min(dst_corners_xy[:, 0])))) - 1)
+    y0 = max(0, int(math.floor(float(np.min(dst_corners_xy[:, 1])))) - 1)
+    x1 = min(w_img, int(math.ceil(float(np.max(dst_corners_xy[:, 0])))) + 2)
+    y1 = min(h_img, int(math.ceil(float(np.max(dst_corners_xy[:, 1])))) + 2)
+    rw = x1 - x0
+    rh = y1 - y0
+    if rw < 2 or rh < 2:
+        return
+
+    src_img = rgba_patch
+    ph, pw = src_img.shape[:2]
+    if rw < pw * 0.72 or rh < ph * 0.72:
+        pre_w = max(8, min(pw, int(round(rw * 1.35))))
+        pre_h = max(4, min(ph, int(round(rh * 1.35))))
+        src_img = cv2.resize(src_img, (pre_w, pre_h), interpolation=cv2.INTER_AREA)
+        ph, pw = src_img.shape[:2]
+
+    src_pts = np.array(
+        [[0.0, 0.0], [float(pw), 0.0], [float(pw), float(ph)], [0.0, float(ph)]],
+        dtype=np.float32,
+    )
+    local_dst = dst_corners_xy.astype(np.float32).copy()
+    local_dst[:, 0] -= float(x0)
+    local_dst[:, 1] -= float(y0)
+
+    H = cv2.getPerspectiveTransform(src_pts, local_dst)
+    warped = cv2.warpPerspective(
+        src_img,
+        H,
+        (rw, rh),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+    a = (warped[:, :, 3:4].astype(np.float32) * (float(opacity) / 255.0))
+    roi = canvas[y0:y1, x0:x1].astype(np.float32)
+    canvas[y0:y1, x0:x1] = np.clip(roi * (1.0 - a) + warped[:, :, :3].astype(np.float32) * a, 0.0, 255.0).astype(np.uint8)
+
+
+def _apply_coupled_lowres_dct_420_np(
+    canvas: np.ndarray,
+    rng: random.Random,
+    curr_obj_px: float,
+    target_px_range: tuple[float, float] = (12.0, 30.0),
+) -> tuple[float, tuple[float, float]]:
+    """Coupled pre-resize `12..30 px` + YCbCr 4:2:0 + H.264 8x8 DCT degradation preserving zero phase shift."""
+    h_img, w_img = canvas.shape[:2]
+    target_px = rng.uniform(float(target_px_range[0]), float(target_px_range[1]))
+    s_lr = float(np.clip(target_px / max(8.0, float(curr_obj_px)), 0.14, 0.82))
+    lw = max(20, int(round(w_img * s_lr)))
+    lh = max(14, int(round(h_img * s_lr)))
+
+    small = cv2.resize(canvas, (lw, lh), interpolation=cv2.INTER_AREA).astype(np.float32) * (1.0 / 255.0)
+
+    bvx_c, bvy_c = 0.0, 0.0
+    r_blur = rng.random()
+    if r_blur < 0.36:
+        k_len = rng.choice((3, 5))
+        ang = rng.uniform(0.0, math.pi)
+        kern = np.zeros((k_len, k_len), dtype=np.float32)
+        c_k = 0.5 * float(k_len - 1)
+        ca, sa = math.cos(ang), math.sin(ang)
+        for s_i in np.linspace(-c_k, c_k, k_len * 2 + 1):
+            kx = int(round(c_k + s_i * ca))
+            ky = int(round(c_k + s_i * sa))
+            if 0 <= kx < k_len and 0 <= ky < k_len:
+                kern[ky, kx] += 1.0
+        kern /= max(1e-6, float(kern.sum()))
+        small = cv2.filter2D(small, -1, kern, borderType=cv2.BORDER_REPLICATE)
+        bvx_c = float(k_len * ca) / max(0.10, s_lr)
+        bvy_c = float(k_len * sa) / max(0.10, s_lr)
+    elif r_blur < 0.72:
+        small = cv2.GaussianBlur(small, (3, 3), rng.uniform(0.50, 1.05))
+
+    # Sensor Poisson-Gaussian noise at low-res capture scale
+    if rng.random() < 0.75:
+        np_rng = np.random.default_rng(rng.getrandbits(32))
+        sigma = rng.uniform(0.006, 0.026)
+        small = np.clip(small + np_rng.normal(0.0, sigma, size=small.shape).astype(np.float32), 0.0, 1.0)
+
+    # ITU-R BT.601 YCbCr 4:2:0 2x2 area chroma subsampling + bilinear upsampling
+    r_ch, g_ch, b_ch = small[:, :, 0], small[:, :, 1], small[:, :, 2]
+    y_luma = 0.299 * r_ch + 0.587 * g_ch + 0.114 * b_ch
+    cb = -0.168736 * r_ch - 0.331264 * g_ch + 0.500 * b_ch
+    cr = 0.500 * r_ch - 0.418688 * g_ch - 0.081312 * b_ch
+    cw = max(6, lw // 2)
+    ch = max(4, lh // 2)
+    cb_sub = cv2.resize(cb, (cw, ch), interpolation=cv2.INTER_AREA)
+    cr_sub = cv2.resize(cr, (cw, ch), interpolation=cv2.INTER_AREA)
+    cb_up = cv2.resize(cb_sub, (lw, lh), interpolation=cv2.INTER_LINEAR)
+    cr_up = cv2.resize(cr_sub, (lw, lh), interpolation=cv2.INTER_LINEAR)
+
+    ycbcr = np.stack([y_luma, cb_up, cr_up], axis=-1)
+
+    # H.264 8x8 DCT quantization in YCbCr domain (`dct_step` up to `0.095`)
+    dct_step = rng.uniform(0.020, 0.095)
+    pad_h = (8 - (lh % 8)) % 8
+    pad_w = (8 - (lw % 8)) % 8
+    if pad_h > 0 or pad_w > 0:
+        ycbcr_pad = np.pad(ycbcr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    else:
+        ycbcr_pad = ycbcr
+    ph8, pw8 = ycbcr_pad.shape[:2]
+    bh, bw = ph8 // 8, pw8 // 8
+    blocks = ycbcr_pad.reshape(bh, 8, bw, 8, 3).transpose(0, 2, 4, 1, 3)  # (bh, bw, 3, 8, 8)
+    coeffs = (_DCT8_NP @ blocks) @ _DCT8_NP_T
+    ch_scale = np.array([1.0, 1.35, 1.35], dtype=np.float32).reshape(1, 1, 3, 1, 1)
+    q_step = dct_step * ch_scale * _DCT8_FREQ_WEIGHT_NP[None, None, None, :, :]
+    coeffs_q = np.round(coeffs / q_step) * q_step
+    rec_blocks = (_DCT8_NP_T @ coeffs_q) @ _DCT8_NP
+    rec_ycbcr = rec_blocks.transpose(0, 3, 1, 4, 2).reshape(ph8, pw8, 3)[:lh, :lw, :]
+
+    yr, cbr, crr = rec_ycbcr[:, :, 0], rec_ycbcr[:, :, 1], rec_ycbcr[:, :, 2]
+    rgb_lr = np.stack(
+        [
+            yr + 1.402 * crr,
+            yr - 0.344136 * cbr - 0.714136 * crr,
+            yr + 1.772 * cbr,
+        ],
+        axis=-1,
+    )
+    rgb_u8 = np.clip(np.round(rgb_lr * 255.0), 0.0, 255.0).astype(np.uint8)
+
+    u_up = rng.random()
+    if u_up < 0.48:
+        canvas[:] = cv2.resize(rgb_u8, (w_img, h_img), interpolation=cv2.INTER_LINEAR)
+    elif u_up < 0.82:
+        canvas[:] = cv2.resize(rgb_u8, (w_img, h_img), interpolation=cv2.INTER_CUBIC)
+    else:
+        # Pixel-center-exact nearest-neighbor upsampling (zero +0.5*(s-1) phase shift!)
+        iy = np.clip(np.floor((np.arange(h_img, dtype=np.float32) + 0.5) * (float(lh) / float(h_img))).astype(np.int32), 0, lh - 1)
+        ix = np.clip(np.floor((np.arange(w_img, dtype=np.float32) + 0.5) * (float(lw) / float(w_img))).astype(np.int32), 0, lw - 1)
+        canvas[:] = rgb_u8[np.ix_(iy, ix)]
+
+    qual = float(np.clip((target_px / 32.0) * (1.0 - 2.2 * dct_step), 0.24, 0.84))
+    return qual, (bvx_c, bvy_c)
 
 
 def _compute_3d_plate_homography(
@@ -1605,6 +2086,15 @@ class QuadCropSynthConfig:
 class QuadCropSynthesizer:
     """Ultra-fast (< 0.8 ms/sample) `(96, 160, 3)` noisy ROI -> tight 4-corner + verifier sample generator."""
 
+    STRUCTURED_HARD_NEG_MODES: tuple[str, ...] = (
+        "blue_highway_route_sign",
+        "frameless_truck_body_text",
+        "bordered_payload_and_speed_decals",
+        "shop_parking_multiline_sign",
+        "grille_emblem_bumper_slats",
+        "building_window_grid_and_reflectors",
+    )
+
     HARD_NEG_MODES: tuple[str, ...] = (
         "radiator_grille",
         "headlight_taillight",
@@ -1636,12 +2126,21 @@ class QuadCropSynthesizer:
         if self.config.domain_split not in {"train", "val_holdout", "cal_holdout"}:
             raise ValueError("Unknown synthetic domain split")
         self._bank: _SceneAssetBank | None = None
+        self._scene_helper: FullSceneDetSynthesizer | None = None
 
     @property
     def bank(self) -> _SceneAssetBank:
         if self._bank is None:
             self._bank = _SceneAssetBank.get(self.config.plate_bank_size)
         return self._bank
+
+    @property
+    def _bg_helper(self) -> FullSceneDetSynthesizer:
+        if self._scene_helper is None:
+            self._scene_helper = FullSceneDetSynthesizer(
+                SceneSynthConfig(image_size=(DUAL_CANVAS_H, DUAL_CANVAS_W), plate_bank_size=self.config.plate_bank_size)
+            )
+        return self._scene_helper
 
     def _apply_roi_degradation(
         self,
@@ -1650,32 +2149,43 @@ class QuadCropSynthesizer:
         force_lowres: bool = False,
         plate_occ_scale: float = 1.0,
     ) -> float:
-        """Apply camera low-res capture + blur + JPEG/block artifacts + glare/night; return quality factor in [0.2, 1.0]."""
+        """Apply camera low-res capture + blur + H.264 DCT/4:2:0 or JPEG artifacts + glare/night."""
         qual = 1.0
         h, w = roi.shape[:2]
 
-        # Distant / low-res blurry capture (compensated by `plate_occ_scale` so oblique foreshortened plates stay >= 9px!)
-        if force_lowres or rng.random() < self.config.p_lowres_distant:
-            min_lw = max(24, min(58, int(round(24.0 / max(0.45, min(1.0, plate_occ_scale))))))
-            lw = rng.randint(min_lw, max(min_lw + 4, 66))
-            lh = max(14, int(round(lw * (h / float(w)) * rng.uniform(0.88, 1.12))))
-            small = cv2.resize(roi, (lw, lh), interpolation=cv2.INTER_AREA)
-            if rng.random() < 0.65:
-                small = cv2.GaussianBlur(small, (3, 3), rng.uniform(0.55, 1.15))
-            if rng.random() < 0.55:
-                jq = rng.randint(28, 66)
-                ok, enc = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), jq])
-                if ok:
-                    dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
-                    if dec is not None:
-                        small = dec
-            up_mode = rng.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST])
-            roi[:] = cv2.resize(small, (w, h), interpolation=up_mode)
-            qual *= max(0.32, min(0.85, lw / 68.0))
-        elif rng.random() < 0.30:
-            k_sz = rng.choice([3, 5])
-            roi[:] = cv2.GaussianBlur(roi, (k_sz, k_sz), rng.uniform(0.6, 1.3))
-            qual *= 0.86
+        if self.config.domain_split == "train":
+            # 45% coupled pre-resize 12..30 px + YCbCr 4:2:0 + H.264 8x8 DCT degradation
+            if force_lowres or rng.random() < 0.45:
+                curr_px = max(16.0, 84.0 * float(plate_occ_scale))
+                q_lr, _ = _apply_coupled_lowres_dct_420_np(roi, rng, curr_obj_px=curr_px, target_px_range=(12.0, 30.0))
+                qual *= q_lr
+            elif rng.random() < 0.28:
+                k_sz = rng.choice([3, 5])
+                roi[:] = cv2.GaussianBlur(roi, (k_sz, k_sz), rng.uniform(0.6, 1.3))
+                qual *= 0.86
+        else:
+            # Holdout-invariant legacy path (`val_holdout` & `cal_holdout`)
+            if force_lowres or rng.random() < self.config.p_lowres_distant:
+                min_lw = max(24, min(58, int(round(24.0 / max(0.45, min(1.0, plate_occ_scale))))))
+                lw = rng.randint(min_lw, max(min_lw + 4, 66))
+                lh = max(14, int(round(lw * (h / float(w)) * rng.uniform(0.88, 1.12))))
+                small = cv2.resize(roi, (lw, lh), interpolation=cv2.INTER_AREA)
+                if rng.random() < 0.65:
+                    small = cv2.GaussianBlur(small, (3, 3), rng.uniform(0.55, 1.15))
+                if rng.random() < 0.55:
+                    jq = rng.randint(28, 66)
+                    ok, enc = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), jq])
+                    if ok:
+                        dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+                        if dec is not None:
+                            small = dec
+                up_mode = rng.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST])
+                roi[:] = cv2.resize(small, (w, h), interpolation=up_mode)
+                qual *= max(0.32, min(0.85, lw / 68.0))
+            elif rng.random() < 0.30:
+                k_sz = rng.choice([3, 5])
+                roi[:] = cv2.GaussianBlur(roi, (k_sz, k_sz), rng.uniform(0.6, 1.3))
+                qual *= 0.86
 
         # Photometric / Night / Glare
         r_light = rng.random()
@@ -1723,11 +2233,118 @@ class QuadCropSynthesizer:
     def _synthesize_hard_negative(self, rng: random.Random) -> QuadCropTrainingSample:
         """Synthesize realistic non-plate false-positive trap ROI (`is_plate = 0.0`)."""
         roi = np.empty((QUAD_ROI_H, QUAD_ROI_W, 3), dtype=np.uint8)
-        mode = rng.choice(self.HARD_NEG_MODES)
+        if self.config.domain_split == "train" and rng.random() < 0.76:
+            mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES)
+        else:
+            mode = rng.choice(self.HARD_NEG_MODES)
         bg_body = rng.choice(FullSceneDetSynthesizer.BODY_COLORS)
         roi[:] = (int(bg_body[0] * 0.75), int(bg_body[1] * 0.75), int(bg_body[2] * 0.75))
 
-        if mode == "radiator_grille":
+        if mode == "blue_highway_route_sign":
+            # Sky / highway gantry truss + MLIT blue route sign ("319", "246", "16", "R17")
+            roi[:] = rng.choice([(148, 178, 214), (168, 176, 186), (26, 32, 46)])
+            px_pole = rng.randint(68, 92)
+            cv2.rectangle(roi, (px_pole - 4, 0), (px_pole + 4, QUAD_ROI_H), (142, 148, 156), -1)
+            bp = rng.choice(self.bank.blue_route_patches)
+            dst_q = np.array(
+                [
+                    [rng.uniform(22, 44), rng.uniform(10, 22)],
+                    [rng.uniform(116, 138), rng.uniform(10, 22)],
+                    [rng.uniform(116, 140), rng.uniform(72, 86)],
+                    [rng.uniform(20, 44), rng.uniform(72, 86)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(roi, bp, dst_q)
+
+        elif mode == "frameless_truck_body_text":
+            # Colored/ribbed truck metal body + frameless painted text ("スケルトン車", "最大積載量 2000kg", "産廃収集運搬車", "自家用")
+            metal_c = rng.choice([(226, 230, 236), (196, 202, 210), (42, 84, 142), (48, 96, 68), (224, 182, 40), (46, 50, 58)])
+            roi[:] = metal_c
+            rib_dark = (max(12, metal_c[0] - 28), max(12, metal_c[1] - 28), max(14, metal_c[2] - 28))
+            rib_hi = (min(252, metal_c[0] + 22), min(252, metal_c[1] + 22), min(252, metal_c[2] + 22))
+            for ry_rib in range(rng.randint(8, 16), QUAD_ROI_H - 6, rng.randint(14, 22)):
+                cv2.line(roi, (0, ry_rib), (QUAD_ROI_W, ry_rib), rib_dark, 2)
+                cv2.line(roi, (0, ry_rib + 2), (QUAD_ROI_W, ry_rib + 2), rib_hi, 1)
+            lum_m = 0.299 * metal_c[0] + 0.587 * metal_c[1] + 0.114 * metal_c[2]
+            cand_rgba = [
+                st for st in self.bank.frameless_decal_rgba
+                if abs((0.299 * float(st[0, 0, 0]) + 0.587 * float(st[0, 0, 1]) + 0.114 * float(st[0, 0, 2])) - lum_m) > 75.0
+            ]
+            st_rgba = rng.choice(cand_rgba if cand_rgba else self.bank.frameless_decal_rgba)
+            dst_q = np.array(
+                [
+                    [rng.uniform(10, 28), rng.uniform(24, 36)],
+                    [rng.uniform(132, 150), rng.uniform(22, 36)],
+                    [rng.uniform(132, 150), rng.uniform(58, 72)],
+                    [rng.uniform(10, 28), rng.uniform(58, 72)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_rgba_patch_into_canvas(roi, st_rgba, dst_q, opacity=rng.uniform(0.84, 0.98))
+
+        elif mode == "bordered_payload_and_speed_decals":
+            roi[:] = rng.choice([(208, 214, 220), (46, 50, 58), (52, 88, 134), (56, 96, 72)])
+            cv2.line(roi, (0, rng.randint(68, 84)), (QUAD_ROI_W, rng.randint(68, 84)), (204, 44, 40), 3)
+            dc = rng.choice(self.bank.bordered_decal_patches)
+            dst_q = np.array(
+                [
+                    [rng.uniform(14, 36), rng.uniform(20, 34)],
+                    [rng.uniform(122, 146), rng.uniform(20, 34)],
+                    [rng.uniform(122, 146), rng.uniform(60, 76)],
+                    [rng.uniform(14, 36), rng.uniform(60, 76)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(roi, dc, dst_q)
+
+        elif mode == "shop_parking_multiline_sign":
+            roi[:] = rng.choice([(164, 168, 174), (124, 130, 138), (192, 186, 176), (34, 38, 48)])
+            mp = rng.choice(self.bank.multiline_parking_patches)
+            dst_q = np.array(
+                [
+                    [rng.uniform(12, 32), rng.uniform(10, 22)],
+                    [rng.uniform(128, 148), rng.uniform(10, 22)],
+                    [rng.uniform(128, 148), rng.uniform(72, 86)],
+                    [rng.uniform(12, 32), rng.uniform(72, 86)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(roi, mp, dst_q)
+
+        elif mode == "grille_emblem_bumper_slats":
+            roi[:] = bg_body
+            gx0, gy0 = rng.randint(6, 22), rng.randint(8, 22)
+            gx1, gy1 = QUAD_ROI_W - rng.randint(6, 22), QUAD_ROI_H - rng.randint(8, 22)
+            cv2.rectangle(roi, (gx0, gy0), (gx1, gy1), (24, 26, 30), -1)
+            cv2.rectangle(roi, (gx0, gy0), (gx1, gy1), (198, 204, 212), 2)
+            step = rng.choice([6, 8, 10])
+            for y_s in range(gy0 + step, gy1 - 2, step):
+                cv2.line(roi, (gx0 + 2, y_s), (gx1 - 2, y_s), (168, 174, 184), rng.choice([1, 2]))
+            cx_e, cy_e = (gx0 + gx1) // 2, (gy0 + gy1) // 2
+            cv2.ellipse(roi, (cx_e, cy_e), (rng.randint(12, 20), rng.randint(8, 13)), 0, 0, 360, (218, 224, 232), 2, lineType=cv2.LINE_AA)
+
+        elif mode == "building_window_grid_and_reflectors":
+            if rng.random() < 0.58:
+                is_night_w = rng.random() < 0.55
+                roi[:] = (36, 40, 50) if is_night_w else rng.choice([(176, 172, 166), (144, 148, 156)])
+                ww, wh = rng.randint(22, 38), rng.randint(14, 24)
+                for y_w in range(8, QUAD_ROI_H - wh, wh + 8):
+                    for x_w in range(10, QUAD_ROI_W - ww, ww + 10):
+                        lit = is_night_w and (rng.random() < 0.62)
+                        pane_c = rng.choice([(242, 224, 158), (218, 234, 248)]) if lit else (42, 52, 64)
+                        cv2.rectangle(roi, (x_w, y_w), (x_w + ww, y_w + wh), pane_c, -1)
+                        cv2.rectangle(roi, (x_w, y_w), (x_w + ww, y_w + wh), (206, 210, 216), 1)
+            else:
+                roi[:] = rng.choice([(46, 52, 60), (74, 78, 84), (168, 174, 180)])
+                ry_g = rng.randint(32, 52)
+                cv2.rectangle(roi, (0, ry_g), (QUAD_ROI_W, ry_g + 16), (218, 222, 228), -1)
+                for rx_r in range(18, QUAD_ROI_W - 22, rng.randint(34, 52)):
+                    ref_c = (238, 122, 26) if rng.random() < 0.55 else (214, 36, 40)
+                    cv2.rectangle(roi, (rx_r, ry_g + 2), (rx_r + 22, ry_g + 14), ref_c, -1)
+                    cv2.rectangle(roi, (rx_r, ry_g + 2), (rx_r + 22, ry_g + 14), (244, 246, 248), 1)
+
+        elif mode == "radiator_grille":
             gx0, gy0 = rng.randint(8, 28), rng.randint(10, 24)
             gx1, gy1 = QUAD_ROI_W - rng.randint(8, 28), QUAD_ROI_H - rng.randint(10, 24)
             cv2.rectangle(roi, (gx0, gy0), (gx1, gy1), (26, 28, 32), -1)
@@ -2084,37 +2701,54 @@ class QuadCropSynthesizer:
                 return self._synthesize_hard_negative(rng)
 
         plate_side = SIDE_FRONT if rng.random() < 0.50 else SIDE_REAR
-        ctx_style = rng.choices(
-            [
-                "sedan_bumper",
-                "kei_offset",
-                "truck_recessed",
-                "tractor_exposed_chassis",
-                "mixer_chevron_rear",
-                "bus_flat_panel",
-                "high_grille_work_truck",
-                "minivan_garnish",
-            ],
-            weights=[0.16, 0.18, 0.14, 0.12, 0.11, 0.11, 0.08, 0.10],
-            k=1,
-        )[0]
-
-        if ctx_style == "kei_offset":
-            p_cat = "kei_black" if rng.random() < 0.38 else "kei"
-        elif ctx_style == "bus_flat_panel":
-            p_cat = "commercial_green_large" if rng.random() < 0.80 else "commercial_large"
-        elif ctx_style in ("truck_recessed", "tractor_exposed_chassis", "mixer_chevron_rear", "high_grille_work_truck"):
-            r_c = rng.random()
-            if r_c < 0.54:
-                p_cat = "commercial_green_large"
-            elif r_c < 0.78:
-                p_cat = "commercial_med"
+        if self.config.domain_split == "train":
+            entry, _ = self.bank.pick_stratified_plate(plate_side, rng, p_temporary=self.config.p_temporary_plate)
+            if entry.plate_type_str in (PlateType.KEI_COMMERCIAL.value, PlateType.KEI_PRIVATE.value):
+                ctx_style = "kei_offset" if (plate_side == SIDE_FRONT and rng.random() < 0.72) else rng.choice(("sedan_bumper", "minivan_garnish"))
+            elif entry.plate_type_str == PlateType.STANDARD_COMMERCIAL.value:
+                ctx_style = rng.choices(
+                    ["truck_recessed", "tractor_exposed_chassis", "mixer_chevron_rear", "bus_flat_panel", "high_grille_work_truck"],
+                    weights=[0.30, 0.22, 0.18, 0.18, 0.12],
+                    k=1,
+                )[0]
             else:
-                p_cat = "commercial_large"
+                ctx_style = rng.choices(
+                    ["sedan_bumper", "minivan_garnish", "truck_recessed", "bus_flat_panel"],
+                    weights=[0.44, 0.34, 0.12, 0.10],
+                    k=1,
+                )[0]
         else:
-            p_cat = "standard_white" if rng.random() < 0.55 else "standard"
+            ctx_style = rng.choices(
+                [
+                    "sedan_bumper",
+                    "kei_offset",
+                    "truck_recessed",
+                    "tractor_exposed_chassis",
+                    "mixer_chevron_rear",
+                    "bus_flat_panel",
+                    "high_grille_work_truck",
+                    "minivan_garnish",
+                ],
+                weights=[0.16, 0.18, 0.14, 0.12, 0.11, 0.11, 0.08, 0.10],
+                k=1,
+            )[0]
 
-        entry = self.bank.pick_plate(p_cat, plate_side, rng, p_temporary=self.config.p_temporary_plate)
+            if ctx_style == "kei_offset":
+                p_cat = "kei_black" if rng.random() < 0.38 else "kei"
+            elif ctx_style == "bus_flat_panel":
+                p_cat = "commercial_green_large" if rng.random() < 0.80 else "commercial_large"
+            elif ctx_style in ("truck_recessed", "tractor_exposed_chassis", "mixer_chevron_rear", "high_grille_work_truck"):
+                r_c = rng.random()
+                if r_c < 0.54:
+                    p_cat = "commercial_green_large"
+                elif r_c < 0.78:
+                    p_cat = "commercial_med"
+                else:
+                    p_cat = "commercial_large"
+            else:
+                p_cat = "standard_white" if rng.random() < 0.55 else "standard"
+
+            entry = self.bank.pick_plate(p_cat, plate_side, rng, p_temporary=self.config.p_temporary_plate)
         pw_m, ph_m = (0.440, 0.220) if entry.is_large else (0.330, 0.165)
 
         # 3D perspective yaw (-68..+68), context-conditional bracket pitch, roll (-18..+18), and distance keystone z ~ logU(2.1, 26.0)
@@ -2344,11 +2978,16 @@ class QuadCropSynthesizer:
             )
             cv2.fillConvexPoly(roi, np.round(lip_pts).astype(np.int32), lip_col, lineType=cv2.LINE_AA)
 
-        # Heavy upper-row bumper/garnish overhang shadow (32% of positives)
+        # Heavy upper-row bumper/garnish overhang shadow (35% deep 0.06x-0.25x in train; 32% legacy in holdout)
         sh_pen = 1.0
-        if rng.random() < 0.32:
-            sh_frac = rng.uniform(0.22, 0.48)
-            sh_dark = rng.uniform(0.18, 0.44)
+        p_overhang_sh = 0.35 if self.config.domain_split == "train" else 0.32
+        if rng.random() < p_overhang_sh:
+            if self.config.domain_split == "train":
+                sh_frac = rng.uniform(0.28, 0.56)
+                sh_dark = rng.uniform(0.06, 0.25)
+            else:
+                sh_frac = rng.uniform(0.22, 0.48)
+                sh_dark = rng.uniform(0.18, 0.44)
             sh_pen = 0.82 + 0.30 * sh_dark
             sh_tilt = rng.uniform(-5.0, 5.0)
             yy_s, xx_s = np.mgrid[0:QUAD_ROI_H, 0:QUAD_ROI_W].astype(np.float32)
@@ -2409,6 +3048,578 @@ class QuadCropSynthesizer:
             plate_side=plate_side,
             tight_quality=round(tight_quality, 4),
         )
+
+    def _render_structured_hardneg_on_canvas(
+        self,
+        canvas: np.ndarray,
+        mode: str,
+        weather: str,
+        horizon_y: int,
+        rng: random.Random,
+    ) -> tuple[float, float, float, float, float]:
+        """Render one of the 6 structured hard-negative traps onto `(320, 480, 3)` `canvas`; return `(x0, y0, x1, y1, obj_w)`."""
+        h_c, w_c = canvas.shape[:2]
+        dim = 0.50 if weather == "night" else (0.85 if weather in ("sunset", "wet_road") else 1.0)
+        cx_t = rng.uniform(0.30, 0.70) * float(w_c)
+        cy_t = rng.uniform(0.32, 0.68) * float(h_c)
+        tw = rng.uniform(44.0, 118.0)
+
+        if mode == "blue_highway_route_sign":
+            cy_t = rng.uniform(max(44.0, horizon_y - 42.0), min(float(h_c) - 60.0, horizon_y + 38.0))
+            th = tw * rng.uniform(0.56, 0.88)
+            pole_x = int(round(cx_t))
+            cv2.rectangle(canvas, (pole_x - 4, int(round(cy_t))), (pole_x + 4, min(h_c - 4, horizon_y + 72)), (146, 152, 160), -1)
+            bp = rng.choice(self.bank.blue_route_patches)
+            if dim < 0.99:
+                bp = np.clip(bp.astype(np.float32) * max(0.55, dim), 0.0, 255.0).astype(np.uint8)
+            dx_top = rng.uniform(-5.0, 5.0)
+            dy_r = rng.uniform(-4.0, 4.0)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw + dx_top, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw + dx_top, cy_t - 0.5 * th + dy_r],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + dy_r],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(canvas, bp, dst_q)
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "frameless_truck_body_text":
+            # Full side/rear truck panel with ribs, chassis & wheels in surround + frameless painted text (ZERO border!)
+            vx0 = max(12, int(round(cx_t - tw * rng.uniform(1.3, 2.0))))
+            vx1 = min(w_c - 12, int(round(cx_t + tw * rng.uniform(1.3, 2.0))))
+            vy0 = max(16, int(round(cy_t - tw * rng.uniform(0.65, 1.05))))
+            vy1 = min(h_c - 22, int(round(cy_t + tw * rng.uniform(0.65, 1.05))))
+            raw_m = rng.choice([(228, 232, 238), (196, 202, 210), (42, 86, 144), (48, 98, 68), (226, 184, 42), (46, 50, 58)])
+            metal_c = (int(raw_m[0] * dim), int(raw_m[1] * dim), int(raw_m[2] * dim))
+            cv2.rectangle(canvas, (vx0, vy0), (vx1, vy1), metal_c, -1)
+            cv2.rectangle(canvas, (vx0 + 8, vy1), (vx1 - 8, min(h_c - 6, vy1 + 26)), (28, 30, 36), -1)
+            rib_d = (max(10, metal_c[0] - 26), max(10, metal_c[1] - 26), max(12, metal_c[2] - 26))
+            for ry_r in range(vy0 + 12, vy1 - 8, rng.randint(14, 24)):
+                cv2.line(canvas, (vx0 + 2, ry_r), (vx1 - 2, ry_r), rib_d, 2)
+            for wx_t in (vx0 + int((vx1 - vx0) * 0.24), vx0 + int((vx1 - vx0) * 0.78)):
+                wy_t = min(h_c - 14, vy1 + 18)
+                cv2.circle(canvas, (wx_t, wy_t), 18, (20, 22, 26), -1, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, (wx_t, wy_t), 10, (176, 182, 190), -1, lineType=cv2.LINE_AA)
+            lum_m = 0.299 * metal_c[0] + 0.587 * metal_c[1] + 0.114 * metal_c[2]
+            cand_rgba = [
+                st for st in self.bank.frameless_decal_rgba
+                if abs((0.299 * float(st[0, 0, 0]) + 0.587 * float(st[0, 0, 1]) + 0.114 * float(st[0, 0, 2])) * dim - lum_m) > 62.0
+            ]
+            st_rgba = rng.choice(cand_rgba if cand_rgba else self.bank.frameless_decal_rgba)
+            if dim < 0.99:
+                st_rgba = st_rgba.copy()
+                st_rgba[:, :, :3] = np.clip(st_rgba[:, :, :3].astype(np.float32) * max(0.55, dim), 0.0, 255.0).astype(np.uint8)
+            th = tw * rng.uniform(0.22, 0.34)
+            skew_y = rng.uniform(-5.0, 5.0)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th + skew_y],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + skew_y],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_rgba_patch_into_canvas(canvas, st_rgba, dst_q, opacity=rng.uniform(0.85, 0.98))
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "bordered_payload_and_speed_decals":
+            vx0 = max(16, int(round(cx_t - tw * 1.6)))
+            vx1 = min(w_c - 16, int(round(cx_t + tw * 1.6)))
+            vy0 = max(16, int(round(cy_t - tw * 1.0)))
+            vy1 = min(h_c - 20, int(round(cy_t + tw * 0.9)))
+            raw_b = rng.choice([(218, 222, 228), (52, 88, 136), (56, 98, 74), (58, 62, 70)])
+            bed_c = (int(raw_b[0] * dim), int(raw_b[1] * dim), int(raw_b[2] * dim))
+            cv2.rectangle(canvas, (vx0, vy0), (vx1, vy1), bed_c, -1)
+            cv2.rectangle(canvas, (vx0 + 12, vy1), (vx1 - 12, min(h_c - 6, vy1 + 24)), (26, 28, 34), -1)
+            cv2.line(canvas, (vx0 + 4, vy1 - 3), (vx1 - 4, vy1 - 3), (206, 44, 40), 3)
+            dc = rng.choice(self.bank.bordered_decal_patches)
+            if dim < 0.99:
+                dc = np.clip(dc.astype(np.float32) * max(0.55, dim), 0.0, 255.0).astype(np.uint8)
+            th = tw * rng.uniform(0.28, 0.52)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th + rng.uniform(-3.0, 3.0)],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + rng.uniform(-3.0, 3.0)],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(canvas, dc, dst_q)
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "shop_parking_multiline_sign":
+            cy_t = rng.uniform(max(44.0, horizon_y - 26.0), min(float(h_c) - 56.0, horizon_y + 48.0))
+            th = tw * rng.uniform(0.42, 0.58)
+            px_l = int(round(cx_t - 0.36 * tw))
+            px_r = int(round(cx_t + 0.36 * tw))
+            for px_p in (px_l, px_r):
+                cv2.rectangle(canvas, (px_p - 2, int(round(cy_t)),), (px_p + 2, min(h_c - 6, int(round(cy_t + th + 48)))), (150, 156, 164), -1)
+            mp = rng.choice(self.bank.multiline_parking_patches)
+            if dim < 0.99:
+                mp = np.clip(mp.astype(np.float32) * max(0.60, dim), 0.0, 255.0).astype(np.uint8)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th + rng.uniform(-4.0, 4.0)],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + rng.uniform(-4.0, 4.0)],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(canvas, mp, dst_q)
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "grille_emblem_bumper_slats":
+            # Full front fascia WITHOUT any plate in the grille/intake zone
+            cy_t = rng.uniform(max(float(horizon_y) + 28.0, 128.0), float(h_c) - 62.0)
+            vw_g = tw * rng.uniform(2.1, 2.8)
+            vh_g = vw_g * rng.uniform(0.68, 0.86)
+            vx0 = int(round(cx_t - 0.5 * vw_g))
+            vx1 = int(round(cx_t + 0.5 * vw_g))
+            vy1 = min(h_c - 10, int(round(cy_t + 0.36 * vh_g)))
+            vy0 = max(12, int(round(vy1 - vh_g)))
+            raw_c = rng.choice(FullSceneDetSynthesizer.BODY_COLORS)
+            body_c = (int(raw_c[0] * dim), int(raw_c[1] * dim), int(raw_c[2] * dim))
+            cv2.rectangle(canvas, (max(0, vx0), max(0, int(round(vy0 + 0.42 * vh_g)))), (min(w_c, vx1), vy1), body_c, -1)
+            cab_pts = np.array(
+                [[vx0 + 0.08 * vw_g, vy0 + 0.42 * vh_g], [vx0 + 0.18 * vw_g, vy0], [vx1 - 0.18 * vw_g, vy0], [vx1 - 0.08 * vw_g, vy0 + 0.42 * vh_g]],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(canvas, cab_pts, body_c, lineType=cv2.LINE_AA)
+            gx0 = max(6, int(round(cx_t - 0.5 * tw)))
+            gx1 = min(w_c - 6, int(round(cx_t + 0.5 * tw)))
+            th = tw * rng.uniform(0.38, 0.56)
+            gy0 = max(8, int(round(cy_t - 0.5 * th)))
+            gy1 = min(h_c - 12, int(round(cy_t + 0.5 * th)))
+            cv2.rectangle(canvas, (gx0, gy0), (gx1, gy1), (24, 26, 32), -1)
+            cv2.rectangle(canvas, (gx0, gy0), (gx1, gy1), (196, 202, 210), 2)
+            for ys in range(gy0 + 6, gy1 - 2, rng.choice((6, 8, 10))):
+                cv2.line(canvas, (gx0 + 2, ys), (gx1 - 2, ys), (156, 162, 172), 1)
+            cv2.ellipse(canvas, ((gx0 + gx1) // 2, (gy0 + gy1) // 2), (max(6, int(tw * 0.12)), max(4, int(th * 0.18))), 0, 0, 360, (216, 222, 230), 2, lineType=cv2.LINE_AA)
+            hl_w = max(10, int(vw_g * 0.16))
+            cv2.rectangle(canvas, (max(2, vx0 + 8), gy0 - 2), (min(w_c - 2, vx0 + 8 + hl_w), gy0 + max(8, int(th * 0.55))), (238, 242, 248), -1)
+            cv2.rectangle(canvas, (max(2, vx1 - 8 - hl_w), gy0 - 2), (min(w_c - 2, vx1 - 8), gy0 + max(8, int(th * 0.55))), (238, 242, 248), -1)
+            return (float(gx0), float(gy0), float(gx1), float(gy1), float(gx1 - gx0))
+
+        # building_window_grid_and_reflectors
+        if rng.random() < 0.58:
+            cy_t = rng.uniform(44.0, max(78.0, float(horizon_y) + 18.0))
+            th = tw * rng.uniform(0.45, 0.65)
+            bx0 = max(8, int(round(cx_t - tw * 1.1)))
+            bx1 = min(w_c - 8, int(round(cx_t + tw * 1.1)))
+            by0 = max(4, int(round(cy_t - th * 1.1)))
+            by1 = min(h_c - 16, int(round(cy_t + th * 1.1)))
+            is_night_w = weather == "night" or rng.random() < 0.42
+            cv2.rectangle(canvas, (bx0, by0), (bx1, by1), (36, 40, 50) if is_night_w else (166, 162, 156), -1)
+            ww = max(14, int(tw * 0.30))
+            wh = max(9, int(ww * 0.54))
+            for yw in range(by0 + 8, by1 - wh - 4, wh + 8):
+                for xw in range(bx0 + 8, bx1 - ww - 4, ww + 9):
+                    lit = is_night_w and rng.random() < 0.65
+                    pc = rng.choice([(244, 226, 158), (218, 234, 248)]) if lit else (42, 52, 64)
+                    cv2.rectangle(canvas, (xw, yw), (xw + ww, yw + wh), pc, -1)
+                    cv2.rectangle(canvas, (xw, yw), (xw + ww, yw + wh), (206, 210, 216), 1)
+            return (cx_t - 0.5 * tw, cy_t - 0.5 * th, cx_t + 0.5 * tw, cy_t + 0.5 * th, tw)
+
+        cy_t = rng.uniform(float(horizon_y) + 16.0, float(h_c) - 44.0)
+        th = tw * rng.uniform(0.32, 0.48)
+        gx0 = max(12, int(round(cx_t - tw * 1.2)))
+        gx1 = min(w_c - 12, int(round(cx_t + tw * 1.2)))
+        gy0 = int(round(cy_t - 0.32 * th))
+        gy1 = int(round(cy_t + 0.32 * th))
+        cv2.rectangle(canvas, (gx0, gy0), (gx1, gy1), (216, 220, 226), -1)
+        for xp in range(gx0 + 16, gx1 - 10, 42):
+            cv2.rectangle(canvas, (xp - 3, gy1), (xp + 3, min(h_c - 6, gy1 + 26)), (142, 148, 156), -1)
+            ref_c = (238, 122, 24) if rng.random() < 0.55 else (214, 36, 40)
+            cv2.rectangle(canvas, (xp - 10, gy0 + 2), (xp + 10, max(gy0 + 5, gy1 - 2)), ref_c, -1)
+        return (cx_t - 0.5 * tw, cy_t - 0.5 * th, cx_t + 0.5 * tw, cy_t + 0.5 * th, tw)
+
+    def synthesize_dual_sample(
+        self,
+        seed: int | None = None,
+        sampling_policy: int = 0,
+        *,
+        fovea_scale: float | None = None,
+        surround_scale: float | None = None,
+    ) -> dict[str, Any]:
+        """Synthesize concentric `fovea_rgb (96, 160, 3)` + `surround_rgb (64, 96, 3)` on a rendered `(320, 480, 3)` canvas.
+
+        Returns dict with:
+          - `fovea_rgb`: `(96, 160, 3)` uint8
+          - `surround_rgb`: `(64, 96, 3)` uint8
+          - `is_plate`: float (`1.0` or `0.0`)
+          - `corners_norm`: `(4, 2)` float32 signed unclamped coords in `[-0.35, 1.35]` relative to `fovea` window
+          - `corner_vis`: `(4,)` float32
+          - `plate_id`: int (`>= 1` per registration for positives, `0` for negatives)
+          - `sampling_policy`: int (`0..3`)
+        """
+        from vpocr_det.quad_cropper import (
+            FOVEA_BASE_SCALE,
+            SURROUND_BASE_SCALE,
+            concentric_roi_windows,
+            extract_dual_concentric_plate_rois,
+        )
+
+        fov_s = float(FOVEA_BASE_SCALE if fovea_scale is None else fovea_scale)
+        sur_s = float(SURROUND_BASE_SCALE if surround_scale is None else surround_scale)
+
+        pol = int(sampling_policy) % 4
+        split_seed = {"train": 0, "val_holdout": 1 << 48, "cal_holdout": 2 << 48}[self.config.domain_split]
+        eff_seed = int(random.getrandbits(31)) if seed is None else int(seed)
+        rng = random.Random(split_seed + eff_seed + 0x51A6E2)
+        prop_rng = random.Random(split_seed + eff_seed * 131 + pol * 9973 + 0x2719)
+
+        h_c, w_c = DUAL_CANVAS_H, DUAL_CANVAS_W
+        canvas = np.empty((h_c, w_c, 3), dtype=np.uint8)
+        scene_family = rng.choice(FullSceneDetSynthesizer.SCENE_FAMILIES)
+        weather = rng.choices(FullSceneDetSynthesizer.WEATHER_MODES, weights=[0.34, 0.22, 0.12, 0.16, 0.16], k=1)[0]
+        horizon_y = rng.randint(int(h_c * 0.24), int(h_c * 0.44))
+        vp_x = rng.randint(int(w_c * 0.34), int(w_c * 0.66))
+
+        is_pos = rng.random() < self.config.p_positive
+        self._bg_helper._draw_background(
+            canvas,
+            scene_family=scene_family,
+            weather=weather,
+            horizon_y=horizon_y,
+            vp_x=vp_x,
+            rng=rng,
+            extra_clutter=(not is_pos),
+        )
+
+        if not is_pos:
+            mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES)
+            tx0, ty0, tx1, ty1, obj_w = self._render_structured_hardneg_on_canvas(
+                canvas, mode=mode, weather=weather, horizon_y=horizon_y, rng=rng
+            )
+            # Symmetric 45% coupled pre-resize 12..30 px + 8x8 DCT + 4:2:0 degradation on (320, 480, 3)
+            if rng.random() < 0.45:
+                _apply_coupled_lowres_dct_420_np(canvas, rng, curr_obj_px=obj_w, target_px_range=(12.0, 30.0))
+            elif rng.random() < 0.28:
+                canvas[:] = cv2.GaussianBlur(canvas, (3, 3), rng.uniform(0.55, 1.15))
+
+            if rng.random() < 0.14:
+                gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+                canvas[:, :, 0] = gray
+                canvas[:, :, 1] = gray
+                canvas[:, :, 2] = gray
+
+            bw_n = max(8.0, tx1 - tx0)
+            bh_n = max(6.0, ty1 - ty0)
+            jx = prop_rng.uniform(-0.20, 0.20) * bw_n
+            jy = prop_rng.uniform(-0.20, 0.20) * bh_n
+            sc_n = prop_rng.uniform(0.84, 1.24)
+            ncx = 0.5 * (tx0 + tx1) + jx
+            ncy = 0.5 * (ty0 + ty1) + jy
+            prop_neg = (
+                ncx - 0.5 * bw_n * sc_n,
+                ncy - 0.5 * bh_n * sc_n,
+                ncx + 0.5 * bw_n * sc_n,
+                ncy + 0.5 * bh_n * sc_n,
+            )
+            fov_u8, sur_u8, _, _ = extract_dual_concentric_plate_rois(
+                canvas, prop_neg, gamma=prop_rng.uniform(1.0, 1.35), fovea_scale=fov_s, surround_scale=sur_s
+            )
+            return {
+                "fovea_rgb": fov_u8,
+                "surround_rgb": sur_u8,
+                "is_plate": 0.0,
+                "corners_norm": np.zeros((4, 2), dtype=np.float32),
+                "corner_vis": np.zeros((4,), dtype=np.float32),
+                "plate_id": 0,
+                "sampling_policy": pol,
+                "plate_side": SIDE_PURE_SIDE,
+                "tight_quality": 0.0,
+                "visible_support_fraction": 0.0,
+                "is_large": 0.0,
+                "blur_vec_norm": np.zeros((2,), dtype=np.float32),
+                "min_projected_edge_px": 0.0,
+                "blur_magnitude_px": 0.0,
+                "local_contrast_snr": 0.0,
+                "hard_neg_mode": mode,
+            }
+
+        # --- Positive sample (`is_plate = 1.0`) on `(320, 480, 3)` canvas ---
+        plate_side = SIDE_FRONT if rng.random() < 0.48 else SIDE_REAR
+        entry, plate_id = self.bank.pick_stratified_plate(plate_side, rng, p_temporary=self.config.p_temporary_plate)
+        ptype = entry.plate_type_str
+        if ptype in (PlateType.KEI_COMMERCIAL.value, PlateType.KEI_PRIVATE.value):
+            arch = rng.choice(("kei_car", "kei_van"))
+        elif ptype == PlateType.STANDARD_COMMERCIAL.value:
+            arch = rng.choices(
+                ("box_truck", "cargo_truck", "dump_truck", "bus", "commercial_van"),
+                weights=[0.28, 0.24, 0.18, 0.14, 0.16],
+                k=1,
+            )[0]
+        else:
+            arch = rng.choices(
+                ("sedan", "hatchback", "minivan", "suv", "commercial_van"),
+                weights=[0.28, 0.18, 0.26, 0.18, 0.10],
+                k=1,
+            )[0]
+
+        pw_m, ph_m = (0.440, 0.220) if entry.is_large else (0.330, 0.165)
+        if arch in ("kei_car", "kei_van"):
+            vw_m, vh_m = 1.48, 1.68
+        elif arch == "bus":
+            vw_m, vh_m = 2.46, 3.05
+        elif arch in ("box_truck", "cargo_truck", "dump_truck"):
+            vw_m, vh_m = (2.38, 2.95) if entry.is_large else (1.90, 2.45)
+        elif arch in ("minivan", "suv", "commercial_van"):
+            vw_m, vh_m = 1.82, 1.88
+        else:
+            vw_m, vh_m = 1.76, 1.46
+
+        # Render crisp base canvas width `42..118 px`; 45% coupled low-res pass downsamples to 12..30 px!
+        target_canvas_pw = rng.uniform(44.0, 116.0)
+        r_yaw = rng.random()
+        if r_yaw < 0.22:
+            yaw_deg = rng.choice((-1.0, 1.0)) * rng.uniform(42.0, 64.0)
+        elif r_yaw < 0.62:
+            yaw_deg = rng.uniform(-42.0, 42.0)
+        else:
+            yaw_deg = rng.uniform(-20.0, 20.0)
+        pitch_deg = rng.uniform(-30.0, 18.0)
+        roll_deg = rng.uniform(-14.0, 14.0)
+
+        fx = 465.0
+        cos_yaw = max(0.42, math.cos(math.radians(yaw_deg)))
+        z_m = max(1.65, (fx * pw_m * cos_yaw) / target_canvas_pw)
+        veh_w_px = min(float(w_c) * 0.86, fx * (vw_m * max(0.78, cos_yaw) + 0.85 * abs(math.sin(math.radians(yaw_deg)))) / z_m)
+        veh_h_px = min(float(h_c) * 0.82, fx * vh_m / z_m)
+
+        vcx = rng.uniform(max(125.0, 0.5 * veh_w_px + 18.0), min(float(w_c) - 125.0, float(w_c) - 0.5 * veh_w_px - 18.0))
+        vy1 = rng.uniform(max(float(horizon_y) + 64.0, veh_h_px + 16.0), float(h_c) - 18.0)
+        vy0 = vy1 - veh_h_px
+        vx0 = vcx - 0.5 * veh_w_px
+        vx1 = vcx + 0.5 * veh_w_px
+
+        p_anchor = self._bg_helper._draw_vehicle_and_compute_plate(
+            canvas,
+            archetype=arch,
+            plate_side=plate_side,
+            vx0=vx0,
+            vy0=vy0,
+            vx1=vx1,
+            vy1=vy1,
+            weather=weather,
+            rng=rng,
+        )
+        px_c, py_c = p_anchor if p_anchor is not None else (vcx, vy0 + 0.74 * veh_h_px)
+        px_c = float(np.clip(px_c, 74.0, float(w_c) - 74.0))
+        py_c = float(np.clip(py_c, 52.0, float(h_c) - 48.0))
+
+        cx_cam, cy_cam = 0.5 * float(w_c), float(horizon_y)
+        tx_3d = (px_c - cx_cam) * z_m / fx
+        ty_3d = (py_c - cy_cam) * z_m / fx
+        H_3d = _compute_3d_plate_homography(
+            pw_m=pw_m,
+            ph_m=ph_m,
+            center_3d=(tx_3d, ty_3d, z_m),
+            yaw_deg=yaw_deg,
+            pitch_deg=pitch_deg,
+            roll_deg=roll_deg,
+            fx=fx,
+            fy=fx,
+            cx=cx_cam,
+            cy=cy_cam,
+        )
+        q_canvas = cv2.perspectiveTransform(_UNIT_QUAD_4, H_3d).reshape(4, 2).astype(np.float32)
+
+        # Keep true corners inside [20, W_c-20] x [16, H_c-16] so sensor never clips true plate
+        dx_clamp = 0.0
+        dy_clamp = 0.0
+        if float(q_canvas[:, 0].min()) < 20.0:
+            dx_clamp = 20.0 - float(q_canvas[:, 0].min())
+        elif float(q_canvas[:, 0].max()) > float(w_c) - 20.0:
+            dx_clamp = (float(w_c) - 20.0) - float(q_canvas[:, 0].max())
+        if float(q_canvas[:, 1].min()) < 16.0:
+            dy_clamp = 16.0 - float(q_canvas[:, 1].min())
+        elif float(q_canvas[:, 1].max()) > float(h_c) - 16.0:
+            dy_clamp = (float(h_c) - 16.0) - float(q_canvas[:, 1].max())
+        if dx_clamp != 0.0 or dy_clamp != 0.0:
+            q_canvas[:, 0] += dx_clamp
+            q_canvas[:, 1] += dy_clamp
+
+        # Optional outer chrome/black dealer bracket outside physical [0, 1]^2 boundary
+        if rng.random() < 0.26:
+            H_u2c = cv2.getPerspectiveTransform(_UNIT_QUAD_4.reshape(4, 2), q_canvas)
+            outer_u = np.array([[[-0.045, -0.06]], [[1.045, -0.06]], [[1.045, 1.10]], [[-0.045, 1.10]]], dtype=np.float32)
+            outer_p = cv2.perspectiveTransform(outer_u, H_u2c).reshape(4, 2)
+            cv2.fillConvexPoly(canvas, np.round(outer_p).astype(np.int32), (210, 216, 224) if rng.random() < 0.5 else (28, 30, 34), lineType=cv2.LINE_AA)
+
+        w_edge_mean = 0.5 * (float(np.linalg.norm(q_canvas[1] - q_canvas[0])) + float(np.linalg.norm(q_canvas[2] - q_canvas[3])))
+        src_patch = entry.patch_half if w_edge_mean < 64.0 else entry.patch_full
+        _warp_patch_into_canvas(canvas, src_patch, q_canvas)
+
+        # Optional opaque top-lip bumper/tailgate overhang (~18% of positives)
+        corner_unoccluded = np.ones((4,), dtype=bool)
+        lip_pen = 1.0
+        vis_support = 1.0
+        if rng.random() < 0.18:
+            H_u2lip = cv2.getPerspectiveTransform(_UNIT_QUAD_4.reshape(4, 2), q_canvas)
+            lip_depth = rng.uniform(0.04, 0.11)
+            lip_pen = 1.0 - 1.5 * lip_depth
+            vis_support = 1.0 - lip_depth
+            if lip_depth >= 0.055:
+                corner_unoccluded[0] = False
+                corner_unoccluded[1] = False
+            lip_u = np.array([[[-0.08, -0.28]], [[1.08, -0.28]], [[1.08, lip_depth]], [[-0.08, lip_depth]]], dtype=np.float32)
+            lip_p = cv2.perspectiveTransform(lip_u, H_u2lip).reshape(4, 2)
+            cv2.fillConvexPoly(canvas, np.round(lip_p).astype(np.int32), (32, 36, 42), lineType=cv2.LINE_AA)
+
+        # 35% deep upper-half overhang shadow (`0.06x-0.25x` luminance multiplier) across recessed pocket & upper half
+        sh_pen = 1.0
+        qx0_c, qy0_c = float(q_canvas[:, 0].min()), float(q_canvas[:, 1].min())
+        qx1_c, qy1_c = float(q_canvas[:, 0].max()), float(q_canvas[:, 1].max())
+        qw_c = max(6.0, qx1_c - qx0_c)
+        qh_c = max(4.0, qy1_c - qy0_c)
+        if rng.random() < 0.35:
+            sh_frac = rng.uniform(0.30, 0.56)
+            sh_dark = rng.uniform(0.06, 0.25)
+            sh_pen = 0.78 + 0.35 * sh_dark
+            sx0 = max(0, int(math.floor(qx0_c - 0.35 * qw_c)))
+            sx1 = min(w_c, int(math.ceil(qx1_c + 0.35 * qw_c)))
+            sy0 = max(0, int(math.floor(qy0_c - 0.45 * qh_c)))
+            sy1 = min(h_c, int(math.ceil(qy1_c + 0.15 * qh_c)))
+            if sx1 > sx0 + 2 and sy1 > sy0 + 2:
+                yy_p, xx_p = np.mgrid[sy0:sy1, sx0:sx1].astype(np.float32)
+                sh_tilt = rng.uniform(-4.5, 4.5)
+                y_cut = qy0_c + sh_frac * qh_c + sh_tilt * ((xx_p - 0.5 * (qx0_c + qx1_c)) / max(8.0, qw_c))
+                y_top = qy0_c - 0.30 * qh_c
+                alpha_y = np.clip((y_cut - yy_p) / rng.uniform(1.8, 4.2), 0.0, 1.0) * np.clip((yy_p - y_top) / max(2.0, 0.18 * qh_c), 0.0, 1.0)
+                x_pad = 0.22 * qw_c
+                alpha_x = np.clip((xx_p - (qx0_c - x_pad)) / max(2.0, 0.15 * qw_c), 0.0, 1.0) * np.clip(((qx1_c + x_pad) - xx_p) / max(2.0, 0.15 * qw_c), 0.0, 1.0)
+                sh_m = (1.0 - (alpha_y * alpha_x) * (1.0 - sh_dark))[:, :, None]
+                canvas[sy0:sy1, sx0:sx1] = np.clip(canvas[sy0:sy1, sx0:sx1].astype(np.float32) * sh_m, 0.0, 255.0).astype(np.uint8)
+
+        # 45% coupled pre-resize `12..30 px` + H.264 8x8 DCT + 4:2:0 low-res degradation on `(320, 480, 3)`
+        qual_deg = 1.0
+        bvx_c, bvy_c = 0.0, 0.0
+        if rng.random() < 0.45:
+            qual_deg, (bvx_c, bvy_c) = _apply_coupled_lowres_dct_420_np(
+                canvas, rng, curr_obj_px=w_edge_mean, target_px_range=(12.0, 30.0)
+            )
+        elif rng.random() < 0.26:
+            canvas[:] = cv2.GaussianBlur(canvas, (3, 3), rng.uniform(0.55, 1.15))
+            qual_deg *= 0.88
+
+        r_ph = rng.random()
+        if r_ph < 0.14:
+            gray = cv2.cvtColor(canvas, cv2.COLOR_RGB2GRAY)
+            canvas[:, :, 0] = gray
+            canvas[:, :, 1] = gray
+            canvas[:, :, 2] = gray
+            qual_deg *= 0.92
+        elif r_ph < 0.26:
+            gain_n = rng.uniform(0.42, 0.72)
+            canvas[:] = np.clip(canvas.astype(np.float32) * gain_n, 0.0, 255.0).astype(np.uint8)
+            qual_deg *= 0.86
+
+        # Sample detector/tracker proposal bbox according to `sampling_policy` (`0..3`),
+        # keeping unclamped signed `corners_norm` strictly in `[-0.35, 1.35]` (never clamped to `[0, 1]`!).
+        qcx_c = 0.5 * (qx0_c + qx1_c)
+        qcy_c = 0.5 * (qy0_c + qy1_c)
+        want_overhang = prop_rng.random() < (0.64 if pol in (1, 2) else (0.26 if pol == 0 else 0.16))
+
+        chosen_prop = (qx0_c, qy0_c, qx1_c, qy1_c)
+        for _ in range(96):
+            if want_overhang:
+                ang_p = prop_rng.uniform(0.0, 2.0 * math.pi)
+                rad_p = prop_rng.uniform(0.46, 0.88) * math.hypot(qw_c, qh_c)
+                pcx = qcx_c + rad_p * math.cos(ang_p)
+                pcy = qcy_c + rad_p * math.sin(ang_p) * 0.82
+                sc_p = prop_rng.uniform(0.68, 1.04)
+                ar_p = math.exp(prop_rng.uniform(-0.22, 0.22))
+            else:
+                pcx = qcx_c + prop_rng.uniform(-0.20, 0.20) * qw_c
+                pcy = qcy_c + prop_rng.uniform(-0.20, 0.20) * qh_c
+                sc_p = prop_rng.uniform(0.88, 1.30)
+                ar_p = math.exp(prop_rng.uniform(-0.14, 0.14))
+            pw_p = max(6.0, qw_c * sc_p * ar_p)
+            ph_p = max(4.0, qh_c * sc_p / ar_p)
+            cand_prop = (pcx - 0.5 * pw_p, pcy - 0.5 * ph_p, pcx + 0.5 * pw_p, pcy + 0.5 * ph_p)
+            win_f_cand, _ = concentric_roi_windows(cand_prop, gamma=1.0, fovea_scale=fov_s, surround_scale=sur_s)
+            rx_f, ry_f, rwf, rhf = win_f_cand
+            cn_x = (q_canvas[:, 0] - rx_f) / max(1e-3, rwf)
+            cn_y = (q_canvas[:, 1] - ry_f) / max(1e-3, rhf)
+            if (
+                float(cn_x.min()) >= -0.345
+                and float(cn_x.max()) <= 1.345
+                and float(cn_y.min()) >= -0.345
+                and float(cn_y.max()) <= 1.345
+            ):
+                is_outside_unit = bool(
+                    float(cn_x.min()) < 0.0
+                    or float(cn_x.max()) > 1.0
+                    or float(cn_y.min()) < 0.0
+                    or float(cn_y.max()) > 1.0
+                )
+                if (not want_overhang) or is_outside_unit:
+                    chosen_prop = cand_prop
+                    break
+
+        fov_u8, sur_u8, win_f, _ = extract_dual_concentric_plate_rois(
+            canvas, chosen_prop, gamma=1.0, fovea_scale=fov_s, surround_scale=sur_s
+        )
+        rx0_f, ry0_f, rw_f, rh_f = win_f
+        corners_norm = np.empty((4, 2), dtype=np.float32)
+        corners_norm[:, 0] = (q_canvas[:, 0] - rx0_f) / max(1e-3, rw_f)
+        corners_norm[:, 1] = (q_canvas[:, 1] - ry0_f) / max(1e-3, rh_f)
+
+        in_sensor = (
+            (q_canvas[:, 0] >= 0.0)
+            & (q_canvas[:, 0] < float(w_c))
+            & (q_canvas[:, 1] >= 0.0)
+            & (q_canvas[:, 1] < float(h_c))
+        )
+        in_fovea = (
+            (corners_norm[:, 0] >= 0.0)
+            & (corners_norm[:, 0] <= 1.0)
+            & (corners_norm[:, 1] >= 0.0)
+            & (corners_norm[:, 1] <= 1.0)
+        )
+        corner_vis = (corner_unoccluded & in_sensor & in_fovea).astype(np.float32)
+
+        ix0_f = max(0.0, float(corners_norm[:, 0].min()))
+        iy0_f = max(0.0, float(corners_norm[:, 1].min()))
+        ix1_f = min(1.0, float(corners_norm[:, 0].max()))
+        iy1_f = min(1.0, float(corners_norm[:, 1].max()))
+        span_x = max(1e-4, float(corners_norm[:, 0].max() - corners_norm[:, 0].min()))
+        span_y = max(1e-4, float(corners_norm[:, 1].max() - corners_norm[:, 1].min()))
+        fov_frac = max(0.0, ix1_f - ix0_f) * max(0.0, iy1_f - iy0_f) / (span_x * span_y)
+        vis_frac_total = float(np.clip(vis_support * (0.35 + 0.65 * fov_frac), 0.15, 1.0))
+
+        edge_lens = [float(np.linalg.norm(q_canvas[(ei + 1) % 4] - q_canvas[ei])) for ei in range(4)]
+        min_edge_px = float(min(edge_lens)) * min(1.0, qual_deg * 1.15)
+        blur_mag_px = float(math.hypot(bvx_c, bvy_c))
+        snr_est = float(np.clip(14.0 * qual_deg * sh_pen, 1.5, 22.0))
+        ang_factor = max(0.35, math.cos(math.radians(abs(yaw_deg) * 0.75)) * math.cos(math.radians(abs(pitch_deg) * 0.6)))
+        tight_quality = float(np.clip(qual_deg * ang_factor * lip_pen * sh_pen, 0.15, 1.0))
+        blur_vec_norm = np.array([bvx_c / max(1e-3, rw_f), bvy_c / max(1e-3, rh_f)], dtype=np.float32)
+
+        return {
+            "fovea_rgb": fov_u8,
+            "surround_rgb": sur_u8,
+            "is_plate": 1.0,
+            "corners_norm": corners_norm,
+            "corner_vis": corner_vis,
+            "plate_id": int(plate_id),
+            "sampling_policy": pol,
+            "plate_side": int(plate_side),
+            "tight_quality": round(tight_quality, 4),
+            "visible_support_fraction": round(vis_frac_total, 4),
+            "is_large": 1.0 if entry.is_large else 0.0,
+            "blur_vec_norm": blur_vec_norm,
+            "min_projected_edge_px": round(min_edge_px, 3),
+            "blur_magnitude_px": round(blur_mag_px, 3),
+            "local_contrast_snr": round(snr_est, 3),
+        }
 
 
 class QuadCropBatch(NamedTuple):

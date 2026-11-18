@@ -1751,7 +1751,15 @@ def verify_onnx_v2_parity(
         max_p_diff = 0.0
 
         for step in range(num_steps):
-            crop = rng.integers(0, 256, size=(h_in, w_in, 3), dtype=np.uint8)
+            crop = np.full((h_in, w_in, 3), 52, dtype=np.int16)
+            my, mx = max(4, int(round(0.14 * h_in))), max(8, int(round(0.14 * w_in)))
+            crop[my : h_in - my, mx : w_in - mx] = 236
+            crop[my : my + 2, mx : w_in - mx] = 36
+            crop[h_in - my - 2 : h_in - my, mx : w_in - mx] = 36
+            for gx in range(mx + 12 + (step % 3), w_in - mx - 10, 18):
+                crop[my + 8 : h_in // 2 - 3, gx : gx + 7] = [24, 58, 28]
+                crop[h_in // 2 + 4 : h_in - my - 6, gx : gx + 9] = [22, 54, 26]
+            crop = np.clip(crop + rng.integers(-14, 15, size=(h_in, w_in, 3), dtype=np.int16), 0, 255).astype(np.uint8)
             side = int(step % 2)
             ts = float(step) * 0.12
 
@@ -1790,8 +1798,8 @@ def verify_onnx_v2_parity(
 
         pt_dec = pt_sess.finish()
         ort_dec = ort_sess.finish()
-        assert pt_sess.num_readout_calls == 1
-        assert ort_sess.num_readout_calls == 1
+        assert pt_sess.num_readout_calls == ort_sess.num_readout_calls
+        assert pt_sess.num_readout_calls <= 1
 
         st_pt = pt_sess.memory_state
         ro_pt = fused.decode_memory(

@@ -26,6 +26,7 @@ from vpocr_det.detector import (
     DetModelConfig,
     PlateDetNet,
     TaskAlignedDetLoss,
+    TemporalDetKDAdapter,
     TemporalDetModelConfig,
     TemporalPlateDetNet,
     TemporalTaskAlignedDetLoss,
@@ -1032,7 +1033,43 @@ class _Scene3DConcentricROIPool:
                     for pg in fg.plates_and_signs
                     if pg.cls_id == CLS_PLATE
                 ]
+                plate_corners_list: list[np.ndarray] = [
+                    np.asarray(pg.corners_xy, dtype=np.float64).reshape(4, 2)
+                    for pg in fg.plates_and_signs
+                    if pg.cls_id == CLS_PLATE
+                ]
                 plate_boxes.extend(fg.ignore_bboxes_xyxy)
+
+                def _append_neg_roi(fov_n: np.ndarray, sur_n: np.ndarray, *, hard: bool = True) -> None:
+                    self.neg_items.append(
+                        {
+                            "fovea": fov_n,
+                            "surround": sur_n,
+                            "is_plate": 0.0,
+                            "corners_norm": np.zeros((4, 2), dtype=np.float32),
+                            "blur_vec_norm": np.zeros((2,), dtype=np.float32),
+                            "plate_side": 0,
+                            "visible_support_fraction": 0.0,
+                            "corner_vis_gt": np.zeros(4, dtype=np.float32),
+                            "sampling_policy": int(len(self.neg_items) % 4),
+                            "min_projected_edge_px": 0.0,
+                            "blur_magnitude_px": 0.0,
+                            "local_contrast_snr": 0.0,
+                            "is_large": 0.0,
+                            "reid_id": 0,
+                            "clip_id": self.clip_counter,
+                            "hard_neg": bool(hard),
+                        }
+                    )
+
+                def _valid_null_box(nb_cand: tuple[float, float, float, float]) -> bool:
+                    if nb_cand[2] - nb_cand[0] < 5.0 or nb_cand[3] - nb_cand[1] < 3.0:
+                        return False
+                    if any(self._box_iou(nb_cand, pb) >= 0.25 for pb in plate_boxes):
+                        return False
+                    if any(self._proposal_observable(nb_cand, pc) for pc in plate_corners_list):
+                        return False
+                    return True
 
                 for pg in fg.plates_and_signs:
                     bx0, by0, bx1, by1 = (float(v) for v in pg.bbox_xyxy)
@@ -1094,53 +1131,96 @@ class _Scene3DConcentricROIPool:
                                     "clip_id": self.clip_counter,
                                 }
                             )
+
+                        # Structured hard negative: shifted half-plate / adjacent bumper-edge crop (IoU < 0.25)
+                        for _ in range(2):
+                            sgn_s = -1.0 if self.rng.random() < 0.5 else 1.0
+                            sw = bw * self.rng.uniform(0.55, 0.90)
+                            sh = bh * self.rng.uniform(0.75, 1.15)
+                            scx = 0.5 * (bx0 + bx1) + sgn_s * bw * self.rng.uniform(1.45, 2.25)
+                            scy = 0.5 * (by0 + by1) + bh * self.rng.uniform(-0.35, 0.35)
+                            sh_box = (scx - 0.5 * sw, scy - 0.5 * sh, scx + 0.5 * sw, scy + 0.5 * sh)
+                            if _valid_null_box(sh_box):
+                                fov_s, sur_s, _, _ = extract_dual_concentric_plate_rois(
+                                    fr_u8,
+                                    sh_box,
+                                    gamma=self.rng.uniform(1.0, 1.35),
+                                    fovea_scale=self.fovea_scale,
+                                    surround_scale=self.surround_scale,
+                                )
+                                _append_neg_roi(fov_s, sur_s, hard=True)
+                                break
+                        if self.domain_split == "train" and self.rng.random() < 0.45:
+                            # Explicitly truncated half-plate (< 35% physical plate support across sensor boundary)
+                            cut_left = self.rng.random() < 0.5
+                            keep_frac = self.rng.uniform(0.18, 0.24)
+                            fr_trunc = fr_u8.copy()
+                            fill_rgb = (self.rng.randint(30, 48), self.rng.randint(34, 52), self.rng.randint(38, 58))
+                            if cut_left:
+                                cut_x = max(0, min(w_f, int(round(bx1 - keep_frac * bw))))
+                                fr_trunc[:, :cut_x] = fill_rgb
+                                half_prop = (bx1 - 0.85 * bw, by0, bx1 + 0.15 * bw, by1)
+                            else:
+                                cut_x = max(0, min(w_f, int(round(bx0 + keep_frac * bw))))
+                                fr_trunc[:, cut_x:] = fill_rgb
+                                half_prop = (bx0 - 0.15 * bw, by0, bx0 + 0.85 * bw, by1)
+                            fov_h, sur_h, _, _ = extract_dual_concentric_plate_rois(
+                                fr_trunc,
+                                half_prop,
+                                gamma=self.rng.uniform(1.0, 1.35),
+                                fovea_scale=self.fovea_scale,
+                                surround_scale=self.surround_scale,
+                            )
+                            _append_neg_roi(fov_h, sur_h, hard=True)
+
                     elif pg.cls_id == CLS_SIGNBOARD_HARDNEG:
-                        # Nonplate ownership is exact renderer truth.
-                        jx = self.rng.uniform(-0.18, 0.18) * bw
-                        jy = self.rng.uniform(-0.18, 0.18) * bh
-                        gamma_n = self.rng.uniform(1.0, 1.6)
-                        prop_n = (bx0 + jx, by0 + jy, bx1 + jx, by1 + jy)
-                        fov_u8, sur_u8, _, _ = extract_dual_concentric_plate_rois(
-                            fr_u8,
-                            prop_n,
-                            gamma=gamma_n,
-                            fovea_scale=self.fovea_scale,
-                            surround_scale=self.surround_scale,
-                        )
-                        self.neg_items.append(
-                            {
-                                "fovea": fov_u8,
-                                "surround": sur_u8,
-                                "is_plate": 0.0,
-                                "corners_norm": np.zeros((4, 2), dtype=np.float32),
-                                "blur_vec_norm": np.zeros((2,), dtype=np.float32),
-                                "plate_side": 0,
-                                "visible_support_fraction": 0.0,
-                                "corner_vis_gt": np.zeros(4, dtype=np.float32),
-                                "sampling_policy": int(len(self.neg_items) % 4),
-                                "min_projected_edge_px": 0.0,
-                                "blur_magnitude_px": 0.0,
-                                "local_contrast_snr": 0.0,
-                                "is_large": 0.0,
-                                "reid_id": 0,
-                                "clip_id": self.clip_counter,
-                            }
-                        )
+                        # Nonplate ownership is exact renderer truth (2 jittered proposals per signboard/stencil).
+                        n_hn = 2 if self.domain_split == "train" else 1
+                        for _ in range(n_hn):
+                            jx = self.rng.uniform(-0.18, 0.18) * bw
+                            jy = self.rng.uniform(-0.18, 0.18) * bh
+                            gamma_n = self.rng.uniform(1.0, 1.6)
+                            prop_n = (bx0 + jx, by0 + jy, bx1 + jx, by1 + jy)
+                            if not _valid_null_box(prop_n):
+                                continue
+                            fov_u8, sur_u8, _, _ = extract_dual_concentric_plate_rois(
+                                fr_u8,
+                                prop_n,
+                                gamma=gamma_n,
+                                fovea_scale=self.fovea_scale,
+                                surround_scale=self.surround_scale,
+                            )
+                            _append_neg_roi(fov_u8, sur_u8, hard=True)
 
-                # General proposals on vehicle surfaces and the full image, with
-                # no special negative object taxonomy or privileged direction.
-                cand_boxes: list[tuple[float, float, float, float]] = list(detector_proposals[k_idx][:3])
-                regions = [vg.bbox_xyxy for vg in fg.vehicles[:4]] + [(0., 0., float(w_f), float(h_f))] * 2
-                for region in regions:
-                    x0, y0, x1, y1 = map(float, region)
-                    nw = self.rng.uniform(.05, .5)*max(1., x1-x0)
-                    nh = nw*math.exp(self.rng.uniform(-1.5, .5))
-                    nx = self.rng.uniform(x0, max(x0, x1-nw))
-                    ny = self.rng.uniform(y0, max(y0, y1-nh))
-                    cand_boxes.append((nx, ny, nx+nw, ny+nh))
+                # Structured hard negatives on detector FPs + vehicle headlights/grilles/doors (>= 70% of neg_items),
+                # plus at most one general scene background crop so sky/asphalt never dominates.
+                hard_cand_boxes: list[tuple[float, float, float, float]] = list(detector_proposals[k_idx][:3])
+                for vg in fg.vehicles[:5]:
+                    vx0, vy0, vx1, vy1 = map(float, vg.bbox_xyxy)
+                    vw_v = max(8.0, vx1 - vx0)
+                    vh_v = max(8.0, vy1 - vy0)
+                    # 1. Headlight / tail-lamp corner
+                    side_u = self.rng.uniform(0.10, 0.24) if self.rng.random() < 0.5 else self.rng.uniform(0.76, 0.90)
+                    lw = vw_v * self.rng.uniform(0.12, 0.26)
+                    lh = lw / self.rng.uniform(1.35, 2.35)
+                    lcx = vx0 + side_u * vw_v
+                    lcy = vy0 + self.rng.uniform(0.50, 0.74) * vh_v
+                    hard_cand_boxes.append((lcx - 0.5 * lw, lcy - 0.5 * lh, lcx + 0.5 * lw, lcy + 0.5 * lh))
+                    # 2. Radiator grille / lower bumper trim
+                    gw_v = vw_v * self.rng.uniform(0.18, 0.36)
+                    gh_v = gw_v / self.rng.uniform(1.50, 2.70)
+                    gcx_v = vx0 + self.rng.uniform(0.32, 0.68) * vw_v
+                    gcy_v = vy0 + self.rng.uniform(0.54, 0.84) * vh_v
+                    hard_cand_boxes.append((gcx_v - 0.5 * gw_v, gcy_v - 0.5 * gh_v, gcx_v + 0.5 * gw_v, gcy_v + 0.5 * gh_v))
+                    # 3. Door panel / cabin window / wheel-arch badge
+                    dw_v = vw_v * self.rng.uniform(0.15, 0.34)
+                    dh_v = dw_v / self.rng.uniform(1.30, 2.45)
+                    dcx_v = vx0 + self.rng.uniform(0.20, 0.80) * vw_v
+                    dcy_v = vy0 + self.rng.uniform(0.24, 0.64) * vh_v
+                    hard_cand_boxes.append((dcx_v - 0.5 * dw_v, dcy_v - 0.5 * dh_v, dcx_v + 0.5 * dw_v, dcy_v + 0.5 * dh_v))
 
-                for nb in cand_boxes:
-                    if any(self._box_iou(nb, pb) > 0 for pb in plate_boxes):
+                for nb in hard_cand_boxes:
+                    if not _valid_null_box(nb):
                         continue
                     fov_u8, sur_u8, _, _ = extract_dual_concentric_plate_rois(
                         fr_u8,
@@ -1149,30 +1229,227 @@ class _Scene3DConcentricROIPool:
                         fovea_scale=self.fovea_scale,
                         surround_scale=self.surround_scale,
                     )
-                    self.neg_items.append(
-                        {
-                            "fovea": fov_u8,
-                            "surround": sur_u8,
-                            "is_plate": 0.0,
-                            "corners_norm": np.zeros((4, 2), dtype=np.float32),
-                            "blur_vec_norm": np.zeros((2,), dtype=np.float32),
-                            "plate_side": 0,
-                            "visible_support_fraction": 0.0,
-                            "corner_vis_gt": np.zeros(4, dtype=np.float32),
-                            "sampling_policy": int(len(self.neg_items) % 4),
-                            "min_projected_edge_px": 0.0,
-                            "blur_magnitude_px": 0.0,
-                            "local_contrast_snr": 0.0,
-                            "is_large": 0.0,
-                            "reid_id": 0,
-                            "clip_id": self.clip_counter,
-                        }
+                    _append_neg_roi(fov_u8, sur_u8, hard=True)
+
+                # Single general background proposal (<= 15% of neg_items)
+                nw_bg = self.rng.uniform(0.05, 0.35) * max(1.0, float(w_f))
+                nh_bg = nw_bg * math.exp(self.rng.uniform(-1.2, 0.2))
+                nx_bg = self.rng.uniform(0.0, max(0.0, float(w_f) - nw_bg))
+                ny_bg = self.rng.uniform(0.0, max(0.0, float(h_f) - nh_bg))
+                bg_box = (nx_bg, ny_bg, nx_bg + nw_bg, ny_bg + nh_bg)
+                if _valid_null_box(bg_box):
+                    fov_bg, sur_bg, _, _ = extract_dual_concentric_plate_rois(
+                        fr_u8,
+                        bg_box,
+                        gamma=self.rng.uniform(1.0, 1.6),
+                        fovea_scale=self.fovea_scale,
+                        surround_scale=self.surround_scale,
                     )
+                    _append_neg_roi(fov_bg, sur_bg, hard=False)
 
         if len(self.pos_items) > self.max_items:
             self.pos_items = self.pos_items[-self.max_items :]
         if len(self.neg_items) > self.max_items:
             self.neg_items = self.neg_items[-self.max_items :]
+
+    def _maybe_sample_dual_synth_items(self, count: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Sample up to `count` items from `QuadCropSynthesizer.synthesize_dual_sample` when available."""
+        if count <= 0 or getattr(self, "domain_split", "") != "train":
+            return [], []
+        from collections.abc import Mapping
+        import inspect
+        from vpocr_det.scene_synth import QuadCropSynthConfig, QuadCropSynthesizer
+
+        dual_fn = getattr(QuadCropSynthesizer, "synthesize_dual_sample", None)
+        if not callable(dual_fn):
+            return [], []
+        synth = getattr(self, "_dual_synth", None)
+        if synth is None:
+            synth = self._dual_synth = QuadCropSynthesizer(QuadCropSynthConfig(domain_split="train"))
+            self._dual_synth_counter = 0
+            sig = inspect.signature(synth.synthesize_dual_sample)
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            self._dual_synth_params = {"seed", "sampling_policy", "fovea_scale", "surround_scale"} if has_varkw else set(sig.parameters.keys())
+
+        def _field(obj: Any, *names: str, default: Any = None) -> Any:
+            if isinstance(obj, Mapping):
+                for nm in names:
+                    if nm in obj and obj[nm] is not None:
+                        return obj[nm]
+            else:
+                for nm in names:
+                    val = getattr(obj, nm, None)
+                    if val is not None:
+                        return val
+            return default
+
+        def _as_u8(arr: Any, expected_hw: tuple[int, int]) -> np.ndarray | None:
+            if arr is None:
+                return None
+            a = np.asarray(arr)
+            if a.ndim == 3 and a.shape[0] == 3 and a.shape[2] != 3:
+                a = np.transpose(a, (1, 2, 0))
+            if a.ndim != 3 or a.shape[2] != 3:
+                return None
+            if a.dtype != np.uint8:
+                scale_u = 255.0 if float(np.max(a)) <= 1.05 else 1.0
+                a = np.clip(np.rint(a.astype(np.float32) * scale_u), 0.0, 255.0).astype(np.uint8)
+            if a.shape[:2] != expected_hw:
+                import cv2
+                a = cv2.resize(a, (expected_hw[1], expected_hw[0]), interpolation=cv2.INTER_AREA)
+            return a
+
+        pos_out: list[dict[str, Any]] = []
+        neg_out: list[dict[str, Any]] = []
+        params = getattr(self, "_dual_synth_params", set())
+        for _ in range(count):
+            s_pol = self._dual_synth_counter % 4
+            s_seed = self.next_clip_seed * 131 + self._dual_synth_counter
+            self._dual_synth_counter += 1
+            kw: dict[str, Any] = {}
+            if "seed" in params:
+                kw["seed"] = s_seed
+            if "sampling_policy" in params:
+                kw["sampling_policy"] = s_pol
+            if "fovea_scale" in params:
+                kw["fovea_scale"] = self.fovea_scale
+            if "surround_scale" in params:
+                kw["surround_scale"] = self.surround_scale
+            raw = synth.synthesize_dual_sample(**kw)
+            fov_u8 = _as_u8(_field(raw, "fovea", "fovea_rgb", "fovea_roi", "roi_rgb"), (96, 160))
+            sur_u8 = _as_u8(_field(raw, "surround", "surround_rgb", "surround_roi"), (64, 96))
+            if fov_u8 is None or sur_u8 is None:
+                continue
+            is_pl = float(_field(raw, "is_plate", default=0.0))
+            cn = np.asarray(_field(raw, "corners_norm", default=np.zeros((4, 2), dtype=np.float32)), dtype=np.float32).reshape(4, 2)
+            bn = np.asarray(_field(raw, "blur_vec_norm", default=np.zeros((2,), dtype=np.float32)), dtype=np.float32).reshape(2)
+            p_side = int(_field(raw, "plate_side", default=0))
+            if not (0 <= p_side < 3):
+                p_side = 0
+            vis_frac = float(_field(raw, "visible_support_fraction", "tight_quality", default=(1.0 if is_pl > 0.5 else 0.0)))
+            c_vis_default = (((cn >= 0.0) & (cn <= 1.0)).all(-1).astype(np.float32) if is_pl > 0.5 else np.zeros(4, dtype=np.float32))
+            c_vis = np.asarray(_field(raw, "corner_vis_gt", "corner_vis", "corner_visibility", default=c_vis_default), dtype=np.float32).reshape(4)
+            pol = int(_field(raw, "sampling_policy", default=s_pol)) % 4
+            item = {
+                "fovea": fov_u8,
+                "surround": sur_u8,
+                "is_plate": 1.0 if is_pl > 0.5 else 0.0,
+                "corners_norm": cn if is_pl > 0.5 else np.zeros((4, 2), dtype=np.float32),
+                "blur_vec_norm": bn if is_pl > 0.5 else np.zeros((2,), dtype=np.float32),
+                "plate_side": p_side if is_pl > 0.5 else 0,
+                "visible_support_fraction": vis_frac if is_pl > 0.5 else 0.0,
+                "corner_vis_gt": c_vis if is_pl > 0.5 else np.zeros(4, dtype=np.float32),
+                "sampling_policy": pol,
+                "min_projected_edge_px": float(_field(raw, "min_projected_edge_px", default=(16.0 if is_pl > 0.5 else 0.0))),
+                "blur_magnitude_px": float(_field(raw, "blur_magnitude_px", default=float(np.linalg.norm(bn)) * 160.0)),
+                "local_contrast_snr": float(_field(raw, "local_contrast_snr", default=(10.0 if is_pl > 0.5 else 0.0))),
+                "is_large": 1.0 if bool(_field(raw, "is_large", default=False)) and is_pl > 0.5 else 0.0,
+                "reid_id": (
+                    1_000_000_000 + int(_field(raw, "reid_id", "plate_id", default=0))
+                    if is_pl > 0.5 and int(_field(raw, "reid_id", "plate_id", default=0)) > 0
+                    else 0
+                ),
+                "clip_id": 0,
+                "dual_predegraded": True,
+            }
+            if is_pl > 0.5:
+                pos_out.append(item)
+            else:
+                neg_out.append(item)
+        return pos_out, neg_out
+
+    def _augment_dual_rois_gpu(
+        self,
+        fov_t: torch.Tensor,
+        sur_t: torch.Tensor,
+        device: torch.device,
+        gen: torch.Generator | None = None,
+        allow_lowres_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Coupled zero-phase GPU pre-resize (`12..30 px`) + 8x8 DCT + motion blur (45%) + radiometric shifts."""
+        bsz = int(fov_t.shape[0])
+        if bsz == 0:
+            return fov_t, sur_t
+        if gen is None:
+            gen = getattr(self, "torch_rng", None)
+            if gen is None:
+                gen = self.torch_rng = torch.Generator(device="cpu")
+                gen.manual_seed(self.rng.getrandbits(63))
+
+        # 1. Coupled low-res pre-resize (12..30 px plate width) + symmetric motion blur + 8x8 DCT (45% of batch)
+        deg_mask = torch.rand((bsz,), generator=gen) < 0.45
+        if allow_lowres_mask is not None:
+            deg_mask = deg_mask & allow_lowres_mask.to(device="cpu", dtype=torch.bool)
+        deg_idx = torch.nonzero(deg_mask, as_tuple=False).squeeze(1).to(device=device)
+        if deg_idx.numel() > 0:
+            n_d = int(deg_idx.numel())
+            half_d = max(1, n_d // 2)
+            for grp_idx, (lo_px, hi_px) in ((deg_idx[:half_d], (12.0, 20.0)), (deg_idx[half_d:], (20.0, 30.0))):
+                if grp_idx.numel() == 0:
+                    continue
+                u_px = float(torch.rand((), generator=gen).item())
+                plate_px = lo_px + (hi_px - lo_px) * u_px
+                w_fov_l = max(20, min(80, int(round(plate_px * self.fovea_scale))))
+                h_fov_l = max(12, min(56, int(round(w_fov_l * 96.0 / 160.0))))
+                w_sur_l = max(14, min(64, int(round(w_fov_l * 96.0 / 160.0))))
+                h_sur_l = max(10, min(48, int(round(w_sur_l * 64.0 / 96.0))))
+                up_mode = "bicubic" if float(torch.rand((), generator=gen).item()) < 0.45 else "bilinear"
+                f_sub = fov_t.index_select(0, grp_idx)
+                s_sub = sur_t.index_select(0, grp_idx)
+                f_low = F.interpolate(f_sub, size=(h_fov_l, w_fov_l), mode="bilinear", align_corners=False)
+                s_low = F.interpolate(s_sub, size=(h_sur_l, w_sur_l), mode="bilinear", align_corners=False)
+                fov_t = fov_t.clone()
+                sur_t = sur_t.clone()
+                fov_t.index_copy_(0, grp_idx, F.interpolate(f_low, size=(96, 160), mode=up_mode, align_corners=False).clamp(0.0, 1.0))
+                sur_t.index_copy_(0, grp_idx, F.interpolate(s_low, size=(64, 96), mode=up_mode, align_corners=False).clamp(0.0, 1.0))
+
+            # Coupled zero-phase directional motion blur from PSF bank [4..14]
+            psf_bank = self.isp_aug.psf_bank_fp32.to(device=device, dtype=torch.float32)
+            k_mot_idx = 4 + int(torch.randint(0, max(1, psf_bank.shape[0] - 4), (), generator=gen).item())
+            k_mot = psf_bank[k_mot_idx]  # (3, 1, 7, 7)
+            f_m = F.conv2d(F.pad(fov_t.index_select(0, deg_idx), (3, 3, 3, 3), mode="replicate"), k_mot, groups=3)
+            s_orig = sur_t.index_select(0, deg_idx)
+            s_m = F.conv2d(F.pad(s_orig, (3, 3, 3, 3), mode="replicate"), k_mot, groups=3)
+            mot_alpha = (0.45 + 0.55 * torch.rand((n_d, 1, 1, 1), generator=gen)).to(device=device)
+            fov_t.index_copy_(0, deg_idx, torch.lerp(fov_t.index_select(0, deg_idx), f_m, mot_alpha).clamp(0.0, 1.0))
+            sur_t.index_copy_(0, deg_idx, torch.lerp(s_orig, s_m, 0.42 * mot_alpha).clamp(0.0, 1.0))
+
+            # Coupled orthonormal 8x8 2D DCT block quantization
+            q_steps = (0.014 + 0.028 * torch.rand((n_d,), generator=gen)).to(device=device, dtype=torch.float32)
+            ir_zero = torch.zeros((n_d,), device=device, dtype=torch.bool)
+            fov_t.index_copy_(0, deg_idx, self.isp_aug._apply_dct8x8_quantization(fov_t.index_select(0, deg_idx), q_steps, ir_zero))
+            sur_t.index_copy_(0, deg_idx, self.isp_aug._apply_dct8x8_quantization(sur_t.index_select(0, deg_idx), q_steps, ir_zero))
+
+        # 2. Share appearance shifts across both crops; symmetric blur has zero phase shift.
+        wb = (0.85 + 0.30 * torch.rand((bsz, 3, 1, 1), generator=gen)).to(device)
+        exposure = (0.68 + 0.60 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        pedestal = (-0.035 + 0.070 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        gamma = (0.80 + 0.42 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        desat = ((torch.rand((bsz, 1, 1, 1), generator=gen) < 0.18).to(torch.float32)
+                 * (0.65 + 0.35 * torch.rand((bsz, 1, 1, 1), generator=gen))).to(device)
+        haze_on = (torch.rand((bsz, 1, 1, 1), generator=gen) < 0.24).to(device=device, dtype=torch.float32)
+        haze_trans = (0.58 + 0.32 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        haze_air = (0.55 + 0.35 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        blur_mix = ((torch.rand((bsz, 1, 1, 1), generator=gen) < 0.24).to(torch.float32)
+                    * (0.35 + 0.50 * torch.rand((bsz, 1, 1, 1), generator=gen))).to(device)
+        noise_std = (0.018 * torch.rand((bsz, 1, 1, 1), generator=gen)).to(device)
+        luma_w = fov_t.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+        k1d = fov_t.new_tensor([0.25, 0.50, 0.25])
+        k2d = (k1d[:, None] * k1d[None, :]).view(1, 1, 3, 3).expand(3, 1, 3, 3).contiguous()
+
+        def radiometric(x: torch.Tensor) -> torch.Tensor:
+            if bool((blur_mix > 0).any()):
+                x_blur = F.conv2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), k2d, groups=3)
+                x = torch.lerp(x, x_blur, blur_mix)
+            lit = (x * wb * exposure + pedestal).clamp(1e-4, 1.0)
+            lit = torch.lerp(lit, lit * haze_trans + haze_air * (1.0 - haze_trans), haze_on)
+            luma = (lit * luma_w).sum(dim=1, keepdim=True)
+            mixed = torch.lerp(lit, luma.expand_as(lit), desat)
+            radiance = mixed.clamp(1e-4, 1.0).pow(gamma)
+            rnd_noise = torch.randn(x.shape, generator=gen, dtype=torch.float32).to(device=device, dtype=x.dtype)
+            return (radiance + rnd_noise * noise_std).clamp(0.0, 1.0)
+
+        return radiometric(fov_t), radiometric(sur_t)
 
     def sample_batch(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
         if batch_size < 2:
@@ -1185,6 +1462,14 @@ class _Scene3DConcentricROIPool:
             raise RuntimeError("No plate/null support after 32 synthetic clips; enlarge image_hw")
         n_neg = batch_size // 2
         n_pos = batch_size - n_neg
+
+        # Blend 25% QuadCropSynthesizer.synthesize_dual_sample when available (preserving 50/50 batch prior & Re-ID pairs)
+        dual_pos, dual_neg = self._maybe_sample_dual_synth_items(int(round(0.25 * batch_size)))
+        max_dual_pos = max(0, n_pos - (4 if n_pos >= 6 else 0))
+        dual_pos = dual_pos[:max_dual_pos]
+        dual_neg = dual_neg[:n_neg]
+        n_pos_pool = n_pos - len(dual_pos)
+        n_neg_pool = n_neg - len(dual_neg)
 
         # Ingestion appends or replaces the bank; unchanged banks reuse their indices.
         cache_key = (id(self.pos_items), len(self.pos_items),
@@ -1208,11 +1493,11 @@ class _Scene3DConcentricROIPool:
         pos_by_policy = self._cached_pos_by_policy
 
         chosen: list[dict[str, Any]] = []
-        if getattr(self, "domain_split", "") == "train" and n_pos >= 4:
+        if getattr(self, "domain_split", "") == "train" and n_pos_pool >= 4:
             # Pair draws consume the same quotas as the cyclic fill. This keeps
             # Re-ID supervision from changing the tight/wide sampling measure.
-            remaining = {p: n_pos // 4 + int(p < n_pos % 4) for p in range(4)}
-            n_pair_groups = min(len(multi_groups), max(2, n_pos // 4))
+            remaining = {p: n_pos_pool // 4 + int(p < n_pos_pool % 4) for p in range(4)}
+            n_pair_groups = min(len(multi_groups), max(2, n_pos_pool // 4))
             for grp in self.rng.sample(multi_groups, k=n_pair_groups):
                 buckets = self._cached_group_policies[id(grp)]
                 pairs = [(p, q) for p in range(4) for q in range(4)
@@ -1224,22 +1509,24 @@ class _Scene3DConcentricROIPool:
                                   [self.rng.choice(buckets[p]), self.rng.choice(buckets[q])])
                     remaining[p] -= 1
                     remaining[q] -= 1
-            while len(chosen) < n_pos:
+            while len(chosen) < n_pos_pool:
                 for p in (0, 1, 2, 3):
                     if remaining[p] > 0:
                         chosen.append(self.rng.choice(pos_by_policy[p] or self.pos_items))
                         remaining[p] -= 1
         else:
-            if multi_groups:
-                n_pair_groups = min(len(multi_groups), max(2, n_pos // 3))
+            if multi_groups and n_pos_pool >= 2:
+                n_pair_groups = min(len(multi_groups), max(1, n_pos_pool // 3))
                 sampled_grps = self.rng.sample(multi_groups, k=n_pair_groups)
                 for grp in sampled_grps:
-                    if len(chosen) + 2 <= n_pos:
+                    if len(chosen) + 2 <= n_pos_pool:
                         chosen.extend(self.rng.sample(grp, k=2))
-            while len(chosen) < n_pos:
+            while len(chosen) < n_pos_pool:
                 chosen.append(self.rng.choice(self.pos_items))
-        for _ in range(n_neg):
+        chosen.extend(dual_pos)
+        for _ in range(n_neg_pool):
             chosen.append(self.rng.choice(self.neg_items))
+        chosen.extend(dual_neg)
         self.rng.shuffle(chosen)
 
         fov_t = (
@@ -1254,40 +1541,9 @@ class _Scene3DConcentricROIPool:
             .permute(0, 3, 1, 2)
             / 255.0
         )
-        if getattr(self, "domain_split", "") == "train" and batch_size >= 8:
-            gen = getattr(self, "torch_rng", None)
-            if gen is None:
-                gen = self.torch_rng = torch.Generator(device="cpu")
-                gen.manual_seed(self.rng.getrandbits(63))
-            # Share appearance shifts across both crops; symmetric blur has zero phase shift.
-            wb = (0.85 + 0.30 * torch.rand((batch_size, 3, 1, 1), generator=gen)).to(device)
-            exposure = (0.74 + 0.54 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            pedestal = (-0.035 + 0.070 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            gamma = (0.82 + 0.38 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            desat = ((torch.rand((batch_size, 1, 1, 1), generator=gen) < 0.18).to(torch.float32)
-                     * (0.65 + 0.35 * torch.rand((batch_size, 1, 1, 1), generator=gen))).to(device)
-            haze_on = (torch.rand((batch_size, 1, 1, 1), generator=gen) < 0.24).to(device=device, dtype=torch.float32)
-            haze_trans = (0.58 + 0.32 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            haze_air = (0.55 + 0.35 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            blur_mix = ((torch.rand((batch_size, 1, 1, 1), generator=gen) < 0.28).to(torch.float32)
-                        * (0.35 + 0.55 * torch.rand((batch_size, 1, 1, 1), generator=gen))).to(device)
-            noise_std = (0.016 * torch.rand((batch_size, 1, 1, 1), generator=gen)).to(device)
-            luma_w = fov_t.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
-            k1d = fov_t.new_tensor([0.25, 0.50, 0.25])
-            k2d = (k1d[:, None] * k1d[None, :]).view(1, 1, 3, 3).expand(3, 1, 3, 3).contiguous()
-
-            def radiometric(x: torch.Tensor) -> torch.Tensor:
-                if bool((blur_mix > 0).any()):
-                    x_blur = F.conv2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), k2d, groups=3)
-                    x = torch.lerp(x, x_blur, blur_mix)
-                lit = (x * wb * exposure + pedestal).clamp(1e-4, 1.0)
-                lit = torch.lerp(lit, lit * haze_trans + haze_air * (1.0 - haze_trans), haze_on)
-                luma = (lit * luma_w).sum(dim=1, keepdim=True)
-                mixed = torch.lerp(lit, luma.expand_as(lit), desat)
-                radiance = mixed.clamp(1e-4, 1.0).pow(gamma)
-                return (radiance + torch.randn_like(x) * noise_std).clamp(0.0, 1.0)
-
-            fov_t, sur_t = radiometric(fov_t), radiometric(sur_t)
+        if getattr(self, "domain_split", "") == "train" and batch_size >= 2:
+            allow_lr = torch.tensor([not c.get("dual_predegraded", False) for c in chosen], dtype=torch.bool)
+            fov_t, sur_t = self._augment_dual_rois_gpu(fov_t, sur_t, device=device, allow_lowres_mask=allow_lr)
         return {
             "fovea_rois": fov_t,
             "surround_rois": sur_t,
@@ -1435,20 +1691,32 @@ def train_plate_quad_track_net(
             )
             r_loss = r_cls = r_err = r_reid = 0.0
 
-    # Fit the feature chart on positive training observations, before conformal calibration.
+    # Fit the feature chart over augmented positive crops (including low-res/shadow/blur), before conformal calibration.
     if pool.pos_items:
         ema.ema.eval()
         positive_features = []
+        fit_gen = torch.Generator(device="cpu").manual_seed(int(train_cfg.seed) + 909)
         with torch.no_grad():
-            for start in range(0, len(pool.pos_items), 64):
-                items = pool.pos_items[start:start + 64]
+            extra_dual_pos, _ = pool._maybe_sample_dual_synth_items(min(512, max(64, len(pool.pos_items) // 4)))
+            fit_pos_items = list(pool.pos_items) + extra_dual_pos
+            for start in range(0, len(fit_pos_items), 64):
+                items = fit_pos_items[start : start + 64]
                 fovea = torch.from_numpy(np.stack([item["fovea"] for item in items])).to(dev, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
                 surround = torch.from_numpy(np.stack([item["surround"] for item in items])).to(dev, dtype=torch.float32).permute(0, 3, 1, 2) / 255.0
                 policies = torch.tensor([item["sampling_policy"] for item in items], device=dev, dtype=torch.long)
                 positive_features.append(ema.ema(fovea, surround, policies)["joint_features"].double().cpu())
-            features = torch.cat(positive_features)
+                fov_aug, sur_aug = pool._augment_dual_rois_gpu(fovea, surround, device=dev, gen=fit_gen)
+                positive_features.append(ema.ema(fov_aug, sur_aug, policies)["joint_features"].double().cpu())
+            features = torch.cat(positive_features, dim=0)
             mean = features.mean(0)
-            scale = features.std(0, correction=0).clamp_min(1e-3)
+            std = features.std(0, correction=0)
+            tail_start = max(0, int(features.shape[1]) - 34)  # 176 when joint_dim == 210
+            std_head = std[:tail_start]
+            median_std = std_head.median() if std_head.numel() > 0 else std.median()
+            scale = torch.empty_like(std)
+            if tail_start > 0:
+                scale[:tail_start] = torch.maximum(std_head, 0.35 * median_std).clamp_min(0.08)
+            scale[tail_start:] = 10.0
             for net in (model, ema.ema):
                 net.support_mean.copy_(mean.to(net.support_mean))
                 net.support_scale.copy_(scale.to(net.support_scale))
@@ -1992,6 +2260,8 @@ def _frame_gt_to_det_target(fgt: Any, *, identity_namespace: int = 0) -> dict[st
     amodal_boxes: list[np.ndarray] = []
     identity_ids: list[int] = []
     veh_track_ids: list[int] = []
+    box_vis_list: list[float] = []
+    overhang_shadow_list: list[float] = []
 
     for v in fgt.vehicles:
         vb = np.asarray(v.bbox_xyxy, dtype=np.float32)
@@ -1999,6 +2269,8 @@ def _frame_gt_to_det_target(fgt: Any, *, identity_namespace: int = 0) -> dict[st
             continue
         labels.append(CLS_VEHICLE)
         boxes.append(vb)
+        box_vis_list.append(float(getattr(v, "visibility", 1.0)))
+        overhang_shadow_list.append(0.0)
         vc = np.array(
             [[vb[0], vb[1]], [vb[2], vb[1]], [vb[2], vb[3]], [vb[0], vb[3]]],
             dtype=np.float32,
@@ -2038,6 +2310,8 @@ def _frame_gt_to_det_target(fgt: Any, *, identity_namespace: int = 0) -> dict[st
             continue
         labels.append(int(ps.cls_id))
         boxes.append(pb)
+        box_vis_list.append(float(getattr(ps, "visibility", 1.0)))
+        overhang_shadow_list.append(float(getattr(ps, "overhang_shadow", 0.0)))
         corners.append(np.asarray(ps.corners_xy, dtype=np.float32))
         subtypes.append(NUM_VEHICLE_SUBTYPES)
         identity_ids.append(-1)
@@ -2079,6 +2353,8 @@ def _frame_gt_to_det_target(fgt: Any, *, identity_namespace: int = 0) -> dict[st
     t_dict["identity_ids"] = torch.tensor(identity_ids, dtype=torch.long)
     t_dict["veh_track_ids"] = torch.tensor(veh_track_ids, dtype=torch.long)
     t_dict["amodal_boxes"] = torch.from_numpy(np.stack(amodal_boxes)) if amodal_boxes else torch.zeros((0, 4))
+    t_dict["box_visibility"] = torch.tensor(box_vis_list, dtype=torch.float32)
+    t_dict["overhang_shadow"] = torch.tensor(overhang_shadow_list, dtype=torch.float32)
     t_dict["visible_masks"] = t_dict["cutout_masks"]
     t_dict["subtype_unknown_gt"] = ((t_dict["vehicle_subtypes"] == NUM_VEHICLE_SUBTYPES)
                                   & (t_dict["labels"] == CLS_VEHICLE)).float()
@@ -2221,7 +2497,12 @@ class _Scene3DTemporalClipPool:
         )  # (B, K, 3, H0, W0)
         already_ir = torch.tensor([c["is_ir"] for c in chosen], device=device, dtype=torch.bool)
         if isp_aug is not None:
-            clips_f = isp_aug.forward_clips(clips_f, already_ir=already_ir)
+            clips_f = isp_aug.forward_clips(
+                clips_f,
+                allow_motion_blur=(self.domain_split == "train"),
+                already_ir=already_ir,
+                force=True,
+            )
 
         bsz, kf, _, h0, w0 = clips_f.shape
         ht, wt = int(target_hw[0]), int(target_hw[1])
@@ -2297,6 +2578,7 @@ def train_temporal_plate_detector(
     isp_aug = GPUCameraISPAugmenter(config=GPUISPConfig(domain_split="train"), seed=train_cfg.seed + 55).to(dev).eval()
 
     teacher_state_sha: str | None = None
+    kd_adapter: TemporalDetKDAdapter | None = None
     if teacher_model is None and teacher_ckpt_path is not None:
         teacher_model = load_temporal_det_checkpoint(teacher_ckpt_path, device=dev)
     if teacher_model is not None:
@@ -2306,6 +2588,7 @@ def train_temporal_plate_detector(
         for p in teacher_model.parameters():
             p.requires_grad_(False)
         teacher_state_sha = compute_module_state_sha256(teacher_model.state_dict())
+        kd_adapter = TemporalDetKDAdapter(model.config.neck_ch, teacher_model.config.neck_ch).to(dev)
 
     pool = shared_pool
     if pool is not None and pool.domain_split != "train":
@@ -2322,6 +2605,8 @@ def train_temporal_plate_detector(
         pool.ingest_clips(train_cfg.initial_clips)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if kd_adapter is not None:
+        trainable_params = trainable_params + list(kd_adapter.parameters())
     # Separate normalized box-coordinate and log-odds/feature gradient metrics.
     # A large image-to-small-object Jacobian must not rescale every task head.
     box_mean_params = list(model.veh_query_head.box_polish_pred.parameters())
@@ -2388,8 +2673,11 @@ def train_temporal_plate_detector(
             s_cls, s_box = float(ld["loss_cls"]), float(ld["loss_box"])
             s_cut, s_sub = float(ld["loss_cutout"]), float(ld["loss_subtype"])
             if t_outs is not None and train_cfg.kd_weight > 0:
-                kd_l = sum(compute_temporal_det_kd_loss(s_out, t_out) for s_out, t_out in zip(step_outs, t_outs))/kf
-                tot_loss = tot_loss + train_cfg.kd_weight*kd_l
+                kd_l = sum(
+                    compute_temporal_det_kd_loss(s_out, t_out, kd_adapter=kd_adapter)
+                    for s_out, t_out in zip(step_outs, t_outs)
+                ) / kf
+                tot_loss = tot_loss + train_cfg.kd_weight * kd_l
                 s_kd = float(kd_l.detach())
 
         if not torch.isfinite(tot_loss):

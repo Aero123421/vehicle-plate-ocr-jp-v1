@@ -39,7 +39,7 @@ const options = {
   autoSealFrames: 12,
   autoSealMinSec: 0.9,
   autoSealMinPrecision: 0.7,
-  autoExitSec: 0.55,
+  autoExitSec: 1.10,
   requireFullFieldsForEarlySeal: true,
   discardShortUnreadable: true,
 };
@@ -276,7 +276,7 @@ function updateSmoothingTargets(payload, wallNow) {
         clamp(predC[k][1] + prev.cornersOffset[k][1] * decay - ny, -48, 48),
       ]);
     }
-    const optRef = t.optPatch ? createOpticalRef(t.optPatch, t.corners) : prev?.optRef ?? null;
+    const optRef = t.optPatch ? createOpticalRef(t.optPatch, t.optCorners ?? t.corners) : prev?.optRef ?? null;
     smoothPlates.set(t.id, {
       corners: t.corners,
       box: t.box,
@@ -637,7 +637,7 @@ function alignPlateToLiveVideo(sm, liveKey, dt, w, h, wallNow) {
   const res = trackPlateOpticalCore(sm.optRef, sampleRoi, w, h, guessCorners, {
     searchRadiusPx,
     allowScaleSearch,
-    minZncc: 0.60,
+    minZncc: sm.optRef.basis.width < 36 ? 0.50 : 0.60,
     maxIter: 6,
   });
 

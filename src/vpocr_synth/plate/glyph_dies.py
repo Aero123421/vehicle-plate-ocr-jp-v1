@@ -648,21 +648,50 @@ class GlyphSDFAtlas:
                 font_cache[key] = f
             return f
 
-        # Pre-rasterize unique Japanese font bitmaps + skeleton sheets + counter/endpoint maps
+        # Pre-rasterize unique Japanese font bitmaps + 2x (128x128) skeleton/counter/Voronoi-gap sheets
         skel_face_cache: dict[
             tuple[str, int],
-            dict[int, tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, int]],
+            dict[
+                int,
+                tuple[
+                    np.ndarray,
+                    float,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    int,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                ],
+            ],
         ] = {}
         jp_faces: dict[
             tuple[str, int],
-            dict[int, tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, int]],
+            dict[
+                int,
+                tuple[
+                    np.ndarray,
+                    np.ndarray,
+                    float,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    int,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                ],
+            ],
         ] = {}
         jp_tids = [
             tid
             for tid in range(1, self.vocab_size)
             if not MLITVectorDieEngine.supports(self.vocab.id_to_token[tid])
         ]
-        k_close5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k_close19 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
         k_ones3 = np.ones((3, 3), dtype=np.uint8)
 
         for fpath, fidx, _, _, _ in self.STYLE_RECIPES:
@@ -681,63 +710,152 @@ class GlyphSDFAtlas:
             if skel_key_data := skel_face_cache.get(skey):
                 skel_map = skel_key_data
             else:
-                skel_font = get_font(skel_path, fidx, 56)
-                # Batch 16x16 sheet of 64x64 glyphs for single-call distanceTransform + 1D ridge skeleton!
-                sk_sheet = np.zeros((16 * 68, 16 * 68), dtype=np.uint8)
+                # 2x supersampled (128x128) skeleton & topological Voronoi gap extraction
+                skel_font_2x = get_font(skel_path, fidx, 112)
+                s2_stride = 136  # 128 + 2*4 pad
+                sk_sheet_2x = np.zeros((16 * s2_stride, 16 * s2_stride), dtype=np.uint8)
                 for tid in jp_tids:
                     tok = self.vocab.id_to_token[tid]
                     r_r, r_c = divmod(tid, 16)
-                    sk_sheet[r_r * 68 + 2 : r_r * 68 + 66, r_c * 68 + 2 : r_c * 68 + 66] = (
-                        self._rasterize_char_tight(tok, skel_font, canvas_hw=(64, 64), margin_frac=0.045)
+                    sk_sheet_2x[
+                        r_r * s2_stride + 4 : r_r * s2_stride + 132,
+                        r_c * s2_stride + 4 : r_c * s2_stride + 132,
+                    ] = self._rasterize_char_tight(
+                        tok, skel_font_2x, canvas_hw=(128, 128), margin_frac=0.045
                     )
-                dist_sh = cv2.distanceTransform(sk_sheet, cv2.DIST_L2, 3)
-                sh_h, sh_w = dist_sh.shape
-                yy = np.arange(sh_h, dtype=np.float32)[:, None] * 1e-4
-                xx = np.arange(sh_w, dtype=np.float32)[None, :] * 1.3e-4
-                d_tb = dist_sh + (yy + xx) * (sk_sheet > 0)
-                d_pad = np.pad(d_tb, 1, mode="constant", constant_values=0.0)
-                c = d_pad[1:-1, 1:-1]
-                ridge_sh = (
-                    (sk_sheet > 0)
-                    & (dist_sh >= 0.65)
-                    & (((c >= d_pad[1:-1, :-2]) & (c >= d_pad[1:-1, 2:])) | ((c >= d_pad[:-2, 1:-1]) & (c >= d_pad[2:, 1:-1])))
+                dist_sh_2x = cv2.distanceTransform(sk_sheet_2x, cv2.DIST_L2, 5)
+                sh_h2, sh_w2 = dist_sh_2x.shape
+                yy2 = np.arange(sh_h2, dtype=np.float32)[:, None] * 1e-4
+                xx2 = np.arange(sh_w2, dtype=np.float32)[None, :] * 1.3e-4
+                d_tb2 = dist_sh_2x + (yy2 + xx2) * (sk_sheet_2x > 0)
+                d_pad2 = np.pad(d_tb2, 1, mode="constant", constant_values=0.0)
+                c2_p = d_pad2[1:-1, 1:-1]
+                ridge_sh_2x = (
+                    (sk_sheet_2x > 0)
+                    & (dist_sh_2x >= 0.85)
+                    & (
+                        ((c2_p >= d_pad2[1:-1, :-2]) & (c2_p >= d_pad2[1:-1, 2:]))
+                        | ((c2_p >= d_pad2[:-2, 1:-1]) & (c2_p >= d_pad2[2:, 1:-1]))
+                    )
                 ).astype(np.uint8)
 
                 skel_map = {}
                 for tid in jp_tids:
                     r_r, r_c = divmod(tid, 16)
-                    sk_bmp = sk_sheet[r_r * 68 + 2 : r_r * 68 + 66, r_c * 68 + 2 : r_c * 68 + 66]
-                    sk_cell = ridge_sh[r_r * 68 + 2 : r_r * 68 + 66, r_c * 68 + 2 : r_c * 68 + 66]
-                    if not np.any(sk_cell):
-                        sk_cell = sk_bmp
-                    dens = float(sk_cell.sum()) / float(64 * 64)
-                    core_mask, bay_core, end_mask, n_counters = self._extract_counter_and_end_features(
-                        sk_bmp, sk_cell, k_close5, k_ones3
+                    sk_bmp_2x = sk_sheet_2x[
+                        r_r * s2_stride + 4 : r_r * s2_stride + 132,
+                        r_c * s2_stride + 4 : r_c * s2_stride + 132,
+                    ]
+                    sk_cell_2x = ridge_sh_2x[
+                        r_r * s2_stride + 4 : r_r * s2_stride + 132,
+                        r_c * s2_stride + 4 : r_c * s2_stride + 132,
+                    ]
+                    if not np.any(sk_cell_2x):
+                        sk_cell_2x = sk_bmp_2x
+                    # Equivalent 1x skeleton density (sum / (2 * 64 * 64) since 1D curve length scales 2x)
+                    dens = float(sk_cell_2x.sum()) / float(2 * 64 * 64)
+                    core_2x, voronoi_gap_2x, end_2x, n_counters = (
+                        self._extract_counter_voronoi_and_end_features_2x(
+                            sk_bmp_2x, sk_cell_2x, k_close19, k_ones3
+                        )
                     )
-                    skel_map[tid] = (sk_cell, dens, core_mask, bay_core, end_mask, n_counters)
+                    # Downproject 2x topological masks to 64x64 for Bucket 0 open-counter / bay preservation
+                    sk64 = np.zeros((64, 64), dtype=np.uint8)
+                    sy2, sx2 = np.nonzero(sk_cell_2x)
+                    if sy2.size > 0:
+                        sk64[np.clip(sy2 >> 1, 0, 63), np.clip(sx2 >> 1, 0, 63)] = 1
+                    core64 = np.zeros((64, 64), dtype=np.uint8)
+                    cy2, cx2 = np.nonzero(core_2x)
+                    if cy2.size > 0:
+                        core64[np.clip(cy2 >> 1, 0, 63), np.clip(cx2 >> 1, 0, 63)] = 1
+                    gap64 = np.zeros((64, 64), dtype=np.uint8)
+                    gy2, gx2 = np.nonzero(voronoi_gap_2x)
+                    if gy2.size > 0:
+                        gap64[np.clip(gy2 >> 1, 0, 63), np.clip(gx2 >> 1, 0, 63)] = 1
+                        gap64[sk64 > 0] = 0
+                    end64 = np.zeros((64, 64), dtype=np.uint8)
+                    ey2, ex2 = np.nonzero(end_2x)
+                    if ey2.size > 0:
+                        end64[np.clip(ey2 >> 1, 0, 63), np.clip(ex2 >> 1, 0, 63)] = 1
+
+                    skel_map[tid] = (
+                        sk64,
+                        dens,
+                        core64,
+                        gap64,
+                        end64,
+                        n_counters,
+                        sk_cell_2x,
+                        core_2x,
+                        voronoi_gap_2x,
+                        end_2x,
+                    )
                 skel_face_cache[skey] = skel_map
 
             bold_font = get_font(fpath, fidx, 54)
             face_map: dict[
-                int, tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray, int]
+                int,
+                tuple[
+                    np.ndarray,
+                    np.ndarray,
+                    float,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    int,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                    np.ndarray,
+                ],
             ] = {}
             for tid in jp_tids:
                 tok = self.vocab.id_to_token[tid]
                 bmp64 = self._rasterize_char_tight(tok, bold_font, canvas_hw=(64, 64), margin_frac=0.045)
-                sk64, dens, core_mask, bay_core, end_mask, n_counters = skel_map[tid]
-                if np.any(core_mask) or np.any(bay_core):
+                (
+                    sk64,
+                    dens,
+                    core64,
+                    gap64,
+                    end64,
+                    n_counters,
+                    sk_cell_2x,
+                    core_2x,
+                    voronoi_gap_2x,
+                    end_2x,
+                ) = skel_map[tid]
+                if np.any(core64) or np.any(gap64):
                     bmp64 = bmp64.copy()
-                    # Preserve enclosed MLIT counters (口/田/日/目 & Hiragana loops) without breaking skeleton
-                    bmp64[(core_mask > 0) & (sk64 == 0)] = 0
-                    if np.any(bay_core):
+                    # Preserve enclosed MLIT counters (口/田/日/目 & small Hiragana loops) without breaking skeleton
+                    bmp64[(core64 > 0) & (sk64 == 0)] = 0
+                    if np.any(gap64):
                         d_bold_in = cv2.distanceTransform(bmp64, cv2.DIST_L2, 3)
-                        bmp64[(bay_core > 0) & (sk64 == 0) & (d_bold_in <= 1.75)] = 0
-                face_map[tid] = (bmp64, sk64, dens, core_mask, bay_core, end_mask, n_counters)
+                        bmp64[(gap64 > 0) & (sk64 == 0) & (d_bold_in <= 1.85)] = 0
+                face_map[tid] = (
+                    bmp64,
+                    sk64,
+                    dens,
+                    core64,
+                    gap64,
+                    end64,
+                    n_counters,
+                    sk_cell_2x,
+                    core_2x,
+                    voronoi_gap_2x,
+                    end_2x,
+                )
             jp_faces[fkey] = face_map
 
         # Tiled sheet helper: 16x16 cells of (80x80) = (1280x1280) -> single cv2.distanceTransform in <2ms!
         cell_pad = 8
         cell_sz = self.GLYPH_SIZE + 2 * cell_pad  # 80
+
+        # 2x supersampled condensed physical sheet (128x76, aspect 76/128 = 0.594 ~ 0.58)
+        w_phys_2x = 76
+        h_phys_2x = 128
+        c_pad_2x = 12
+        c_cell_w2 = w_phys_2x + 2 * c_pad_2x   # 100
+        c_cell_h2 = h_phys_2x + 2 * c_pad_2x   # 152
 
         for s_idx, (fpath, fidx, ascii_mode, die_params, r_scale) in enumerate(self.STYLE_RECIPES):
             face_map = jp_faces[(fpath, fidx)]
@@ -749,25 +867,25 @@ class GlyphSDFAtlas:
 
             for b_idx, aspect in enumerate(self.ASPECT_BUCKETS):
                 is_condensed = b_idx == 1
-                # Tiled sheet for bitmap-to-SDF tokens in this (style, bucket)
+                # Tiled sheet for bitmap-to-SDF tokens in Bucket 0
                 sheet_fg = np.zeros((16 * cell_sz, 16 * cell_sz), dtype=np.uint8)
+                sheet_core = np.zeros((16 * cell_sz, 16 * cell_sz), dtype=np.uint8)
+                sheet_gap = np.zeros((16 * cell_sz, 16 * cell_sz), dtype=np.uint8)
+                sheet_end = np.zeros((16 * cell_sz, 16 * cell_sz), dtype=np.uint8)
                 sheet_tids: list[int] = []
-                std_jp_meta: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+                std_jp_meta: dict[int, tuple[bool, bool, bool, bool]] = {}
 
-                # Condensed physical sheet (height 64, width 38) for skeleton-first isotropic dilation!
-                w_phys = 38  # 38 / 64 = 0.594 ~ 0.58 physical condensed slot aspect
-                c_cell_w = w_phys + 2 * cell_pad  # 54
-                c_cell_h = self.GLYPH_SIZE + 2 * cell_pad  # 80
-                cond_skel_sheet = np.zeros((16 * c_cell_h, 16 * c_cell_w), dtype=np.uint8)
-                cond_core_sheet = np.zeros((16 * c_cell_h, 16 * c_cell_w), dtype=np.uint8)
-                cond_end_sheet = np.zeros((16 * c_cell_h, 16 * c_cell_w), dtype=np.uint8)
-                cond_radii: dict[int, tuple[float, bool, bool]] = {}
+                # 2x supersampled condensed physical sheets (128, 76) per cell
+                cond_skel_sheet_2x = np.zeros((16 * c_cell_h2, 16 * c_cell_w2), dtype=np.uint8)
+                cond_core_sheet_2x = np.zeros((16 * c_cell_h2, 16 * c_cell_w2), dtype=np.uint8)
+                cond_gap_sheet_2x = np.zeros((16 * c_cell_h2, 16 * c_cell_w2), dtype=np.uint8)
+                cond_end_sheet_2x = np.zeros((16 * c_cell_h2, 16 * c_cell_w2), dtype=np.uint8)
+                cond_radii: dict[int, tuple[float, bool, bool, bool, bool]] = {}
 
                 for tid in range(1, self.vocab_size):
                     tok = self.vocab.id_to_token[tid]
                     if MLITVectorDieEngine.supports(tok):
                         if ascii_font is not None and tok not in ("-", "・"):
-                            # Diversity style with permissive OSS Latin/digit font
                             bmp = self._rasterize_char_tight(tok, ascii_font, canvas_hw=(64, 64), margin_frac=0.11)
                             r_row, r_col = divmod(tid, 16)
                             y0 = r_row * cell_sz + cell_pad
@@ -775,7 +893,6 @@ class GlyphSDFAtlas:
                             sheet_fg[y0 : y0 + 64, x0 : x0 + 64] = bmp
                             sheet_tids.append(tid)
                         else:
-                            # Procedural MLIT vector stamped die (already exact analytical SDF!)
                             char_asp = 0.90 if not is_condensed else 0.56
                             out[b_idx, s_idx, tid] = MLITVectorDieEngine.render_sdf_u8(
                                 tok,
@@ -785,50 +902,118 @@ class GlyphSDFAtlas:
                             )
                         continue
 
-                    bmp64, skel72, density, core_mask, _bay_core, end_mask, n_counters = face_map[tid]
+                    (
+                        bmp64,
+                        _sk64,
+                        density,
+                        core64,
+                        gap64,
+                        end64,
+                        n_counters,
+                        sk_cell_2x,
+                        core_2x,
+                        voronoi_gap_2x,
+                        end_2x,
+                    ) = face_map[tid]
+                    is_hiragana = len(tok) == 1 and ("\u3040" <= tok <= "\u309f")
                     r_row, r_col = divmod(tid, 16)
 
                     if not is_condensed:
-                        # Bucket 0 (aspect=1.0): open-counter shaped bitmap SDF
+                        # Bucket 0 (aspect=1.0): open-counter + Voronoi-gap shaped bitmap SDF
                         y0 = r_row * cell_sz + cell_pad
                         x0 = r_col * cell_sz + cell_pad
                         sheet_fg[y0 : y0 + 64, x0 : x0 + 64] = bmp64
                         sheet_tids.append(tid)
-                        if np.any(core_mask) or np.any(end_mask):
-                            std_jp_meta[tid] = (core_mask, end_mask)
+                        hc = bool(np.any(core64))
+                        hg = bool(np.any(gap64))
+                        he = bool(np.any(end64))
+                        if hc:
+                            sheet_core[y0 : y0 + 64, x0 : x0 + 64] = core64
+                        if hg:
+                            sheet_gap[y0 : y0 + 64, x0 : x0 + 64] = gap64
+                        if he:
+                            sheet_end[y0 : y0 + 64, x0 : x0 + 64] = end64
+                        if hc or hg or he:
+                            std_jp_meta[tid] = (hc, hg, he, is_hiragana)
                     else:
-                        # Bucket 1 (aspect=0.58): Skeleton-First Horizontal Pre-Compression + Counter Relief!
-                        sy, sx = np.nonzero(skel72)
-                        ty = sy
-                        tx = np.clip((sx.astype(np.float32) * ((w_phys - 1.0) / 63.0)).round().astype(np.int32), 0, w_phys - 1)
-                        cy0 = r_row * c_cell_h + cell_pad
-                        cx0 = r_col * c_cell_w + cell_pad
-                        cond_skel_sheet[cy0 + ty, cx0 + tx] = 1
+                        # Bucket 1 (aspect=0.58): 2x Supersampled (76x128) Skeleton + Background Voronoi Ridge!
+                        sy2, sx2 = np.nonzero(sk_cell_2x)
+                        ty2 = sy2
+                        tx2 = np.clip(
+                            (sx2.astype(np.float32) * ((w_phys_2x - 1.0) / 127.0)).round().astype(np.int32),
+                            0,
+                            w_phys_2x - 1,
+                        )
+                        cy0 = r_row * c_cell_h2 + c_pad_2x
+                        cx0 = r_col * c_cell_w2 + c_pad_2x
+                        cond_skel_sheet_2x[cy0 + ty2, cx0 + tx2] = 1
 
-                        has_core = bool(np.any(core_mask))
+                        has_core = bool(np.any(core_2x))
                         if has_core:
-                            ky, kx = np.nonzero(core_mask)
-                            ktx = np.clip((kx.astype(np.float32) * ((w_phys - 1.0) / 63.0)).round().astype(np.int32), 0, w_phys - 1)
-                            cond_core_sheet[cy0 + ky, cx0 + ktx] = 1
+                            ky2, kx2 = np.nonzero(core_2x)
+                            ktx2 = np.clip(
+                                (kx2.astype(np.float32) * ((w_phys_2x - 1.0) / 127.0)).round().astype(np.int32),
+                                0,
+                                w_phys_2x - 1,
+                            )
+                            cond_core_sheet_2x[cy0 + ky2, cx0 + ktx2] = 1
+                            cond_core_sheet_2x[cy0 + ty2, cx0 + tx2] = 0
 
-                        has_end = bool(np.any(end_mask))
+                        has_gap = bool(np.any(voronoi_gap_2x))
+                        if has_gap:
+                            gy2, gx2 = np.nonzero(voronoi_gap_2x)
+                            gtx2 = np.clip(
+                                (gx2.astype(np.float32) * ((w_phys_2x - 1.0) / 127.0)).round().astype(np.int32),
+                                0,
+                                w_phys_2x - 1,
+                            )
+                            cond_gap_sheet_2x[cy0 + gy2, cx0 + gtx2] = 1
+                            # Never allow mapped Voronoi background ridge to overwrite active stroke skeleton
+                            cond_gap_sheet_2x[cy0 + ty2, cx0 + tx2] = 0
+                            has_gap = bool(
+                                np.any(
+                                    cond_gap_sheet_2x[
+                                        cy0 : cy0 + h_phys_2x, cx0 : cx0 + w_phys_2x
+                                    ]
+                                )
+                            )
+
+                        has_end = bool(np.any(end_2x))
                         if has_end:
-                            ey, ex = np.nonzero(end_mask)
-                            etx = np.clip((ex.astype(np.float32) * ((w_phys - 1.0) / 63.0)).round().astype(np.int32), 0, w_phys - 1)
-                            cond_end_sheet[cy0 + ey, cx0 + etx] = 1
+                            ey2, ex2 = np.nonzero(end_2x)
+                            etx2 = np.clip(
+                                (ex2.astype(np.float32) * ((w_phys_2x - 1.0) / 127.0)).round().astype(np.int32),
+                                0,
+                                w_phys_2x - 1,
+                            )
+                            cond_end_sheet_2x[cy0 + ey2, cx0 + etx2] = 1
 
-                        # Adaptive isotropic physical die radius: calibrated for density + multi-counter Kanji
+                        # Adaptive isotropic physical die radius (in 1x physical pixel units)
                         base_die_r = (
-                            float(np.clip(1.98 - 3.7 * density - 0.06 * min(n_counters, 4), 1.12, 1.84))
+                            float(np.clip(1.94 - 3.8 * density - 0.06 * min(n_counters, 4), 1.08, 1.80))
                             * r_scale
                         )
-                        cond_radii[tid] = (base_die_r, has_core, has_end)
+                        cond_radii[tid] = (base_die_r, has_core, has_gap, has_end, is_hiragana)
 
-                # Batch Euclidean SDF for standard bitmap glyphs
+                # Batch Euclidean SDF for standard Bucket-0 bitmap glyphs
                 if sheet_tids:
                     d_in = np.clip(cv2.distanceTransform(sheet_fg, cv2.DIST_L2, 3), 0.0, 12.0)
                     d_out = np.clip(cv2.distanceTransform(1 - (sheet_fg > 0).astype(np.uint8), cv2.DIST_L2, 3), 0.0, 12.0)
-                    # Signed distance in pixels (+ inside, - outside), shifted slightly by r_scale
+                    d_core_sh = (
+                        cv2.distanceTransform(1 - sheet_core, cv2.DIST_L2, 3)
+                        if np.any(sheet_core)
+                        else None
+                    )
+                    d_gap_sh = (
+                        cv2.distanceTransform(1 - sheet_gap, cv2.DIST_L2, 3)
+                        if np.any(sheet_gap)
+                        else None
+                    )
+                    d_end_sh = (
+                        cv2.distanceTransform(1 - sheet_end, cv2.DIST_L2, 3)
+                        if np.any(sheet_end)
+                        else None
+                    )
                     sdf_sheet = (d_in - d_out) + (r_scale - 1.0) * 3.5
                     for tid in sheet_tids:
                         r_row, r_col = divmod(tid, 16)
@@ -836,13 +1021,18 @@ class GlyphSDFAtlas:
                         x0 = r_col * cell_sz + cell_pad
                         sdf_cell = sdf_sheet[y0 : y0 + 64, x0 : x0 + 64]
                         if meta := std_jp_meta.get(tid):
-                            core_m, end_m = meta
+                            hc, hg, he, is_hira = meta
                             sdf_cell = sdf_cell.copy()
-                            if np.any(core_m):
-                                d_cc = cv2.distanceTransform((1 - core_m).astype(np.uint8), cv2.DIST_L2, 3)
-                                sdf_cell = np.minimum(sdf_cell, -0.85 + 0.90 * d_cc)
-                            if np.any(end_m):
-                                d_end = cv2.distanceTransform((1 - end_m).astype(np.uint8), cv2.DIST_L2, 3)
+                            if hc and d_core_sh is not None:
+                                d_cc = d_core_sh[y0 : y0 + 64, x0 : x0 + 64]
+                                core_floor = -1.25 if is_hira else -0.92
+                                core_slope = 1.02 if is_hira else 0.90
+                                sdf_cell = np.minimum(sdf_cell, core_floor + core_slope * d_cc)
+                            if hg and d_gap_sh is not None:
+                                d_gp = d_gap_sh[y0 : y0 + 64, x0 : x0 + 64]
+                                sdf_cell = np.minimum(sdf_cell, -0.52 + 1.05 * d_gp)
+                            if he and d_end_sh is not None:
+                                d_end = d_end_sh[y0 : y0 + 64, x0 : x0 + 64]
                                 sdf_cell = sdf_cell - 0.26 * np.exp(-0.45 * d_end * d_end)
                         out[b_idx, s_idx, tid] = np.clip(
                             np.round(float(self.SDF_ZERO_U8) + sdf_cell * float(self.SDF_SCALE_U8)),
@@ -850,36 +1040,50 @@ class GlyphSDFAtlas:
                             255.0,
                         ).astype(np.uint8)
 
-                # Batch Euclidean SDF in condensed physical space -> resample to 64x64 slot UV
+                # Batch Euclidean SDF in 2x supersampled (128, 76) float space -> downsample float SDF to 64x64
                 if cond_radii:
-                    d_from_skel = np.clip(cv2.distanceTransform(1 - cond_skel_sheet, cv2.DIST_L2, 5), 0.0, 12.0)
-                    d_from_core = (
-                        cv2.distanceTransform(1 - cond_core_sheet, cv2.DIST_L2, 3)
-                        if np.any(cond_core_sheet)
+                    d_from_skel_2x = np.clip(
+                        cv2.distanceTransform(1 - cond_skel_sheet_2x, cv2.DIST_L2, 5), 0.0, 24.0
+                    )
+                    d_from_core_2x = (
+                        cv2.distanceTransform(1 - cond_core_sheet_2x, cv2.DIST_L2, 5)
+                        if np.any(cond_core_sheet_2x)
                         else None
                     )
-                    d_from_end = (
-                        cv2.distanceTransform(1 - cond_end_sheet, cv2.DIST_L2, 3)
-                        if np.any(cond_end_sheet)
+                    d_from_gap_2x = (
+                        cv2.distanceTransform(1 - cond_gap_sheet_2x, cv2.DIST_L2, 5)
+                        if np.any(cond_gap_sheet_2x)
                         else None
                     )
-                    for tid, (die_r, has_core, has_end) in cond_radii.items():
+                    d_from_end_2x = (
+                        cv2.distanceTransform(1 - cond_end_sheet_2x, cv2.DIST_L2, 3)
+                        if np.any(cond_end_sheet_2x)
+                        else None
+                    )
+                    for tid, (die_r, has_core, has_gap, has_end, is_hira) in cond_radii.items():
                         r_row, r_col = divmod(tid, 16)
-                        cy0 = r_row * c_cell_h + cell_pad
-                        cx0 = r_col * c_cell_w + cell_pad
-                        d_cell = d_from_skel[cy0 : cy0 + 64, cx0 : cx0 + w_phys]
-                        # Isotropic circular dilation of 1px skeleton in physical (64, w_phys) space!
-                        sdf_phys = die_r - d_cell
-                        if has_end and d_from_end is not None:
-                            de_cell = d_from_end[cy0 : cy0 + 64, cx0 : cx0 + w_phys]
-                            sdf_phys = sdf_phys - 0.22 * np.exp(-0.55 * de_cell * de_cell)
-                        if has_core and d_from_core is not None:
-                            dc_cell = d_from_core[cy0 : cy0 + 64, cx0 : cx0 + w_phys]
-                            sdf_phys = np.minimum(sdf_phys, -0.75 + 0.88 * dc_cell)
+                        cy0 = r_row * c_cell_h2 + c_pad_2x
+                        cx0 = r_col * c_cell_w2 + c_pad_2x
+                        d_cell_1x = 0.5 * d_from_skel_2x[cy0 : cy0 + h_phys_2x, cx0 : cx0 + w_phys_2x]
+                        # Isotropic circular dilation in 2x supersampled physical float space (1x SDF units)
+                        sdf_phys_2x = die_r - d_cell_1x
+                        if has_end and d_from_end_2x is not None:
+                            de_1x = 0.5 * d_from_end_2x[cy0 : cy0 + h_phys_2x, cx0 : cx0 + w_phys_2x]
+                            sdf_phys_2x = sdf_phys_2x - 0.22 * np.exp(-0.55 * de_1x * de_1x)
+                        if has_gap and d_from_gap_2x is not None:
+                            dg_2x = d_from_gap_2x[cy0 : cy0 + h_phys_2x, cx0 : cx0 + w_phys_2x]
+                            # Protect open inter-stroke corridors via 2D background Voronoi medial ridge
+                            sdf_phys_2x = np.minimum(sdf_phys_2x, -0.58 + 0.78 * dg_2x)
+                        if has_core and d_from_core_2x is not None:
+                            dc_1x = 0.5 * d_from_core_2x[cy0 : cy0 + h_phys_2x, cx0 : cx0 + w_phys_2x]
+                            core_floor = -1.25 if is_hira else -0.88
+                            core_slope = 1.12 if is_hira else 0.94
+                            sdf_phys_2x = np.minimum(sdf_phys_2x, core_floor + core_slope * dc_1x)
+                        # Downsample 2x supersampled float SDF (128x76 -> 64x64) BEFORE uint8 quantization!
                         sdf_uv = cv2.resize(
-                            sdf_phys,
+                            sdf_phys_2x,
                             (self.GLYPH_SIZE, self.GLYPH_SIZE),
-                            interpolation=cv2.INTER_LINEAR,
+                            interpolation=cv2.INTER_AREA,
                         )
                         out[b_idx, s_idx, tid] = np.clip(
                             np.round(float(self.SDF_ZERO_U8) + sdf_uv * float(self.SDF_SCALE_U8)),
@@ -892,17 +1096,18 @@ class GlyphSDFAtlas:
         return out
 
     @staticmethod
-    def _extract_counter_and_end_features(
-        sk_bmp: np.ndarray,
-        sk_cell: np.ndarray,
-        k_close5: np.ndarray,
+    def _extract_counter_voronoi_and_end_features_2x(
+        sk_bmp_2x: np.ndarray,
+        sk_cell_2x: np.ndarray,
+        k_close19: np.ndarray,
         k_ones3: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        """Extract topological enclosed counter cores, concave tail/stroke bays, and stroke-ends."""
-        bg = (1 - (sk_bmp > 0).astype(np.uint8)).astype(np.uint8)
+        """Extract 2x enclosed counter cores, 2D background Voronoi inter-stroke ridges, & stroke-ends."""
+        bg = (1 - (sk_bmp_2x > 0).astype(np.uint8)).astype(np.uint8)
+        d_bg = cv2.distanceTransform(bg, cv2.DIST_L2, 5)
         num_cc, labels = cv2.connectedComponents(bg, connectivity=4)
-        core_mask = np.zeros_like(sk_bmp, dtype=np.uint8)
-        counter_mask = np.zeros_like(sk_bmp, dtype=np.uint8)
+        core_mask = np.zeros_like(sk_bmp_2x, dtype=np.uint8)
+        counter_mask = np.zeros_like(sk_bmp_2x, dtype=np.uint8)
         n_counters = 0
         if num_cc > 2:
             border_lbls = (
@@ -911,7 +1116,6 @@ class GlyphSDFAtlas:
                 | set(np.unique(labels[:, 0]).tolist())
                 | set(np.unique(labels[:, -1]).tolist())
             )
-            d_bg = cv2.distanceTransform(bg, cv2.DIST_L2, 3)
             for lbl in range(1, num_cc):
                 if lbl in border_lbls:
                     continue
@@ -923,7 +1127,7 @@ class GlyphSDFAtlas:
                 counter_mask[comp] = 1
                 comp_d = d_bg * comp
                 peak_d = float(comp_d.max())
-                thresh = max(0.95, 0.55 * peak_d)
+                thresh = max(1.15, 0.52 * peak_d)
                 c_core = comp & (d_bg >= thresh)
                 if not np.any(c_core):
                     py, px = np.unravel_index(int(np.argmax(comp_d)), comp_d.shape)
@@ -931,19 +1135,29 @@ class GlyphSDFAtlas:
                 else:
                     core_mask[c_core] = 1
 
-        closed = cv2.morphologyEx((sk_bmp > 0).astype(np.uint8), cv2.MORPH_CLOSE, k_close5)
-        bay = (closed > 0) & (sk_bmp == 0) & (counter_mask == 0)
-        if np.any(bay):
-            d_bay = cv2.distanceTransform((1 - (sk_bmp > 0).astype(np.uint8)), cv2.DIST_L2, 3)
-            bay_core = (bay & (d_bay >= 1.25)).astype(np.uint8)
+        # 2D background Voronoi medial ridge inside morphological stroke corridor hull
+        fg_u8 = (sk_bmp_2x > 0).astype(np.uint8)
+        closed = cv2.morphologyEx(fg_u8, cv2.MORPH_CLOSE, k_close19)
+        corridor = (closed > 0) & (bg > 0) & (counter_mask == 0)
+        if np.any(corridor):
+            h2, w2 = d_bg.shape
+            yy = np.arange(h2, dtype=np.float32)[:, None] * 1e-4
+            xx = np.arange(w2, dtype=np.float32)[None, :] * 1.3e-4
+            db_tb = d_bg + (yy + xx) * (bg > 0)
+            db_pad = np.pad(db_tb, 1, mode="constant", constant_values=0.0)
+            c = db_pad[1:-1, 1:-1]
+            h_ridge = (c >= db_pad[1:-1, :-2]) & (c >= db_pad[1:-1, 2:])
+            v_ridge = (c >= db_pad[:-2, 1:-1]) & (c >= db_pad[2:, 1:-1])
+            voronoi_gap = (
+                corridor & (d_bg >= 1.15) & (d_bg <= 9.5) & (h_ridge | v_ridge)
+            ).astype(np.uint8)
         else:
-            bay_core = np.zeros_like(sk_bmp, dtype=np.uint8)
+            voronoi_gap = np.zeros_like(sk_bmp_2x, dtype=np.uint8)
 
-        sk_u8 = (sk_cell > 0).astype(np.uint8)
+        sk_u8 = (sk_cell_2x > 0).astype(np.uint8)
         nbr = cv2.filter2D(sk_u8, cv2.CV_8U, k_ones3, borderType=cv2.BORDER_CONSTANT)
-        # 1-neighbor stroke-ends (nbr == 2 includes center pixel + 1 neighbor; keep isolated dakuten untouched)
         end_mask = ((sk_u8 > 0) & (nbr == 2)).astype(np.uint8)
-        return core_mask, bay_core, end_mask, n_counters
+        return core_mask, voronoi_gap, end_mask, n_counters
 
     @staticmethod
     def _rasterize_char_tight(
@@ -954,9 +1168,10 @@ class GlyphSDFAtlas:
     ) -> np.ndarray:
         """Render single glyph tightly centered into `canvas_hw` binary `{0, 1}` uint8 array."""
         ch_h, ch_w = canvas_hw
-        scratch = Image.new("L", (128, 128), 0)
+        sc_sz = max(128, 2 * max(ch_h, ch_w))
+        scratch = Image.new("L", (sc_sz, sc_sz), 0)
         draw = ImageDraw.Draw(scratch)
-        draw.text((16, 12), char, fill=255, font=font)
+        draw.text((sc_sz // 8, sc_sz // 10), char, fill=255, font=font)
         arr = np.asarray(scratch, dtype=np.uint8)
         ys, xs = np.nonzero(arr > 96)
         if ys.size == 0:
