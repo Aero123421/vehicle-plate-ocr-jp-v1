@@ -31,7 +31,7 @@ const runtime={Tensor:ort.Tensor,env:ort.env,InferenceSession:{
   async create(url,options) {
     const session=await ort.InferenceSession.create(await readFile(fileURLToPath(url)),options);
     const name=url.split('/').at(-1).split('.')[0];
-    return {release:()=>session.release(),async run(feed) {
+    return {inputMetadata:session.inputMetadata,outputMetadata:session.outputMetadata,release:()=>session.release(),async run(feed) {
       calls[name]=(calls[name]??0)+1;
       if(name==='memory_readout') {
         if(strictBatch) assert.equal(collecting,false,'batch readout during COLLECTING');

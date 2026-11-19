@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vpocr_det.detector import ConvBNAct, DWConvBlock
+from vpocr_det.detector import ConvBNAct, DWConvBlock, compute_box_giou
 from vpocr_det.types import ObservationProvenance, PlateDetection, VehicleDetection
 
 ROI_HEIGHT: int = 96
@@ -454,14 +454,30 @@ class PlateQuadTrackNet(nn.Module):
         super().__init__()
         self.config = config or QuadTrackModelConfig()
         c, sc = self.config.base_ch, self.config.surround_ch
-        self.stem = nn.Sequential(ConvBNAct(8, c, k=3), DWConvBlock(c, k=5), DWConvBlock(c, k=5))
+        self.stem = nn.Sequential(
+            ConvBNAct(8, c, k=3),
+            DWConvBlock(c, k=5),
+            DWConvBlock(c, k=5),
+            DWConvBlock(c, k=5),
+        )
         self.ctx_down2 = DWConvBlock(c, k=5)
         self.ctx_down4 = DWConvBlock(c, k=7)
         self.ctx_down8 = DWConvBlock(c, k=7)
-        self.surr_stem = nn.Sequential(ConvBNAct(8, sc, k=3), DWConvBlock(sc, k=3), DWConvBlock(sc, k=5))
-        self.ctx_spatial = nn.Sequential(DWConvBlock(c, k=5), DWConvBlock(c, k=5), DWConvBlock(c, k=7), nn.Conv2d(c, c, 1))
-        nn.init.zeros_(self.ctx_spatial[3].weight)
-        nn.init.zeros_(self.ctx_spatial[3].bias)
+        self.surr_stem = nn.Sequential(
+            ConvBNAct(8, sc, k=3),
+            DWConvBlock(sc, k=3),
+            DWConvBlock(sc, k=5),
+            DWConvBlock(sc, k=5),
+        )
+        self.ctx_spatial = nn.Sequential(
+            DWConvBlock(c, k=5),
+            DWConvBlock(c, k=5),
+            DWConvBlock(c, k=7),
+            DWConvBlock(c, k=5),
+            nn.Conv2d(c, c, 1),
+        )
+        nn.init.zeros_(self.ctx_spatial[-1].weight)
+        nn.init.zeros_(self.ctx_spatial[-1].bias)
         self.cell_head = nn.Conv2d(c, 2, 1)
         self.displacement_head = nn.Conv2d(c, 16, 1)
         nn.init.zeros_(self.displacement_head.weight)
@@ -471,9 +487,15 @@ class PlateQuadTrackNet(nn.Module):
         local_shapes = torch.tensor([[[-0.25, -0.15], [0.25, -0.15], [0.25, 0.15], [-0.25, 0.15]]]).expand(2, 4, 2)
         with torch.no_grad():
             self.displacement_head.bias.copy_(local_shapes.reshape(-1))
-        self.canonical_encoder = nn.Sequential(ConvBNAct(c+1, c, k=3), DWConvBlock(c, k=3), DWConvBlock(c, k=3))
-        self.canon_spatial = nn.Conv2d(c, 2 * c, kernel_size=(4, 8), groups=c, bias=True)
-        self.canon_mixer = nn.Sequential(nn.Linear(2 * c, 2 * c), nn.SiLU(), nn.Linear(2 * c, 2 * c))
+        self.canonical_encoder = nn.Sequential(
+            ConvBNAct(c + 1, c, k=3),
+            DWConvBlock(c, k=5),
+            ConvBNAct(c, c, k=3),
+            DWConvBlock(c, k=3),
+        )
+        canon_groups = math.gcd(c, max(1, c // 16))
+        self.canon_spatial = nn.Conv2d(c, 2 * c, kernel_size=(4, 8), groups=canon_groups, bias=True)
+        self.canon_mixer = nn.Sequential(nn.Linear(2 * c, 4 * c), nn.SiLU(), nn.Linear(4 * c, 2 * c))
         nn.init.zeros_(self.canon_mixer[2].weight)
         nn.init.zeros_(self.canon_mixer[2].bias)
         self.update_head = nn.Linear(2 * c, 8)
@@ -493,7 +515,7 @@ class PlateQuadTrackNet(nn.Module):
         self.mode_cov_head = nn.Linear(2 * c, 12)
         self.visibility_head = nn.Linear(2 * c, 4)
         joint_dim = c + sc + 2 * c + 2 * 12 + 2 + 2 * 4
-        self.meta_head = nn.Sequential(nn.Linear(joint_dim, c*2), nn.SiLU(), nn.Linear(c*2, 9))
+        self.meta_head = nn.Sequential(nn.Linear(joint_dim, c * 3), nn.SiLU(), nn.Linear(c * 3, 9))
         self.reid_head = nn.Linear(c+sc, self.config.reid_dim)
         self.layout_grid_head = nn.Conv2d(c, 1, 1)
         self.edge_hm_head = nn.Conv2d(c, 4, 1)
@@ -520,7 +542,11 @@ class PlateQuadTrackNet(nn.Module):
         self.surround_ctx_proj = nn.Conv2d(sc, c, 1)
         nn.init.zeros_(self.surround_ctx_proj.weight)
         nn.init.zeros_(self.surround_ctx_proj.bias)
-        self.canonical_surround_proj = nn.Sequential(ConvBNAct(sc, c, k=3), DWConvBlock(c, k=3))
+        self.canonical_surround_proj = nn.Sequential(
+            ConvBNAct(sc, c, k=3),
+            DWConvBlock(c, k=3),
+            DWConvBlock(c, k=3),
+        )
 
     @property
     def num_parameters(self) -> int:
@@ -578,20 +604,25 @@ class PlateQuadTrackNet(nn.Module):
 
     def _canonical_features(self, features: torch.Tensor, corners: torch.Tensor,
                             surround_features: torch.Tensor | None = None,
-                            canonical_grid: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                            canonical_grid: torch.Tensor | None = None,
+                            num_modes: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = solve_4pt_homography_torch(self.canon_corners, corners)
         xy = project_points_torch(h, self.canonical_grid if canonical_grid is None else canonical_grid)
-        grid = (2*xy-1).reshape(-1, 20, 40, 2)
+        grid = (2 * xy - 1).reshape(-1, num_modes * 20, 40, 2)
         patch = F.grid_sample(features, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         support = F.grid_sample(torch.ones_like(features[:, :1]), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         if surround_features is not None:
             # Both crops observe the same plane. Transport canonical samples to
             # the wider chart only where the crisp fovea has no observation.
             surround_xy = 0.5 + (xy - 0.5) / self.coarse_chart_scale
-            surround_grid = (2 * surround_xy - 1).reshape(-1, 20, 40, 2)
+            surround_grid = (2 * surround_xy - 1).reshape(-1, num_modes * 20, 40, 2)
             surround_patch = F.grid_sample(surround_features, surround_grid, mode="bilinear",
                                            padding_mode="zeros", align_corners=False)
             patch = patch + (1.0 - support) * surround_patch
+        if num_modes > 1:
+            ch = int(features.shape[1])
+            patch = patch.reshape(-1, ch, num_modes, 20, 40).permute(0, 2, 1, 3, 4).reshape(-1, ch, 20, 40)
+            support = support.reshape(-1, 1, num_modes, 20, 40).permute(0, 2, 1, 3, 4).reshape(-1, 1, 20, 40)
         return self.canonical_encoder(torch.cat([patch, support], 1)), support, h
 
     def forward(self, fovea_rois: torch.Tensor, surround_rois: torch.Tensor | None = None,
@@ -619,22 +650,17 @@ class PlateQuadTrackNet(nn.Module):
             self.cell_head(f_ctx), relative_wide, self.config.temperature)
         init_corners = 0.5 + (init_corners - 0.5) * self.coarse_chart_scale
         corners = init_corners.reshape(-1, 4, 2)
-        def expand_modes(features: torch.Tensor) -> torch.Tensor:
-            return features[:, None].expand(-1, 2, -1, -1, -1).reshape(
-                -1, features.shape[1], features.shape[-2], features.shape[-1])
-        mode_fine, mode_coarse = expand_modes(f_fine), expand_modes(f_coarse)
         s_fine_raw = s_features + self.surr_pyr_s2_proj(F.interpolate(s2, size=s_features.shape[-2:], mode="bilinear", align_corners=False))
         s_coarse_raw = s_fine_raw + self.surr_pyr_s4_proj(F.interpolate(s4, size=s_features.shape[-2:], mode="bilinear", align_corners=False))
         surr_fine = self.canonical_surround_proj(s_fine_raw)
         surr_coarse = self.canonical_surround_proj(s_coarse_raw)
-        mode_surr_fine, mode_surr_coarse = expand_modes(surr_fine), expand_modes(surr_coarse)
         step_corners = [init_corners]
         for k, head in enumerate(self.step_update_heads):
             q_valid = valid_quad_torch(corners)
             warp_corners = torch.where(q_valid[:, None, None], corners.detach(), self.default_fovea_quad)
             patch, support, h = self._canonical_features(
-                mode_coarse if k < 2 else mode_fine, warp_corners,
-                mode_surr_coarse if k < 2 else mode_surr_fine, self.step_canonical_grids[k])
+                f_coarse if k < 2 else f_fine, warp_corners,
+                surr_coarse if k < 2 else surr_fine, self.step_canonical_grids[k], num_modes=2)
             pooled_k = self._pool_canonical(patch)
             delta = (self.update_head(pooled_k) + head(pooled_k)).reshape(-1, 4, 2)
             cand_canon = self.canon_corners + delta
@@ -642,15 +668,15 @@ class PlateQuadTrackNet(nn.Module):
             with torch.amp.autocast(device_type=h.device.type, enabled=False):
                 p_hom = torch.cat([cand_canon.float(), torch.ones_like(cand_canon[..., :1], dtype=torch.float32)], dim=-1) @ h.float().transpose(-1, -2)
                 w0 = h.float()[..., 2:3, 2]
-                # Preserve homogeneous depth sign and margin without a spatial clamp.
-                cheiral = ((p_hom[..., 2] * w0) > 0.15 * w0.square()).all(dim=-1)
+                # Preserve homogeneous depth sign while supporting extreme +/-72 deg oblique perspective tapers.
+                cheiral = ((p_hom[..., 2] * w0) > 0.06 * w0.square()).all(dim=-1)
             updated = project_points_torch(h, cand_canon)
             step_ok = q_valid & canon_valid & cheiral & valid_quad_torch(updated)
             corners = torch.where(step_ok[:, None, None], updated, corners)
             step_corners.append(corners.reshape(b, 2, 4, 2))
         final_q_valid = valid_quad_torch(corners)
         final_warp_corners = torch.where(final_q_valid[:, None, None], corners.detach(), self.default_fovea_quad)
-        patch, support, _ = self._canonical_features(mode_fine, final_warp_corners, mode_surr_fine)
+        patch, support, _ = self._canonical_features(f_fine, final_warp_corners, surr_fine, num_modes=2)
         h_out = solve_4pt_homography_torch(
             self.canon_corners, torch.where(final_q_valid[:, None, None], corners, self.default_fovea_quad)
         )
@@ -710,7 +736,7 @@ class PlateQuadTrackNet(nn.Module):
         return out
 
 
-STAGE2_INT8_MAX_BYTES = 1_572_864
+STAGE2_INT8_MAX_BYTES = 2_621_440
 STAGE2_OUTPUT_NAMES = ("corners_norm", "mode_logits", "mode_weights", "mode_init_corners", "mode_corners",
                        "mode_corner_cov", "corner_cov_chol", "corner_cov",
                        "corner_vis_logits", "homography_3x3", "blur_vec_norm", "reid_emb",
@@ -864,9 +890,11 @@ class PlateQuadTrackLoss(nn.Module):
         neg_mask = target <= 0.5
         if neg_mask.any():
             neg_idx = torch.nonzero(neg_mask, as_tuple=False).squeeze(1)
-            k_hard = max(1, int(math.ceil(0.15 * int(neg_idx.numel()))))
+            neg_probs = torch.sigmoid(logit.detach()[neg_idx])
+            cls_weights[neg_idx] = 1.0 + 1.5 * (neg_probs * neg_probs)
+            k_hard = max(1, int(math.ceil(0.25 * int(neg_idx.numel()))))
             hard_neg_idx = neg_idx[logit.detach()[neg_idx].topk(k_hard).indices]
-            cls_weights[hard_neg_idx] = 1.5
+            cls_weights[hard_neg_idx] = torch.maximum(cls_weights[hard_neg_idx], torch.full_like(cls_weights[hard_neg_idx], 2.5))
         loss_cls = (bce_vec * cls_weights).mean()
         loss_topo = F.binary_cross_entropy_with_logits(out["topology_logit"], target if topology_gt is None else topology_gt.float())
         loss_layout = zero
@@ -898,24 +926,30 @@ class PlateQuadTrackLoss(nn.Module):
             ic_edges = torch.roll(ic, -1, dims=-2) - ic
             ic_next = torch.roll(ic_edges, -1, dims=-2)
             ic_cross = ic_edges[..., 0] * ic_next[..., 1] - ic_edges[..., 1] * ic_next[..., 0]
-            loss_convex = 6.0 * (F.relu(1e-3 - ic_cross).mean(dim=(1, 3)) * responsibilities).sum(-1).mean()
+            loss_convex = 6.0 * (F.relu(2e-4 - ic_cross).mean(dim=(1, 3)) * responsibilities).sum(-1).mean()
             # Outward unit vectors u_hat_k = (c*_k - c_bar*) / (||c*_k - c_bar*|| + 1e-6):
-            # penalize inward corner shrinkage (delta_k < 0, which clips Kanji/Class digits) 2.25x vs 1.0x outward.
+            # penalize inward corner shrinkage slightly higher so Kanji/Class strokes never clip.
             c_bar = truth.mean(dim=-2, keepdim=True)
             rad_vec = truth - c_bar
             u_hat_m = (rad_vec / (torch.linalg.vector_norm(rad_vec, dim=-1, keepdim=True) + 1e-6))[:, None].expand_as(tgt_m)
+            tgt_edges_m = torch.roll(tgt_m, -1, dims=-2) - tgt_m
+            tgt_box_m = torch.cat([tgt_m.amin(dim=-2), tgt_m.amax(dim=-2)], dim=-1)
             step_err = torch.zeros_like(distance)
-            for k, weight in enumerate((0.25, 0.40, 0.70, 1.00)):
+            for k, weight in enumerate((0.25, 0.45, 0.75, 1.15)):
                 diff_k = ic[:, k] - tgt_m
                 delta_rad = (diff_k * u_hat_m).sum(dim=-1)
                 asym_w = torch.where(delta_rad < 0.0, torch.full_like(delta_rad, 1.30), torch.ones_like(delta_rad))
-                wing_c = _wing_loss(ic[:, k], tgt_m, w=0.04, eps=0.006, reduction="none").mean(dim=-1)
+                wing_c = _wing_loss(ic[:, k], tgt_m, w=0.035, eps=0.004, reduction="none").mean(dim=-1)
                 l2_c = torch.linalg.vector_norm(diff_k, dim=-1)
-                step_err = step_err + weight * (asym_w * (wing_c + l2_c)).mean(dim=-1)
+                edge_k = F.smooth_l1_loss(ic_edges[:, k], tgt_edges_m, beta=0.01, reduction="none").mean(dim=(-1, -2))
+                pred_box_k = torch.cat([ic[:, k].amin(dim=-2), ic[:, k].amax(dim=-2)], dim=-1)
+                giou_k = compute_box_giou(pred_box_k, tgt_box_m)
+                step_iou_term = 0.04 * (1.0 - giou_k) if k >= 1 else 0.0
+                step_err = step_err + weight * ((asym_w * (1.15 * wing_c + l2_c)).mean(dim=-1) + 0.35 * edge_k + step_iou_term)
             target_probs = (-distance.detach() / 0.008).softmax(dim=-1)
             loss_mode_sel = -(target_probs * F.log_softmax(out["mode_logits"][pos].float(), dim=-1)).sum(dim=-1).mean()
-            loss_coord = (0.02 * loss_nll + 24.0 * (step_err * responsibilities).sum(-1).mean()
-                          + 8.0 * step_err.min(-1).values.mean() + 0.60 * loss_mode_sel + loss_convex)
+            loss_coord = (0.02 * loss_nll + 28.0 * (step_err * responsibilities).sum(-1).mean()
+                          + 9.0 * step_err.min(-1).values.mean() + 0.60 * loss_mode_sel + loss_convex)
             if "mode_cell_log_probs" in out:
                 # A categorical observation locates the center independently of
                 # the offset field. Bilinear labels preserve its first moment
@@ -970,8 +1004,8 @@ class PlateQuadTrackLoss(nn.Module):
                 pair_loss = torch.where(same, 1-sim, F.relu(sim-.2))
                 loss_reid = pair_loss[mask].mean()
         aux = float(max(0, min(1, aux_warmup_scale)))
-        total = (1.5 * loss_cls + loss_coord + 0.8 * loss_center
-                 + aux * (loss_topo + loss_edge + loss_blur + loss_vis + loss_reid
+        total = (2.2 * loss_cls + loss_coord + 0.8 * loss_center + 3.5 * loss_edge
+                 + aux * (loss_topo + loss_blur + loss_vis + loss_reid
                           + 0.30 * (loss_layout + loss_hm + loss_side + loss_qual + loss_large)))
         return {"loss": total, "loss_cls": loss_cls.detach(), "loss_topo": loss_topo.detach(),
                 "loss_layout": loss_layout.detach(), "loss_coord": loss_coord.detach(), "loss_cov": loss_cov.detach(),
@@ -1472,21 +1506,24 @@ def refine_and_crop_detections(
     policies = list(ObservationProvenance)
     policy = torch.tensor([policies.index(ObservationProvenance(d.provenance)) for d in detections], device=dev)
 
-    def infer(crop_boxes: list[tuple[float, float, float, float]]) -> tuple[dict[str, torch.Tensor], list[tuple[float, float, float, float]]]:
+    def infer(crop_boxes: list[tuple[float, float, float, float]], indices: list[int] | None = None) -> tuple[dict[str, torch.Tensor], list[tuple[float, float, float, float]]]:
+        idxs = list(range(len(crop_boxes))) if indices is None else list(indices)
         foveas, surrounds, windows = [], [], []
-        for i, box in enumerate(crop_boxes):
+        for idx in idxs:
+            box = crop_boxes[idx]
             if dual:
-                fov, sur, win, _ = extract_dual_concentric_plate_rois(frame_rgb, box, gamma=gammas[i],
+                fov, sur, win, _ = extract_dual_concentric_plate_rois(frame_rgb, box, gamma=gammas[idx],
                                                                      fovea_scale=fov_scale, surround_scale=sur_scale)
                 surrounds.append(sur)
             else:
-                fov, win = extract_expanded_plate_roi(frame_rgb, box, expand_scale=1.85*gammas[i])
+                fov, win = extract_expanded_plate_roi(frame_rgb, box, expand_scale=1.85*gammas[idx])
             foveas.append(fov)
             windows.append(win)
         def batch(items: list[np.ndarray]) -> torch.Tensor:
             return torch.from_numpy(np.stack(items)).to(dev, dtype=torch.float32).permute(0, 3, 1, 2)/255
         if isinstance(quad_model, PlateQuadTrackNet):
-            output = quad_model(batch(foveas), batch(surrounds), policy)
+            pol_sub = policy[idxs] if indices is not None else policy
+            output = quad_model(batch(foveas), batch(surrounds), pol_sub)
         elif dual:
             output = quad_model(batch(foveas), batch(surrounds))
         else:
@@ -1519,14 +1556,20 @@ def refine_and_crop_detections(
         return plan, needs_crop
 
     out, windows = infer(boxes)
-    recrop = False
+    recrop_indices: list[int] = []
     for i in range(len(detections)):
         plan, needs_crop = posterior_plan(out, i, windows[i])
         if plan is not None and needs_crop and not plan.missing_support:
             boxes[i] = plan.required_window_xyxy
-            recrop = True
-    if recrop:
-        out, windows = infer(boxes)
+            recrop_indices.append(i)
+    if recrop_indices:
+        sub_out, sub_windows = infer(boxes, recrop_indices)
+        out = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in out.items()}
+        for j, idx in enumerate(recrop_indices):
+            windows[idx] = sub_windows[j]
+            for k, v in sub_out.items():
+                if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == len(recrop_indices):
+                    out[k][idx] = v[j]
     llr = out.get("plate_null_llr", out["is_plate_logit"])
     posterior = torch.sigmoid(llr+math.log(deployment_prior/(1-deployment_prior)))
     costs = decision_costs if decision_costs is not None else (min_is_plate_prob, 1-min_is_plate_prob, 1.)

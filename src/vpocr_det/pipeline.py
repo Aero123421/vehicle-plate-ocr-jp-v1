@@ -17,6 +17,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from vpocr_det.detector import (
     PlateDetNet,
@@ -25,7 +26,12 @@ from vpocr_det.detector import (
     decode_plate_det_predictions,
     decode_temporal_det_predictions,
 )
-from vpocr_det.optical_tracker import OpticalPlateRef, create_optical_ref, quad_basis, track_plate_optical
+from vpocr_det.optical_tracker import (
+    OpticalPlateRef,
+    create_optical_ref,
+    quad_basis,
+    track_plate_optical,
+)
 from vpocr_det.quad_cropper import (
     PlateQuadNet,
     PlateQuadTrackNet,
@@ -71,6 +77,441 @@ def _bbox_iomin_xyxy(
     aa = max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
     ba = max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
     return inter / max(1.0, min(aa, ba))
+
+
+def _vehicle_containment_nms(vehicles: list[VehicleDetection]) -> list[VehicleDetection]:
+    """Suppress duplicate, multi-vehicle wrapper, and cab-inside-truck sub-box detections."""
+    if len(vehicles) <= 1:
+        return list(vehicles)
+    ordered = sorted(vehicles, key=lambda v: -float(v.score))
+    kept: list[VehicleDetection] = []
+    for cand in ordered:
+        cx0, cy0, cx1, cy1 = [float(x) for x in cand.bbox_xyxy]
+        cw = max(1.0, cx1 - cx0)
+        ch = max(1.0, cy1 - cy0)
+        c_area = cw * ch
+        suppress = False
+        contained_keepers: list[VehicleDetection] = []
+        for keeper in kept:
+            kx0, ky0, kx1, ky1 = [float(x) for x in keeper.bbox_xyxy]
+            kw = max(1.0, kx1 - kx0)
+            kh = max(1.0, ky1 - ky0)
+            k_area = kw * kh
+            iou = _bbox_iou_xyxy(cand.bbox_xyxy, keeper.bbox_xyxy)
+            iomin = _bbox_iomin_xyxy(cand.bbox_xyxy, keeper.bbox_xyxy)
+            if iou >= 0.55:
+                suppress = True
+                break
+            # Cab/sub-box inside whole vehicle suppression
+            if (
+                iomin >= 0.82
+                and float(cand.score) < float(keeper.score) * 0.90
+                and c_area < 0.55 * k_area
+            ):
+                tol = 0.14 * max(kw, kh)
+                shares_bottom = abs(cy1 - ky1) <= tol
+                shares_left = abs(cx0 - kx0) <= tol
+                shares_right = abs(cx1 - kx1) <= tol
+                interior_upper = (cy0 >= ky0 - 0.04 * kh) and (cy1 <= ky0 + 0.82 * kh)
+                if shares_bottom or shares_left or shares_right or interior_upper:
+                    suppress = True
+                    break
+            # Track keepers enclosed inside a larger candidate wrapper
+            if c_area > k_area * 1.15 and iomin >= 0.80:
+                contained_keepers.append(keeper)
+        if not suppress and len(contained_keepers) >= 2:
+            # Drop multi-object wrapper box covering 2+ separate vehicles
+            sum_k = sum(
+                max(1.0, (k.bbox_xyxy[2] - k.bbox_xyxy[0]) * (k.bbox_xyxy[3] - k.bbox_xyxy[1]))
+                for k in contained_keepers
+            )
+            if sum_k >= 0.45 * c_area:
+                suppress = True
+        if not suppress:
+            kept.append(cand)
+    return kept
+
+
+def _compute_inner_scene_features(small_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute inner-70% luminance patch and normalized 3x8 RGB Bhattacharyya histogram."""
+    gh, gw = small_rgb.shape[:2]
+    x0 = int(round(0.15 * gw))
+    x1 = max(x0 + 2, int(round(0.85 * gw)))
+    y0 = int(round(0.15 * gh))
+    y1 = max(y0 + 2, int(round(0.85 * gh)))
+    inner = small_rgb[y0:y1, x0:x1, :3].astype(np.float32)
+    inner_y = 0.299 * inner[:, :, 0] + 0.587 * inner[:, :, 1] + 0.114 * inner[:, :, 2]
+    bins = np.clip((inner * (8.0 / 256.0)).astype(np.int32), 0, 7)
+    n_pix = float(max(1, inner.shape[0] * inner.shape[1]))
+    hist = np.zeros((24,), dtype=np.float32)
+    for ch in range(3):
+        hist[ch * 8 : (ch + 1) * 8] = np.bincount(bins[:, :, ch].reshape(-1), minlength=8).astype(np.float32)
+    hist = np.sqrt(hist / n_pix)
+    h_nrm = float(np.linalg.norm(hist))
+    if h_nrm > 1e-6:
+        hist /= h_nrm
+    return inner_y, hist
+
+
+def _is_inner_scene_cut(inner_sad: float, inner_hist_corr: float) -> bool:
+    return bool(
+        (inner_sad >= 34.0 and inner_hist_corr < 0.86)
+        or (inner_sad >= 22.0 and inner_hist_corr < 0.72)
+        or (inner_hist_corr < 0.58 and inner_sad >= 14.0)
+    )
+
+
+class _InnerSceneCutMonitor:
+    """Framed-TV-immune inner-70% scene-cut monitor (`< 0.3 ms` CPU)."""
+
+    def __init__(self, grid_hw: tuple[int, int] = (80, 144)) -> None:
+        self.grid_hw = (int(grid_hw[0]), int(grid_hw[1]))
+        self._prev_y: np.ndarray | None = None
+        self._prev_hist: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._prev_y = None
+        self._prev_hist = None
+
+    def step(self, frame_rgb: np.ndarray) -> tuple[bool, float, float]:
+        if frame_rgb.ndim != 3 or frame_rgb.size == 0:
+            return False, 0.0, 1.0
+        gh, gw = self.grid_hw
+        small = cv2.resize(frame_rgb, (gw, gh), interpolation=cv2.INTER_AREA)
+        cur_y, cur_hist = _compute_inner_scene_features(small)
+        if self._prev_y is None or self._prev_hist is None or self._prev_y.shape != cur_y.shape:
+            self._prev_y = cur_y
+            self._prev_hist = cur_hist
+            return False, 0.0, 1.0
+        sad = float(np.mean(np.abs(cur_y - self._prev_y)))
+        corr = float(np.clip(np.dot(cur_hist, self._prev_hist), 0.0, 1.0))
+        self._prev_y = cur_y
+        self._prev_hist = cur_hist
+        return _is_inner_scene_cut(sad, corr), sad, corr
+
+
+def _handle_scene_cut(owner: Any, retired_this_frame: dict[int, Any]) -> None:
+    """Flush vehicle/plate tracks & recurrent hidden state on a hard scene cut, sealing mature OCR episodes."""
+    for tid, sess in list(owner._ocr_sessions.items()):
+        dec = _finish_cached(owner, tid, sess)
+        owner._retired_decisions[tid] = dec
+        owner._terminal_decisions.pop(tid, None)
+        retired_this_frame[tid] = dec
+        while len(owner._retired_decisions) > owner.max_retired_history:
+            owner._retired_decisions.pop(next(iter(owner._retired_decisions)))
+    owner._ocr_sessions.clear()
+    owner.tracker.flush_for_scene_cut()
+    owner.vehicle_tracker.flush_for_scene_cut()
+    owner._det_hidden_state = None
+    owner._camera_motion_estimator.reset()
+    owner._prev_corners.clear()
+    owner._opt_refs.clear()
+    owner._sr_states.clear()
+    if hasattr(owner, "_track_corner_stats"):
+        owner._track_corner_stats.clear()
+    if hasattr(owner, "_veh_zoom_cooldown"):
+        owner._veh_zoom_cooldown.clear()
+    if hasattr(owner, "_dormant_reappear_cooldown"):
+        owner._dormant_reappear_cooldown.clear()
+    if hasattr(owner, "_cached_vehicles"):
+        owner._cached_vehicles.clear()
+    if hasattr(owner, "_cached_vehicle_bboxes"):
+        owner._cached_vehicle_bboxes.clear()
+
+
+def _session_has_confirmed_high_prec_plate(owner: Any, plate_track_id: int) -> bool:
+    sess = owner._ocr_sessions.get(plate_track_id)
+    if sess is None:
+        return False
+    if not _collecting(sess):
+        dec = owner._terminal_decisions.get(plate_track_id)
+        return dec is not None and getattr(dec, "status", None) == "ACCEPTED"
+    try:
+        mem_p = sess._state_arrays()[1]
+        mean_p = float(np.maximum(mem_p, 0.0).mean())
+        ep_prob = float(sess._qual_acc.episode_plate_prob)
+        return mean_p >= 0.16 and ep_prob >= 0.72
+    except Exception:
+        return False
+
+
+def _run_full_face_vehicle_zoom(
+    owner: Any,
+    frame_rgb: np.ndarray,
+    tracked_vehicles: list[VehicleDetection],
+    existing_plates: list[PlateDetection],
+    frame_key: str,
+) -> list[PlateDetection]:
+    """Full-face multi-scale vehicle Smart-Zoom (10% padded up to 4x mag) with extreme oblique aspect [0.48, 6.2]."""
+    if (
+        not owner.enable_far_zoom
+        or not tracked_vehicles
+        or not hasattr(owner.det_model, "forward_step")
+    ):
+        return []
+    h_orig, w_orig = frame_rgb.shape[:2]
+    if h_orig < 24 or w_orig < 24:
+        return []
+
+    # Tick per-vehicle zoom cooldowns
+    cooldowns: dict[int, int] = owner._veh_zoom_cooldown
+    for vid in list(cooldowns.keys()):
+        rem = cooldowns[vid] - 1
+        if rem <= 0:
+            cooldowns.pop(vid, None)
+        else:
+            cooldowns[vid] = rem
+
+    # Vehicles that already own a confirmed high-precision OCR plate track need zero extra zoom
+    confirmed_vids: set[int] = set()
+    for pt in getattr(owner.tracker, "_tracks", ()):
+        if getattr(pt, "confirmed", False) and getattr(pt, "parent_vehicle_track_id", None) is not None:
+            if _session_has_confirmed_high_prec_plate(owner, pt.track_id):
+                confirmed_vids.add(int(pt.parent_vehicle_track_id))
+
+    zoom_tile_hw = (256, 384)
+    max_zoom_mag = 4.0
+    max_tiles = 2
+    in_h, in_w = owner.input_hw
+    det_scale = min(float(in_w) / float(w_orig), float(in_h) / float(h_orig))
+    tw_lim = max(32, int(math.floor(384.0 / max(1e-6, 1.22 * det_scale))))
+    th_lim = max(24, int(math.floor(256.0 / max(1e-6, 1.22 * det_scale))))
+    candidates_v: list[VehicleDetection] = []
+    for vd in sorted(tracked_vehicles, key=lambda v: -float(v.score)):
+        vid = vd.vehicle_track_id
+        if vid is not None and (vid in confirmed_vids or cooldowns.get(vid, 0) > 0):
+            continue
+        if vid is None and float(vd.score) < 0.55:
+            continue
+        vx0, vy0, vx1, vy1 = [float(x) for x in vd.bbox_xyxy]
+        vw = vx1 - vx0
+        vh = vy1 - vy0
+        if vw < 14.0 or vh < 14.0:
+            continue
+        # Skip if Pass-1/Pass-2 already detected a plate anywhere on the full vehicle face
+        has_plate = False
+        for p in existing_plates:
+            px0, py0, px1, py1 = p.bbox_xyxy
+            pcx = 0.5 * (px0 + px1)
+            pcy = 0.5 * (py0 + py1)
+            if (
+                (vx0 - 0.06 * vw) <= pcx <= (vx1 + 0.06 * vw)
+                and (vy0 - 0.04 * vh) <= pcy <= (vy1 + 0.14 * vh)
+                and float(p.score) >= 0.35
+            ):
+                has_plate = True
+                break
+        if has_plate:
+            continue
+        # Avoid re-running a duplicate Pass-2 tile on small vehicles that decode_temporal_det_predictions
+        # already full-face zoomed on this exact frame; prioritize wide/large vehicles skipped or bumper-clipped
+        # by Pass-2 (mid-door vans, heavy-machinery side/hood mounts).
+        pass2_already_full_face = (
+            vw * det_scale < 240.0
+            and math.ceil(1.22 * vw) <= tw_lim
+            and math.ceil(1.22 * vh) <= th_lim
+        )
+        if pass2_already_full_face:
+            continue
+        candidates_v.append(vd)
+        if len(candidates_v) >= max_tiles:
+            break
+
+    if not candidates_v:
+        return []
+
+    crops: list[np.ndarray] = []
+    metas: list[tuple[VehicleDetection, float, int, int, int, int, int, int]] = []
+    ht, wt = zoom_tile_hw
+    min_w = min(w_orig, max(24, int(math.ceil(float(wt) / max_zoom_mag))))
+    min_h = min(h_orig, max(24, int(math.ceil(float(ht) / max_zoom_mag))))
+    for vd in candidates_v:
+        vx0, vy0, vx1, vy1 = [float(x) for x in vd.bbox_xyxy]
+        vw = vx1 - vx0
+        vh = vy1 - vy0
+        rx0 = int(math.floor(vx0 - 0.10 * vw))
+        ry0 = int(math.floor(vy0 - 0.10 * vh))
+        rx1 = int(math.ceil(vx1 + 0.10 * vw))
+        ry1 = int(math.ceil(vy1 + 0.10 * vh))
+        if rx1 - rx0 < min_w:
+            cx_w = 0.5 * (rx0 + rx1)
+            rx0 = int(round(cx_w - 0.5 * min_w))
+            rx1 = rx0 + min_w
+        if ry1 - ry0 < min_h:
+            cy_h = 0.5 * (ry0 + ry1)
+            ry0 = int(round(cy_h - 0.5 * min_h))
+            ry1 = ry0 + min_h
+        win_w = min(w_orig, max(24, rx1 - rx0))
+        win_h = min(h_orig, max(24, ry1 - ry0))
+        rx0 = max(0, min(w_orig - win_w, rx0))
+        ry0 = max(0, min(h_orig - win_h, ry0))
+        rx1 = min(w_orig, rx0 + win_w)
+        ry1 = min(h_orig, ry0 + win_h)
+        if rx1 - rx0 < 24 or ry1 - ry0 < 24:
+            continue
+        sub = frame_rgb[ry0:ry1, rx0:rx1]
+        sh, sw = sub.shape[:2]
+        z_sc = min(float(wt) / float(sw), float(ht) / float(sh), max_zoom_mag)
+        if det_scale >= 0.90 and z_sc <= det_scale * 1.15:
+            continue
+        nw = max(1, min(wt, int(round(sw * z_sc))))
+        nh = max(1, min(ht, int(round(sh * z_sc))))
+        interp = cv2.INTER_AREA if z_sc < 1.0 else cv2.INTER_CUBIC
+        resized = cv2.resize(sub, (nw, nh), interpolation=interp)
+        canvas = np.full((ht, wt, 3), 114, dtype=np.uint8)
+        z_px = (wt - nw) // 2
+        z_py = (ht - nh) // 2
+        canvas[z_py : z_py + nh, z_px : z_px + nw] = resized
+        crops.append(canvas)
+        metas.append((vd, z_sc, z_px, z_py, rx0, ry0, rx1, ry1))
+
+    if not crops:
+        return []
+
+    z_batch = (
+        torch.from_numpy(np.stack(crops, axis=0))
+        .to(owner.dev, dtype=torch.float32)
+        .permute(0, 3, 1, 2)
+        / 255.0
+    )
+    graph_hw = tuple(getattr(owner.det_model, "input_hw", zoom_tile_hw))
+    if graph_hw != zoom_tile_hw:
+        z_batch = F.interpolate(z_batch, size=graph_hw, mode="bilinear", align_corners=False)
+    z_out = owner.det_model.forward_step(z_batch, h_prev=None)
+    z_all_probs = torch.sigmoid(z_out["cls_logits"]).cpu().numpy()
+    z_probs = z_all_probs[:, :, 0]
+    z_vprobs = z_all_probs[:, :, 1]
+    z_sprobs = z_all_probs[:, :, 2] if z_all_probs.shape[-1] > 2 else np.zeros_like(z_probs)
+    z_boxes_np = z_out["pred_boxes"].cpu().numpy().copy()
+    z_corners_np = z_out["pred_corners"].cpu().numpy().copy()
+    if graph_hw != zoom_tile_hw:
+        tile_sc = np.array([float(wt) / float(graph_hw[1]), float(ht) / float(graph_hw[0])], dtype=np.float32)
+        z_boxes_np *= np.tile(tile_sc, 2)
+        z_corners_np *= tile_sc
+
+    score_thr = max(float(owner.plate_thresh), 0.24)
+    extra_plates: list[PlateDetection] = []
+    for k_i, (vd, z_sc, z_px, z_py, rx0, ry0, rx1, ry1) in enumerate(metas):
+        mask = (z_probs[k_i] >= score_thr) & (z_probs[k_i] > z_vprobs[k_i]) & (z_probs[k_i] > z_sprobs[k_i])
+        found_any = False
+        if np.any(mask):
+            zb = z_boxes_np[k_i, mask].copy()
+            zc = z_corners_np[k_i, mask].copy()
+            zs = z_probs[k_i, mask]
+            inv_z = 1.0 / max(1e-6, z_sc)
+            zb[:, [0, 2]] = np.clip((zb[:, [0, 2]] - z_px) * inv_z + rx0, 0.0, float(w_orig))
+            zb[:, [1, 3]] = np.clip((zb[:, [1, 3]] - z_py) * inv_z + ry0, 0.0, float(h_orig))
+            zc[:, :, 0] = np.clip((zc[:, :, 0] - z_px) * inv_z + rx0, 0.0, float(w_orig))
+            zc[:, :, 1] = np.clip((zc[:, :, 1] - z_py) * inv_z + ry0, 0.0, float(h_orig))
+            zbw = zb[:, 2] - zb[:, 0]
+            zbh = zb[:, 3] - zb[:, 1]
+            aspect = zbw / np.maximum(1e-3, zbh)
+            zqw = zc[:, :, 0].max(axis=-1) - zc[:, :, 0].min(axis=-1)
+            zqh = zc[:, :, 1].max(axis=-1) - zc[:, :, 1].min(axis=-1)
+            valid = (
+                (zbw >= 5.0)
+                & (zbh >= 2.8)
+                & (aspect >= 0.48)
+                & (aspect <= 6.20)
+                & (zqw >= 0.34 * zbw)
+                & (zqw <= 1.95 * zbw)
+                & (zqh >= 0.34 * zbh)
+                & (zqh <= 1.95 * zbh)
+            )
+            if np.any(valid):
+                vb, vc, vs = zb[valid], zc[valid], zs[valid]
+                order = np.argsort(-vs)
+                for idx in order[:4]:
+                    box_t = (float(vb[idx, 0]), float(vb[idx, 1]), float(vb[idx, 2]), float(vb[idx, 3]))
+                    if any(_bbox_iou_xyxy(box_t, ep.bbox_xyxy) >= 0.45 for ep in (*existing_plates, *extra_plates)):
+                        continue
+                    extra_plates.append(
+                        PlateDetection(
+                            bbox_xyxy=box_t,
+                            score=float(vs[idx]),
+                            corners_xy=vc[idx].astype(np.float32),
+                            raw_det_score=float(vs[idx]),
+                            vehicle_bbox_xyxy=vd.bbox_xyxy,
+                            parent_vehicle_track_id=vd.vehicle_track_id,
+                            provenance=ObservationProvenance.DETECTOR_FAR_ZOOM,
+                            frame_key=frame_key,
+                        )
+                    )
+                    found_any = True
+        if not found_any and vd.vehicle_track_id is not None:
+            cooldowns[int(vd.vehicle_track_id)] = 6
+    return extra_plates
+
+
+def _suppress_stationary_corner_logos(
+    owner: Any,
+    plates: list[PlateDetection],
+    img_hw: tuple[int, int],
+) -> list[PlateDetection]:
+    """Suppress unowned static screen-corner TV logos without affecting real parked/moving vehicles."""
+    h_f, w_f = float(img_hw[0]), float(img_hw[1])
+    if h_f <= 0.0 or w_f <= 0.0:
+        return plates
+    stats_map: dict[int, dict[str, Any]] = owner._track_corner_stats
+    kept: list[PlateDetection] = []
+    discarded_ids: set[int] = set()
+    for p in plates:
+        tid = p.track_id
+        if tid is None or p.is_coasted:
+            kept.append(p)
+            continue
+        cx = 0.5 * (float(p.bbox_xyxy[0]) + float(p.bbox_xyxy[2]))
+        cy = 0.5 * (float(p.bbox_xyxy[1]) + float(p.bbox_xyxy[3]))
+        if p.plate_null_llr is not None and math.isfinite(float(p.plate_null_llr)):
+            llr = float(p.plate_null_llr)
+        else:
+            qp = min(1.0 - 1e-6, max(1e-6, float(p.quad_is_plate_prob)))
+            llr = math.log(qp) - math.log1p(-qp)
+        owned = p.parent_vehicle_track_id is not None
+        st = stats_map.get(tid)
+        if st is None:
+            st = {
+                "first_cx": cx,
+                "first_cy": cy,
+                "max_disp": 0.0,
+                "frames": 1,
+                "max_llr": llr,
+                "ever_owned": owned,
+            }
+            stats_map[tid] = st
+        else:
+            disp = math.hypot(cx - float(st["first_cx"]), cy - float(st["first_cy"]))
+            if disp > float(st["max_disp"]):
+                st["max_disp"] = disp
+            st["frames"] = int(st["frames"]) + 1
+            if llr > float(st["max_llr"]):
+                st["max_llr"] = llr
+            if owned:
+                st["ever_owned"] = True
+        in_corner = (cx < 0.16 * w_f or cx > 0.84 * w_f) and (cy < 0.16 * h_f or cy > 0.84 * h_f)
+        if (
+            not bool(st["ever_owned"])
+            and in_corner
+            and int(st["frames"]) >= 6
+            and float(st["max_disp"]) < 1.5
+            and float(st["max_llr"]) < 2.0
+        ):
+            discarded_ids.add(tid)
+            continue
+        kept.append(p)
+
+    if discarded_ids:
+        owner.tracker._tracks = [t for t in owner.tracker._tracks if t.track_id not in discarded_ids]
+        owner.tracker._dormant_tracks = [t for t in owner.tracker._dormant_tracks if t.track_id not in discarded_ids]
+        for tid in discarded_ids:
+            stats_map.pop(tid, None)
+            owner._prev_corners.pop(tid, None)
+            owner._opt_refs.pop(tid, None)
+            owner._sr_states.pop(tid, None)
+            sess = owner._ocr_sessions.get(tid)
+            if sess is not None and _collecting(sess):
+                owner._ocr_sessions.pop(tid, None)
+    return kept
 
 
 def _enforce_patent_clean_ocr_session_config(cfg: Any | None) -> Any | None:
@@ -176,6 +617,9 @@ def _relink_sessions(owner: Any, pairs: list[tuple[int, int]]) -> None:
         if hasattr(owner, "_sr_states") and old_id in owner._sr_states:
             owner._sr_states.setdefault(restored_id, owner._sr_states.pop(old_id))
             owner._sr_states.pop(old_id, None)
+        if hasattr(owner, "_track_corner_stats") and old_id in owner._track_corner_stats:
+            owner._track_corner_stats.setdefault(restored_id, owner._track_corner_stats.pop(old_id))
+            owner._track_corner_stats.pop(old_id, None)
 
 
 def _search_inputs(
@@ -685,6 +1129,9 @@ class VehiclePlateVideoPipeline:
         self._prev_corners: dict[int, np.ndarray] = {}
         self._opt_refs: dict[int, OpticalPlateRef] = {}
         self._sr_states: dict[int, _CanonicalDrizzleState] = {}
+        self._track_corner_stats: dict[int, dict[str, Any]] = {}
+        self._veh_zoom_cooldown: dict[int, int] = {}
+        self._scene_cut_monitor = _InnerSceneCutMonitor()
         self._det_hidden_state: tuple[torch.Tensor, torch.Tensor] | None = None
         self._prev_frame_luma: float | None = None
         self._frame_idx: int = 0
@@ -710,6 +1157,9 @@ class VehiclePlateVideoPipeline:
         self._prev_corners.clear()
         self._opt_refs.clear()
         self._sr_states.clear()
+        self._track_corner_stats.clear()
+        self._veh_zoom_cooldown.clear()
+        self._scene_cut_monitor.reset()
         self._det_hidden_state = None
         self._prev_frame_luma = None
         self._frame_idx = 0
@@ -728,6 +1178,24 @@ class VehiclePlateVideoPipeline:
         t0 = time.perf_counter()
         ts = float(timestamp_s if timestamp_s is not None else self._frame_idx * 0.05)
         frame_key = f"0:{self._frame_idx}"
+        retired_this_frame: dict[int, Any] = {}
+        scene_cut = False
+        pre_veh_ncc = None
+        if self.use_tracker:
+            inner_cut, inner_sad, inner_hist_corr = self._scene_cut_monitor.step(frame_rgb)
+            probed_v, low_ncc_v, pre_veh_ncc = self.vehicle_tracker.probe_vehicle_ncc(frame_rgb, ts)
+            veh_cut = (
+                (
+                    probed_v >= 2
+                    and (low_ncc_v / float(probed_v)) >= 0.60
+                    and (inner_sad >= 10.0 or inner_hist_corr < 0.92)
+                )
+                or (probed_v == 1 and low_ncc_v == 1 and (inner_sad >= 15.0 or inner_hist_corr < 0.85))
+            )
+            scene_cut = bool(inner_cut or veh_cut)
+            if scene_cut:
+                _handle_scene_cut(self, retired_this_frame)
+                pre_veh_ncc = None
         camera_motion = self._camera_motion_estimator.estimate(
             frame_rgb, [t.bbox_xyxy for t in self.vehicle_tracker._tracks])
         is_dual_quad = bool(getattr(self.quad_model, "is_dual_track_net", False))
@@ -750,6 +1218,7 @@ class VehiclePlateVideoPipeline:
         cur_luma = float(frame_rgb[::4, ::4].mean()) if frame_rgb.size > 0 else 0.0
         luma_blackout = (
             self.use_tracker
+            and not scene_cut
             and self._prev_frame_luma is not None
             and self._prev_frame_luma >= 24.0
             and cur_luma < 0.25 * self._prev_frame_luma
@@ -782,18 +1251,24 @@ class VehiclePlateVideoPipeline:
             if self.use_tracker:
                 self._prev_frame_luma = cur_luma
 
+        filtered_vehicles = _vehicle_containment_nms(list(raw_res.vehicles))
         if self.use_tracker:
             tracked_vehicles = self.vehicle_tracker.step(
-                list(raw_res.vehicles),
+                filtered_vehicles,
                 timestamp_s=ts,
                 img_hw=frame_rgb.shape[:2],
                 action_meta=ObservationActionMeta(detector_ran_full=True, frame_key=frame_key),
                 camera_motion=camera_motion, frame_rgb=frame_rgb,
+                precomputed_veh_ncc=pre_veh_ncc,
             )
         else:
-            tracked_vehicles = list(raw_res.vehicles)
+            tracked_vehicles = filtered_vehicles
 
         det_candidates = list(raw_res.plates)
+        if is_temp_det and self.enable_far_zoom and tracked_vehicles:
+            det_candidates.extend(
+                _run_full_face_vehicle_zoom(self, frame_rgb, tracked_vehicles, det_candidates, frame_key)
+            )
         for candidate in det_candidates:
             candidate.frame_key = frame_key
         search_requests = (_search_requests(self, det_candidates, ts, frame_rgb.shape[:2])
@@ -823,7 +1298,6 @@ class VehiclePlateVideoPipeline:
             **refine_extra_kw,
         )
 
-        retired_this_frame: dict[int, Any] = {}
         relinked_this_frame: list[tuple[int, int]] = []
         if self.use_tracker:
             veh_vels = (
@@ -845,6 +1319,7 @@ class VehiclePlateVideoPipeline:
                     tracked_vehicles, plates, update_vehicle_plate_lists=True,
                     img_hw=frame_rgb.shape[:2], plate_tracker=self.tracker,
                 )
+            plates = _suppress_stationary_corner_logos(self, plates, frame_rgb.shape[:2])
             relinked_this_frame = list(self.tracker.last_relinked_pairs)
 
             _relink_sessions(self, relinked_this_frame)
@@ -853,6 +1328,7 @@ class VehiclePlateVideoPipeline:
                 self._prev_corners.pop(exp_tid, None)
                 self._opt_refs.pop(exp_tid, None)
                 self._sr_states.pop(exp_tid, None)
+                self._track_corner_stats.pop(exp_tid, None)
                 exp_sess = self._ocr_sessions.pop(exp_tid, None)
                 if exp_sess is not None:
                     exp_dec = _finish_cached(self, exp_tid, exp_sess)
@@ -1034,7 +1510,7 @@ class VehiclePlateVideoPipeline:
         out_veh_bboxes = (
             [(*v.bbox_xyxy, float(v.score)) for v in tracked_vehicles]
             if tracked_vehicles
-            else list(raw_res.vehicle_bboxes_xyxy)
+            else ([(*v.bbox_xyxy, float(v.score)) for v in filtered_vehicles] if filtered_vehicles else [])
         )
         self._frame_idx += 1
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1046,6 +1522,7 @@ class VehiclePlateVideoPipeline:
             ocr_decisions=ocr_decisions,
             metadata={
                 "raw_candidates": len(raw_res.plates),
+                "scene_cut": bool(scene_cut),
                 "luma_blackout_frozen": bool(luma_blackout),
                 "ocr_accepted": ocr_map,
                 "ocr_accepted_verified": ocr_verified_map,
@@ -1076,10 +1553,14 @@ class FastLuminanceScout:
         self.min_blob_cells = int(min_blob_cells)
         self.min_border_entry_cells = int(min_border_entry_cells)
         self._prev_y: np.ndarray | None = None
+        self._prev_inner_y: np.ndarray | None = None
+        self._prev_inner_hist: np.ndarray | None = None
         self._noise_ema: float = 4.0
 
     def reset(self) -> None:
         self._prev_y = None
+        self._prev_inner_y = None
+        self._prev_inner_hist = None
         self._noise_ema = 4.0
 
     def step(
@@ -1096,16 +1577,34 @@ class FastLuminanceScout:
             + 0.587 * small_rgb[:, :, 1].astype(np.float32)
             + 0.114 * small_rgb[:, :, 2].astype(np.float32)
         )
+        inner_y, inner_hist = _compute_inner_scene_features(small_rgb)
 
         if self._prev_y is None:
             self._prev_y = y_cur
+            self._prev_inner_y = inner_y
+            self._prev_inner_hist = inner_hist
             return {
                 "motion_rois_xyxy": [],
                 "unmonitored_rois_xyxy": [],
                 "has_border_entry": False,
                 "jitter_xy": (0, 0),
                 "noise_floor": self._noise_ema,
+                "scene_cut": False,
+                "inner_sad": 0.0,
+                "inner_hist_corr": 1.0,
             }
+
+        inner_sad = (
+            float(np.mean(np.abs(inner_y - self._prev_inner_y)))
+            if (self._prev_inner_y is not None and self._prev_inner_y.shape == inner_y.shape)
+            else 0.0
+        )
+        inner_hist_corr = (
+            float(np.clip(np.dot(inner_hist, self._prev_inner_hist), 0.0, 1.0))
+            if self._prev_inner_hist is not None
+            else 1.0
+        )
+        scene_cut = _is_inner_scene_cut(inner_sad, inner_hist_corr)
 
         prev = self._prev_y
         mj = min(self.max_jitter_cells, min(gh, gw) // 4)
@@ -1194,12 +1693,17 @@ class FastLuminanceScout:
                     has_border_entry = True
 
         self._prev_y = y_cur
+        self._prev_inner_y = inner_y
+        self._prev_inner_hist = inner_hist
         return {
             "motion_rois_xyxy": motion_rois,
             "unmonitored_rois_xyxy": unmonitored_rois,
             "has_border_entry": has_border_entry,
             "jitter_xy": (int(best_dx), int(best_dy)),
             "noise_floor": round(self._noise_ema, 3),
+            "scene_cut": bool(scene_cut),
+            "inner_sad": round(inner_sad, 3),
+            "inner_hist_corr": round(inner_hist_corr, 4),
         }
 
 
@@ -1223,8 +1727,8 @@ class MultiRateEdgeCascadePipeline:
         plate_thresh: float = 0.22,
         min_is_plate_prob: float = 0.34,
         enable_far_zoom: bool = True,
-        heartbeat_interval: int = 6,
-        max_heartbeat_interval: int = 10,
+        heartbeat_interval: int = 2,
+        max_heartbeat_interval: int = 3,
         overload_track_threshold: int = 4,
         ocr_model: Any | None = None,
         ocr_vocab: Any | None = None,
@@ -1268,6 +1772,8 @@ class MultiRateEdgeCascadePipeline:
         self._prev_corners: dict[int, np.ndarray] = {}
         self._opt_refs: dict[int, OpticalPlateRef] = {}
         self._sr_states: dict[int, _CanonicalDrizzleState] = {}
+        self._track_corner_stats: dict[int, dict[str, Any]] = {}
+        self._veh_zoom_cooldown: dict[int, int] = {}
         self._cached_vehicles: list[VehicleDetection] = []
         self._cached_vehicle_bboxes: list[tuple[float, float, float, float, float]] = []
         self._frame_idx: int = 0
@@ -1301,6 +1807,8 @@ class MultiRateEdgeCascadePipeline:
         self._prev_corners.clear()
         self._opt_refs.clear()
         self._sr_states.clear()
+        self._track_corner_stats.clear()
+        self._veh_zoom_cooldown.clear()
         self._cached_vehicles.clear()
         self._cached_vehicle_bboxes.clear()
         self._frame_idx = 0
@@ -1319,8 +1827,7 @@ class MultiRateEdgeCascadePipeline:
         t0 = time.perf_counter()
         ts = float(timestamp_s if timestamp_s is not None else self._frame_idx * 0.05)
         frame_key = f"0:{self._frame_idx}"
-        camera_motion = self._camera_motion_estimator.estimate(
-            frame_rgb, [t.bbox_xyxy for t in self.vehicle_tracker._tracks])
+        retired_this_frame: dict[int, Any] = {}
         is_dual_quad = bool(getattr(self.quad_model, "is_dual_track_net", False))
         is_temp_det = bool(getattr(self.det_model, "is_temporal_det_net", False) or isinstance(self.det_model, UnifiedTemporalDetORT))
         is_v2_ocr = bool(getattr(self.ocr_model, "is_v2", False)) if self.ocr_model is not None else False
@@ -1357,10 +1864,6 @@ class MultiRateEdgeCascadePipeline:
         proposals = self.tracker.get_predicted_roi_proposals(next_timestamp_s=ts, include_dormant=True)
         active_props = [pr for pr in proposals if not pr.is_dormant]
         dormant_props = [pr for pr in proposals if pr.is_dormant]
-        any_reacquire = any(pr.needs_detector_reacquire for pr in active_props)
-        all_reacquire = bool(active_props) and all(pr.needs_detector_reacquire for pr in active_props)
-        min_reacq_gap = 3 if (self._ocr_sessions or self._retired_decisions) and self._frame_idx >= 10 else 1
-        needs_reacquire = (all_reacquire and self._frames_since_det >= min_reacq_gap) or (any_reacquire and self._frames_since_det >= max(2, min_reacq_gap))
 
         monitored_boxes: list[tuple[float, float, float, float]] = [
             pr.predicted_bbox_xyxy for pr in active_props
@@ -1381,6 +1884,39 @@ class MultiRateEdgeCascadePipeline:
             monitored_boxes_xyxy=monitored_boxes,
             excluded_holes_xyxy=excluded_holes,
         )
+
+        probed_v, low_ncc_v, pre_veh_ncc = self.vehicle_tracker.probe_vehicle_ncc(frame_rgb, ts)
+        scout_cut = bool(scout_info.get("scene_cut", False))
+        inner_sad = float(scout_info.get("inner_sad", 0.0))
+        inner_hist_corr = float(scout_info.get("inner_hist_corr", 1.0))
+        veh_cut = (
+            (
+                probed_v >= 2
+                and (low_ncc_v / float(probed_v)) >= 0.60
+                and (inner_sad >= 10.0 or inner_hist_corr < 0.92)
+            )
+            or (probed_v == 1 and low_ncc_v == 1 and (inner_sad >= 15.0 or inner_hist_corr < 0.85))
+        )
+        scene_cut = bool(scout_cut or veh_cut)
+
+        if scene_cut:
+            _handle_scene_cut(self, retired_this_frame)
+            luma_blackout = False
+            proposals = []
+            active_props = []
+            dormant_props = []
+            confirmed_vtracks = []
+            pre_veh_ncc = None
+            camera_motion = self._camera_motion_estimator.estimate(frame_rgb, [])
+        else:
+            camera_motion = self._camera_motion_estimator.estimate(
+                frame_rgb, [t.bbox_xyxy for t in self.vehicle_tracker._tracks]
+            )
+
+        any_reacquire = any(pr.needs_detector_reacquire for pr in active_props)
+        all_reacquire = bool(active_props) and all(pr.needs_detector_reacquire for pr in active_props)
+        min_reacq_gap = 3 if (self._ocr_sessions or self._retired_decisions) and self._frame_idx >= 10 else 1
+        needs_reacquire = (all_reacquire and self._frames_since_det >= min_reacq_gap) or (any_reacquire and self._frames_since_det >= max(2, min_reacq_gap))
 
         # Explicit high-load scheduling policy (never silently drops tracks!)
         overload_active = len(active_props) >= self.overload_track_threshold
@@ -1417,17 +1953,33 @@ class MultiRateEdgeCascadePipeline:
         )
         border_trigger = bool(scout_info["has_border_entry"]) and (
             (len(active_props) == 0 and self._empty_scene_cooldown == 0 and self._frames_since_det >= min_trig_gap)
-            or (len(active_props) > 0 and self._frames_since_det >= 3)
+            or (len(active_props) > 0 and self._frames_since_det >= 5)
+        )
+        any_veh_ncc_drop = (
+            bool(pre_veh_ncc)
+            and (
+                (len(active_props) == 0 and any(res[1] < 0.40 for res in pre_veh_ncc.values()) and self._frames_since_det >= 2)
+                or (all(res[1] < 0.40 for res in pre_veh_ncc.values()) and self._frames_since_det >= 3)
+            )
+        )
+        veh_starved_trigger = (
+            len(confirmed_vtracks) == 0
+            and len(active_props) == 0
+            and self._empty_scene_cooldown == 0
+            and self._frames_since_det >= 2
         )
 
         run_full_det = (
             self._frame_idx == 0
+            or scene_cut
             or self._frames_since_det >= eff_hb
             or (not is_dual_quad)
             or interior_empty_trigger
             or border_trigger
             or needs_reacquire
             or dormant_reappear
+            or any_veh_ncc_drop
+            or veh_starved_trigger
         )
 
         if run_full_det:
@@ -1462,13 +2014,15 @@ class MultiRateEdgeCascadePipeline:
                     enable_far_zoom=self.enable_far_zoom,
                 )
 
-            if raw_res.vehicles or self.vehicle_tracker._tracks:
+            filtered_vehicles = _vehicle_containment_nms(list(raw_res.vehicles))
+            if filtered_vehicles or self.vehicle_tracker._tracks:
                 tracked_vehicles = self.vehicle_tracker.step(
-                    list(raw_res.vehicles),
+                    filtered_vehicles,
                     timestamp_s=ts,
                     img_hw=frame_rgb.shape[:2],
                     action_meta=ObservationActionMeta(detector_ran_full=True, frame_key=frame_key),
                     camera_motion=camera_motion, frame_rgb=frame_rgb,
+                    precomputed_veh_ncc=pre_veh_ncc,
                 )
             else:
                 tracked_vehicles = []
@@ -1477,31 +2031,39 @@ class MultiRateEdgeCascadePipeline:
             self._cached_vehicle_bboxes = (
                 [(*v.bbox_xyxy, float(v.score)) for v in tracked_vehicles]
                 if tracked_vehicles
-                else list(raw_res.vehicle_bboxes_xyxy)
+                else ([(*v.bbox_xyxy, float(v.score)) for v in filtered_vehicles] if filtered_vehicles else [])
             )
             if (
                 (interior_empty_trigger or (len(active_props) == 0 and border_trigger))
                 and not raw_res.plates
-                and not raw_res.vehicles
-                and not raw_res.vehicle_bboxes_xyxy
+                and not filtered_vehicles
             ):
                 self._empty_scene_cooldown = 3
             self._frames_since_det = 0
             self._full_det_calls += 1
 
             det_candidates = list(raw_res.plates)
+            if is_temp_det and self.enable_far_zoom and tracked_vehicles:
+                det_candidates.extend(
+                    _run_full_face_vehicle_zoom(self, frame_rgb, tracked_vehicles, det_candidates, frame_key)
+                )
         else:
             pre_state = "TRACK" if active_props else ("OCCLUDED" if dormant_props else "SEARCH")
             self._frames_since_det += 1
             tracked_vehicles = self.vehicle_tracker.step([], timestamp_s=ts,
                 img_hw=frame_rgb.shape[:2], action_meta=ObservationActionMeta(frame_key=frame_key),
-                camera_motion=camera_motion, frame_rgb=frame_rgb)
+                camera_motion=camera_motion, frame_rgb=frame_rgb,
+                precomputed_veh_ncc=pre_veh_ncc)
             live_confirmed = [
                 vt for vt in getattr(self.vehicle_tracker, "_tracks", ())
                 if getattr(vt, "confirmed", False)
+                and (getattr(vt, "veh_ref", None) is None or float(getattr(vt, "patch_ncc", 1.0)) >= 0.40)
             ]
             if live_confirmed:
                 self._cached_vehicle_bboxes = [(*vt.bbox_xyxy, float(vt.r)) for vt in live_confirmed]
+            else:
+                self._cached_vehicle_bboxes = []
+                self._cached_vehicles = []
             det_candidates = []
 
         for candidate in det_candidates:
@@ -1554,15 +2116,16 @@ class MultiRateEdgeCascadePipeline:
                 img_hw=frame_rgb.shape[:2], plate_tracker=self.tracker,
             )
             self._cached_vehicles = list(tracked_vehicles)
+        plates = _suppress_stationary_corner_logos(self, plates, frame_rgb.shape[:2])
         relinked_this_frame = list(self.tracker.last_relinked_pairs)
 
         _relink_sessions(self, relinked_this_frame)
 
-        retired_this_frame: dict[int, Any] = {}
         for exp_tid in self.tracker.last_expired_track_ids:
             self._prev_corners.pop(exp_tid, None)
             self._opt_refs.pop(exp_tid, None)
             self._sr_states.pop(exp_tid, None)
+            self._track_corner_stats.pop(exp_tid, None)
             self._dormant_reappear_cooldown.pop(exp_tid, None)
             exp_sess = self._ocr_sessions.pop(exp_tid, None)
             if exp_sess is not None:
@@ -1687,6 +2250,7 @@ class MultiRateEdgeCascadePipeline:
             metadata={
                 "cascade_state": self.state,
                 "ran_full_detector": run_full_det,
+                "scene_cut": bool(scene_cut),
                 "dormant_reappear_triggered": bool(dormant_reappear),
                 "luma_blackout_frozen": bool(luma_blackout),
                 "overload_active": overload_active,

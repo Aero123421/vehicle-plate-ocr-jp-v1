@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gen-6 pure-synthetic scratch training, innovation calibration and four-graph export."""
+"""Gen-7 pure-synthetic scratch training, multi-frame memory SR, innovation calibration and four-graph export."""
 
 from __future__ import annotations
 
@@ -220,6 +220,7 @@ def compute_hard_negative_aux_loss(
         torch.zeros_like(enc.frame_valid_logit.float()),
     )
     gate_pen = enc.frame_valid_gate.float().pow(2).mean()
+    prec_pen = enc.lambda_prec.float().mean() + 0.25 * enc.lambda_color.float().mean()
     tgt_unread = torch.ones((batch_n,), dtype=torch.long, device=dev)
     stat_ce = F.cross_entropy(ro.status_logits.float(), tgt_unread)
     read_bce = _safe_bce_prob_v2(
@@ -235,7 +236,7 @@ def compute_hard_negative_aux_loss(
         )
     else:
         pad_ce = stat_ce * 0.0
-    return fv_bce + gate_pen + 0.55 * stat_ce + 0.50 * read_bce + 0.30 * pad_ce
+    return fv_bce + gate_pen + 0.45 * prec_pen + 0.55 * stat_ce + 0.50 * read_bce + 0.30 * pad_ce
 
 
 def compute_crisp_dwell_splice_aux_loss(
@@ -993,7 +994,7 @@ def evaluate_synthetic_val(
         blr = _move_batch_v2_to_device(
             val_engine.sample_batch(
                 bsz_lr,
-                seq_len=12,
+                seq_len=16 if num_batches >= 2 else 12,
                 approach_prob=0.0,
                 lowres_sr_prob=1.0,
                 regime_override=REGIME_NAMES[0],
@@ -1096,6 +1097,8 @@ def train_preset_from_scratch(
         statutory_len=0.65,
         innovation_nll=0.02,
         terminal_risk=0.25,
+        memory_sr=0.55,
+        f1_sr=0.20,
     )
     criterion = OCRLossV2(
         vocab_size=vocab.size,
@@ -1171,25 +1174,25 @@ def train_preset_from_scratch(
         # 100% fresh GPU synthetic batches every step (zero cached_raw_batch reuse!)
         u_mode = float(torch.rand((), generator=lh_rng).item())
         init_state: MemoryStateV2 | None = None
-        if stage >= 2 and total_steps >= 40 and u_mode < 0.30:
-            # 30% Differentiable Long-Horizon T=20..24 sequences across 4 temporal regimes:
-            # (1) pure 12..26px low-res SR, (2) far->near approach, (3) near->far receding, (4) bell-curve!
-            t_lh = int(torch.randint(20, 25, (), generator=lh_rng).item())
+        if stage >= 2 and total_steps >= 40 and u_mode < 0.42:
+            # 42% Differentiable Long-Horizon T=16..24 sequences across 4 temporal regimes:
+            # (1) 48% pure 12..26px low-res sub-pixel SR, (2) far->near approach, (3) near->far receding, (4) bell-curve!
+            t_lh = int(torch.randint(16, 25, (), generator=lh_rng).item())
             bsz_lh = max(2, min(batch_size, (batch_size * seq_len) // t_lh))
             u_sub = float(torch.rand((), generator=lh_rng).item())
-            if u_sub < 0.28:
+            if u_sub < 0.48:
                 raw_batch = _move_batch_v2_to_device(
                     engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.0, lowres_sr_prob=1.0),
                     device,
                 )
                 batch = dict(raw_batch)
-            elif u_sub < 0.56:
+            elif u_sub < 0.70:
                 raw_batch = _move_batch_v2_to_device(
                     engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.90, lowres_sr_prob=0.0),
                     device,
                 )
                 batch = dict(raw_batch)
-            elif u_sub < 0.80:
+            elif u_sub < 0.86:
                 raw_batch = _move_batch_v2_to_device(
                     engine.sample_batch(bsz_lh, seq_len=t_lh, approach_prob=0.90, lowres_sr_prob=0.0),
                     device,
@@ -1225,7 +1228,7 @@ def train_preset_from_scratch(
             raw_batch = _move_batch_v2_to_device(engine.sample_batch(batch_size, seq_len=seq_len), device)
             batch = dict(raw_batch)
             ts_in = batch["timestamps_s"]
-            if batch["crops"].shape[1] == seq_len and stage >= 2 and total_steps >= 40 and 0.30 <= u_mode < 0.50:
+            if batch["crops"].shape[1] == seq_len and stage >= 2 and total_steps >= 40 and 0.42 <= u_mode < 0.60:
                 init_state, ts_in = _build_approach_or_dwell_prefix_state(
                     model, batch, lh_rng, use_amp=use_amp
                 )
@@ -1248,6 +1251,7 @@ def train_preset_from_scratch(
                 batch["frame_pad_mask"] = short_pad
 
         want_stroke = bool("stroke_mask_gt" in batch and batch["stroke_mask_gt"] is not None)
+        want_mem_sr = bool("canon_clean_crop" in batch and batch["canon_clean_crop"] is not None)
         do_aux_pair = (step % 2 == 0) or (step < 120)
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -1261,6 +1265,7 @@ def train_preset_from_scratch(
                 frame_pad_mask=batch.get("frame_pad_mask"),
                 compute_prefix_readout=True,
                 compute_stroke_mask=want_stroke,
+                compute_memory_sr=want_mem_sr,
                 init_state=init_state,
                 target_status=batch.get("target_status"),
             )
@@ -1314,7 +1319,8 @@ def train_preset_from_scratch(
                 f"  [{preset.upper()} {step + 1}/{total_steps} | C{stage} | {elapsed:.0f}s] "
                 f"loss={metrics['loss_total']:.4f} "
                 f"(slots={metrics['loss_seq_slots']:.4f}, col={metrics['loss_color_type']:.4f}, "
-                f"unc={metrics['loss_unc_cal']:.4f}, cf={metrics['loss_cf_conflict']:.4f}) "
+                f"unc={metrics['loss_unc_cal']:.4f}, cf={metrics['loss_cf_conflict']:.4f}, "
+                f"sr={metrics.get('loss_memory_sr', 0.0):.4f}) "
                 f"lr={lr_now:.2e}",
                 flush=True,
             )
@@ -1349,9 +1355,9 @@ def train_preset_from_scratch(
         warmup_steps=warmup_steps,
         max_lr=max_lr,
         min_lr=2.0e-5,
-        long_horizon_prob=0.20,
-        approach_batch_prob=0.30,
-        approach_seq_len_range=(20, 24),
+        long_horizon_prob=0.18,
+        approach_batch_prob=0.42,
+        approach_seq_len_range=(16, 24),
         curriculum_fractions=fracs,
         seed=data_seed,
     )
@@ -1367,7 +1373,7 @@ def train_preset_from_scratch(
     )
 
     meta_summary: dict[str, Any] = {
-        "version": "0.6.0",
+        "version": "1.0.0",
         "zero_real_pixel_training": True,
         "init_mode": "random_scratch",
         "init_seed": init_seed,
@@ -1417,7 +1423,8 @@ def train_preset_from_scratch(
     graph_names = ("frame_encoder", "memory_step", "memory_readout", "stopping_risk")
     artifact_sizes = {f"{name}.int8.onnx": (onnx_dir / f"{name}.int8.onnx").stat().st_size for name in graph_names}
     if preset == "nano":
-        assert sum(artifact_sizes.values()) <= 6 * 1024**2, artifact_sizes
+        tot_nano_bytes = sum(artifact_sizes.values())
+        assert int(6.0 * 1024**2) <= tot_nano_bytes <= int(6.9 * 1024**2), artifact_sizes
     meta_summary["int8_bytes"] = artifact_sizes
     meta_summary["checkpoint_sha256"] = compute_file_sha256(ckpt_path)
     meta_summary["provenance_verification"] = prov_report

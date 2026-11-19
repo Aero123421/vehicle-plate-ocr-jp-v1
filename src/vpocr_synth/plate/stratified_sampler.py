@@ -58,6 +58,8 @@ KANJI_CONFUSABLE_GROUPS: list[tuple[str, ...]] = [
     ("大阪", "上越", "大分", "大宮", "和泉", "京都"),
     ("岩手", "平泉", "盛岡", "青森"),
     ("姫路", "釧路", "高知", "高崎", "高松"),
+    ("練馬", "横浜", "相模", "湘南", "多摩", "川崎"),
+    ("新潟", "愛媛", "金沢", "函館", "札幌"),
 ]
 CONFUSABLE_GROUPS: list[tuple[str, ...]] = DIGIT_LATIN_CONFUSABLE_GROUPS + HIRAGANA_CONFUSABLE_GROUPS
 
@@ -145,18 +147,18 @@ def _occurrence_index(idx: int, pattern: list[str], value: str) -> int:
 class StratifiedSamplerConfig:
     confusable_focus_prob: float = 0.30
     p_class_3digit_latin: float = 0.08
-    p_class_2digit: float = 0.22
+    p_class_2digit: float = 0.26
     p_class_1digit: float = 0.08
     p_serial_4digit: float = 0.65
     p_serial_3digit: float = 0.15
     p_serial_2digit: float = 0.12
     p_serial_1digit: float = 0.08
-    p_type_private: float = 0.24
+    p_type_private: float = 0.22
     p_type_commercial: float = 0.32
-    p_type_kei_private: float = 0.16
-    p_type_kei_commercial: float = 0.16
+    p_type_kei_private: float = 0.14
+    p_type_kei_commercial: float = 0.20
     p_type_graphic: float = 0.12
-    p_large_commercial: float = 0.62
+    p_large_commercial: float = 0.64
     p_large_private: float = 0.30
     p_large_graphic: float = 0.16
 
@@ -245,22 +247,35 @@ class StratifiedPlateSampler:
                 if rname in self._region_name_set and rname not in kanji_conf_unique:
                     kanji_conf_unique.append(rname)
         special_extras = [
+            "練馬",
+            "横浜",
+            "新潟",
+            "愛媛",
+            "金沢",
+            "函館",
+            "品川",
+            "足立",
+            "越谷",
+            "なにわ",
+            "岡山",
+            "岩手",
             "尾張小牧",
             "伊勢志摩",
             "柏",
             "堺",
             "袖ケ浦",
             "富士山",
-            "なにわ",
             "つくば",
             "いわき",
             "長崎",
-            "岡山",
             "福山",
             "富山",
             "熊本",
         ]
-        boost_extras = kanji_conf_unique + [r for r in special_extras if r in self._region_name_set]
+        boost_extras = [r for r in special_extras if r in self._region_name_set]
+        for r in kanji_conf_unique:
+            if r not in boost_extras:
+                boost_extras.append(r)
         # Keep total cycle <= 199 (prime <= 200) so any 200 consecutive samples cover 100% of regions
         max_extras = max(0, 199 - len(base_perm))
         boost_extras = boost_extras[:max_extras]
@@ -419,7 +434,7 @@ class StratifiedPlateSampler:
             # SOFA 'A' / 'B' plates on standard passenger vehicles predominantly use 5-series (500..599)
             return rng.choices(["5", "3", "7", "1", "4", "8"], weights=[0.88, 0.04, 0.03, 0.02, 0.02, 0.01], k=1)[0]
         if plate_size == PlateSize.LARGE and plate_type != PlateType.GRAPHIC:
-            return rng.choices(["1", "2", "8", "9", "0"], weights=[0.46, 0.20, 0.20, 0.07, 0.07], k=1)[0]
+            return rng.choices(["1", "2", "8", "9", "0"], weights=[0.42, 0.18, 0.28, 0.06, 0.06], k=1)[0]
         if plate_type == PlateType.KEI_PRIVATE:
             return rng.choices(["5", "7", "4", "8"], weights=[0.74, 0.14, 0.07, 0.05], k=1)[0]
         if plate_type == PlateType.KEI_COMMERCIAL:
@@ -498,7 +513,18 @@ class StratifiedPlateSampler:
             else:
                 classification = "0"
         elif style == "3digit_std":
-            classification = f"{first}{rng.randint(0,9)}{rng.randint(0,9)}"
+            if (
+                plate_type == PlateType.STANDARD_COMMERCIAL
+                and plate_size == PlateSize.LARGE
+                and first == "8"
+                and rng.random() < 0.55
+            ):
+                # Boost green large commercial 800 / 830 specialty series (e.g. 800, 830, 80x, 83x)
+                classification = rng.choice(
+                    ["800", "830", "800", "830", f"80{rng.randint(0, 9)}", f"83{rng.randint(0, 9)}"]
+                )
+            else:
+                classification = f"{first}{rng.randint(0,9)}{rng.randint(0,9)}"
         elif style == "3digit_latin":
             latin_occ = (idx // lp_cls) * self._class_latin_total + self._class_latin_prefix[cls_pos]
             letter = self._allowed_latin[latin_occ % len(self._allowed_latin)]
@@ -508,8 +534,16 @@ class StratifiedPlateSampler:
             else:
                 classification = f"{first}{letter}{letter2}"
         elif style == "2digit":
-            if first == "8" and rng.random() < 0.45:
-                classification = f"8{rng.choice(['8', '0'])}"
+            # Boost common real-world 2-digit classifications (11, 40, 42, 48, 50, 58, 88, 99)
+            _target_2d_by_first = {
+                "1": ("11", "10", "11", "14"),
+                "4": ("40", "42", "48", "40", "42", "48"),
+                "5": ("50", "58", "50", "58", "55"),
+                "8": ("88", "80", "88", "83"),
+                "9": ("99", "90", "99"),
+            }
+            if first in _target_2d_by_first and rng.random() < 0.62:
+                classification = rng.choice(_target_2d_by_first[first])
             elif rng.random() < 0.32:
                 classification = f"{first}{rng.choice([first, '0'])}"
             else:

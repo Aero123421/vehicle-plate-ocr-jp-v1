@@ -40,8 +40,8 @@ class TrainConfigV2:
     apply_ema_at_end: bool = False
     compute_garbage_invariance: bool = True
     long_horizon_prob: float = 0.28
-    approach_batch_prob: float = 0.30
-    approach_seq_len_range: tuple[int, int] = (20, 24)
+    approach_batch_prob: float = 0.34
+    approach_seq_len_range: tuple[int, int] = (16, 24)
     label_smoothing_start: float = 0.006
     label_smoothing_end: float = 0.001
     curriculum_fractions: tuple[float, float, float] = (0.20, 0.50, 0.80)
@@ -188,8 +188,13 @@ def _dict_to_model_config_v2(cfg_dict: Mapping[str, Any]) -> ModelConfigV2:
         clean["blocks"] = tuple(clean["blocks"])
     if "input_hw" in clean and isinstance(clean["input_hw"], list):
         clean["input_hw"] = tuple(clean["input_hw"])
-    if "gen5_arch" not in clean and len(clean) > 2:
-        clean["gen5_arch"] = False
+    if len(clean) > 2:
+        if "gen5_arch" not in clean:
+            clean["gen5_arch"] = False
+        if "stem_channels" not in clean:
+            clean["stem_channels"] = 4
+        if "readout_layers" not in clean:
+            clean["readout_layers"] = 2
     return ModelConfigV2(**clean)
 
 
@@ -1051,15 +1056,15 @@ class OCRTrainerV2:
                 token_budget = max(24, int(self.config.batch_size) * int(self.config.seq_len))
                 bsz_app = max(4, min(int(self.config.batch_size), token_budget // t_app))
                 u_traj = float(torch.rand((), generator=lh_rng).item())
-                if supports_lowres_kw and u_traj < 0.28:
+                if supports_lowres_kw and u_traj < 0.25:
                     raw_app = train_source.sample_batch(
                         bsz_app, seq_len=t_app, approach_prob=0.0, lowres_sr_prob=1.0
                     )
                     batch = _move_batch_v2_to_device(raw_app, self.device)
-                elif u_traj < 0.56:
+                elif u_traj < 0.58:
                     raw_app = train_source.sample_batch(bsz_app, seq_len=t_app, approach_prob=0.88)
                     batch = _move_batch_v2_to_device(raw_app, self.device)
-                elif u_traj < 0.80:
+                elif u_traj < 0.85:
                     # Receding `near -> far` trajectory
                     raw_app = train_source.sample_batch(bsz_app, seq_len=t_app, approach_prob=0.88)
                     batch = _move_batch_v2_to_device(raw_app, self.device)
@@ -1139,6 +1144,9 @@ class OCRTrainerV2:
             want_stroke = bool(
                 "stroke_mask_gt" in batch and batch["stroke_mask_gt"] is not None
             )
+            want_mem_sr = bool(
+                "canon_clean_crop" in batch and batch["canon_clean_crop"] is not None
+            )
 
             with self._autocast_ctx():
                 seq_out = self.model.forward_sequence(
@@ -1149,6 +1157,7 @@ class OCRTrainerV2:
                     frame_pad_mask=batch.get("frame_pad_mask"),
                     compute_prefix_readout=True,
                     compute_stroke_mask=want_stroke,
+                    compute_memory_sr=want_mem_sr,
                     init_state=init_state,
                     target_status=batch.get("target_status"),
                 )
@@ -1198,7 +1207,8 @@ class OCRTrainerV2:
                     f"    [V2 {step + 1}/{num_steps} | C{int(metrics['curriculum_stage'])}] "
                     f"loss={metrics['loss_total']:.4f} "
                     f"(slots={metrics['loss_seq_slots']:.4f}, aux={metrics['loss_aux_frames']:.4f}, "
-                    f"col={metrics['loss_color_type']:.4f}, unc={metrics['loss_unc_cal']:.4f}) "
+                    f"col={metrics['loss_color_type']:.4f}, unc={metrics['loss_unc_cal']:.4f}, "
+                    f"sr={metrics.get('loss_memory_sr', 0.0):.4f}) "
                     f"lr={lr_now:.2e}",
                     flush=True,
                 )

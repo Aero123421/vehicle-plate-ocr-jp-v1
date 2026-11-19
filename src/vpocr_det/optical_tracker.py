@@ -397,3 +397,251 @@ def track_plate_optical(
         return False, final_zncc, None
 
     return True, final_zncc, corners
+
+
+VEH_TPL_W: int = 16
+VEH_TPL_H: int = 16
+_VEH_CW: int = 8
+_VEH_CH: int = 8
+
+_VEH_U16 = (0.10 + 0.80 * (np.arange(VEH_TPL_W, dtype=np.float32) + 0.5) / float(VEH_TPL_W))[None, :]  # (1, 16)
+_VEH_V16 = (0.10 + 0.80 * (np.arange(VEH_TPL_H, dtype=np.float32) + 0.5) / float(VEH_TPL_H))[:, None]  # (16, 1)
+_VEH_U8 = (0.10 + 0.80 * (np.arange(_VEH_CW, dtype=np.float32) + 0.5) / float(_VEH_CW))[None, :]       # (1, 8)
+_VEH_V8 = (0.10 + 0.80 * (np.arange(_VEH_CH, dtype=np.float32) + 0.5) / float(_VEH_CH))[:, None]       # (8, 1)
+
+
+@dataclass(slots=True)
+class VehicleAppearanceRef:
+    """Compact 16x16 grayscale ZNCC patch + 24D RGB color histogram + 32D appearance vector."""
+
+    tpl: np.ndarray         # (256,) float32 zero-mean unit-L2-norm
+    coarse: np.ndarray      # (64,) float32 zero-mean unit-L2-norm
+    tpl_std: float
+    color_hist: np.ndarray  # (24,) float32 L2-normalized sqrt-prob 3x8 RGB histogram
+    app32: np.ndarray       # (32,) float32 unit-L2-norm [24D RGB hist + 8D 4x2 luma grid]
+
+
+def extract_vehicle_appearance(
+    frame_rgb: np.ndarray,
+    bbox_xyxy: tuple[float, float, float, float],
+) -> VehicleAppearanceRef | None:
+    """Extract interior-80% 16x16 ZNCC template, 24D RGB histogram, and 32D appearance vector."""
+    if frame_rgb.ndim != 3 or frame_rgb.shape[2] < 3:
+        return None
+    h, w = frame_rgb.shape[:2]
+    x0, y0, x1, y1 = [float(v) for v in bbox_xyxy]
+    bw = x1 - x0
+    bh = y1 - y0
+    if not (math.isfinite(bw) and math.isfinite(bh)) or bw < 10.0 or bh < 10.0:
+        return None
+
+    # Bilinearly sample interior 80% on 16x16 grid directly from tight RGB slice
+    ix0 = max(0, int(math.floor(x0 + 0.08 * bw)) - 1)
+    iy0 = max(0, int(math.floor(y0 + 0.08 * bh)) - 1)
+    ix1 = min(w, int(math.ceil(x1 - 0.08 * bw)) + 2)
+    iy1 = min(h, int(math.ceil(y1 - 0.08 * bh)) + 2)
+    if ix1 - ix0 < 3 or iy1 - iy0 < 3:
+        return None
+
+    sub = frame_rgb[iy0:iy1, ix0:ix1, :3].astype(np.float32)
+    px = x0 + bw * _VEH_U16  # (1, 16)
+    py = y0 + bh * _VEH_V16  # (16, 1)
+    lx = np.clip(px - float(ix0), 0.0, float(ix1 - ix0) - 1.001)
+    ly = np.clip(py - float(iy0), 0.0, float(iy1 - iy0) - 1.001)
+    x_idx = lx.astype(np.int32)
+    y_idx = ly.astype(np.int32)
+    fx = (lx - x_idx)[:, :, None]
+    fy = (ly - y_idx)[:, :, None]
+    v00 = sub[y_idx, x_idx]
+    v01 = sub[y_idx, x_idx + 1]
+    v10 = sub[y_idx + 1, x_idx]
+    v11 = sub[y_idx + 1, x_idx + 1]
+    rgb16 = (v00 * (1.0 - fx) + v01 * fx) * (1.0 - fy) + (v10 * (1.0 - fx) + v11 * fx) * fy  # (16, 16, 3)
+
+    luma16 = 0.299 * rgb16[:, :, 0] + 0.587 * rgb16[:, :, 1] + 0.114 * rgb16[:, :, 2]
+    d16 = luma16 - float(np.mean(luma16))
+    sq16 = float(np.sum(d16 * d16))
+    tpl_std = math.sqrt(sq16 / float(VEH_TPL_W * VEH_TPL_H))
+    if tpl_std < 2.2:
+        return None
+    tpl = (d16.reshape(-1) / math.sqrt(sq16)).astype(np.float32)
+
+    c8_px = x0 + bw * _VEH_U8  # (1, 8)
+    c8_py = y0 + bh * _VEH_V8  # (8, 1)
+    c8_lx = np.clip(c8_px - float(ix0), 0.0, float(ix1 - ix0) - 1.001)
+    c8_ly = np.clip(c8_py - float(iy0), 0.0, float(iy1 - iy0) - 1.001)
+    c8_xi = c8_lx.astype(np.int32)
+    c8_yi = c8_ly.astype(np.int32)
+    c8_fx = (c8_lx - c8_xi)[:, :, None]
+    c8_fy = (c8_ly - c8_yi)[:, :, None]
+    c8_rgb = (
+        (sub[c8_yi, c8_xi] * (1.0 - c8_fx) + sub[c8_yi, c8_xi + 1] * c8_fx) * (1.0 - c8_fy)
+        + (sub[c8_yi + 1, c8_xi] * (1.0 - c8_fx) + sub[c8_yi + 1, c8_xi + 1] * c8_fx) * c8_fy
+    )
+    c8 = 0.299 * c8_rgb[:, :, 0] + 0.587 * c8_rgb[:, :, 1] + 0.114 * c8_rgb[:, :, 2]
+    dc8 = c8 - float(np.mean(c8))
+    c_sq = float(np.sum(dc8 * dc8))
+    if c_sq < 1e-4:
+        return None
+    coarse = (dc8.reshape(-1) / math.sqrt(c_sq)).astype(np.float32)
+
+    # 24D RGB histogram (3 x 8 bins) with Bhattacharyya sqrt normalization
+    bins = np.clip((rgb16 * (8.0 / 256.0)).astype(np.int32), 0, 7)
+    hist = np.zeros((24,), dtype=np.float32)
+    for ch in range(3):
+        hist[ch * 8 : (ch + 1) * 8] = np.bincount(bins[:, :, ch].reshape(-1), minlength=8).astype(np.float32)
+    hist = np.sqrt(hist / float(VEH_TPL_W * VEH_TPL_H))
+    h_norm = float(np.linalg.norm(hist))
+    if h_norm > 1e-6:
+        hist /= h_norm
+
+    # 8D 4x2 spatial luma profile normalized to match RGB hist energy
+    grid4x2 = luma16.reshape(2, 8, 4, 4).mean(axis=(1, 3)).reshape(-1) / 255.0
+    g_d = grid4x2 - float(np.mean(grid4x2))
+    g_norm = float(np.linalg.norm(g_d))
+    if g_norm > 1e-6:
+        g_d = g_d / g_norm
+
+    app32 = np.concatenate([hist * 0.80, g_d.astype(np.float32) * 0.60], axis=0)
+    a_norm = float(np.linalg.norm(app32))
+    if a_norm > 1e-6:
+        app32 /= a_norm
+
+    return VehicleAppearanceRef(
+        tpl=tpl,
+        coarse=coarse,
+        tpl_std=tpl_std,
+        color_hist=hist,
+        app32=app32,
+    )
+
+
+def track_vehicle_patch_ncc(
+    ref: VehicleAppearanceRef | None,
+    frame_rgb: np.ndarray,
+    pred_bbox_xyxy: tuple[float, float, float, float],
+    *,
+    max_shift_px: float = 24.0,
+    min_ncc: float = 0.42,
+) -> tuple[bool, float, tuple[float, float, float, float], float, float]:
+    """Coarse-to-fine 2D ZNCC vehicle template shift search (`±max_shift_px`) with flat-asphalt guard."""
+    if ref is None:
+        return False, -1.0, pred_bbox_xyxy, 0.0, 0.0
+    h, w = frame_rgb.shape[:2]
+    x0, y0, x1, y1 = [float(v) for v in pred_bbox_xyxy]
+    bw = x1 - x0
+    bh = y1 - y0
+    if bw < 10.0 or bh < 10.0:
+        return False, -1.0, pred_bbox_xyxy, 0.0, 0.0
+
+    rad = max(4, int(round(min(float(max_shift_px), max(12.0, 0.45 * max(bw, bh))))))
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    roi = extract_roi_gray(frame_rgb, cx, cy, 0.50 * bw + float(rad) + 2.0, 0.50 * bh + float(rad) + 2.0)
+    if roi is None:
+        return False, -1.0, pred_bbox_xyxy, 0.0, 0.0
+    gray, ox, oy = roi
+    gh, gw = gray.shape
+    min_std = max(2.2, 0.14 * ref.tpl_std)
+
+    base_x8 = (x0 + bw * _VEH_U8) - float(ox)   # (1, 8)
+    base_y8 = (y0 + bh * _VEH_V8) - float(oy)   # (8, 1)
+    base_x16 = (x0 + bw * _VEH_U16) - float(ox) # (1, 16)
+    base_y16 = (y0 + bh * _VEH_V16) - float(oy) # (16, 1)
+
+    def _eval_coarse(dx: float, dy: float) -> float:
+        nx0 = x0 + dx
+        ny0 = y0 + dy
+        if nx0 + 0.5 * bw < -4.0 or nx0 + 0.5 * bw > float(w + 4) or ny0 + 0.5 * bh < -4.0 or ny0 + 0.5 * bh > float(h + 4):
+            return -1.0
+        lx = np.clip(base_x8 + dx, 0.0, float(gw) - 1.001)
+        ly = np.clip(base_y8 + dy, 0.0, float(gh) - 1.001)
+        xi = lx.astype(np.int32)
+        yi = ly.astype(np.int32)
+        fx = lx - xi
+        fy = ly - yi
+        patch = (
+            (gray[yi, xi] * (1.0 - fx) + gray[yi, xi + 1] * fx) * (1.0 - fy)
+            + (gray[yi + 1, xi] * (1.0 - fx) + gray[yi + 1, xi + 1] * fx) * fy
+        ).reshape(-1)
+        d = patch - float(np.mean(patch))
+        sq = float(np.dot(d, d))
+        if sq < (min_std * min_std) * float(_VEH_CW * _VEH_CH) * 0.45:
+            return -1.0
+        return float(np.dot(d, ref.coarse) / math.sqrt(sq))
+
+    def _eval_fine(dx: float, dy: float) -> float:
+        nx0 = x0 + dx
+        ny0 = y0 + dy
+        if nx0 + 0.5 * bw < -4.0 or nx0 + 0.5 * bw > float(w + 4) or ny0 + 0.5 * bh < -4.0 or ny0 + 0.5 * bh > float(h + 4):
+            return -1.0
+        lx = np.clip(base_x16 + dx, 0.0, float(gw) - 1.001)
+        ly = np.clip(base_y16 + dy, 0.0, float(gh) - 1.001)
+        xi = lx.astype(np.int32)
+        yi = ly.astype(np.int32)
+        fx = lx - xi
+        fy = ly - yi
+        patch = (
+            (gray[yi, xi] * (1.0 - fx) + gray[yi, xi + 1] * fx) * (1.0 - fy)
+            + (gray[yi + 1, xi] * (1.0 - fx) + gray[yi + 1, xi + 1] * fx) * fy
+        ).reshape(-1)
+        d = patch - float(np.mean(patch))
+        sq = float(np.dot(d, d))
+        if sq < (min_std * min_std) * float(VEH_TPL_W * VEH_TPL_H):
+            return -1.0
+        return float(np.dot(d, ref.tpl) / math.sqrt(sq))
+
+    inv_r2 = 1.0 / float(max(16, rad * rad))
+    best_dx, best_dy = 0.0, 0.0
+    best_pen = _eval_coarse(0.0, 0.0)
+
+    # Stage 1: Coarse 8px grid over ±rad
+    step1 = max(4, rad // 3)
+    for dy in range(-rad, rad + 1, step1):
+        for dx in range(-rad, rad + 1, step1):
+            if dx == 0 and dy == 0:
+                continue
+            sc = _eval_coarse(float(dx), float(dy))
+            pen = sc - 0.015 * float(dx * dx + dy * dy) * inv_r2
+            if pen > best_pen:
+                best_pen = pen
+                best_dx, best_dy = float(dx), float(dy)
+
+    # Stage 2: Medium 3px refinement on 8x8
+    base_dx, base_dy = best_dx, best_dy
+    step2 = max(2, int(round(step1 / 2.5)))
+    for oy_s in (-2 * step2, -step2, 0, step2, 2 * step2):
+        for ox_s in (-2 * step2, -step2, 0, step2, 2 * step2):
+            if ox_s == 0 and oy_s == 0:
+                continue
+            dx = float(np.clip(base_dx + ox_s, -rad, rad))
+            dy = float(np.clip(base_dy + oy_s, -rad, rad))
+            sc = _eval_coarse(dx, dy)
+            pen = sc - 0.015 * (dx * dx + dy * dy) * inv_r2
+            if pen > best_pen:
+                best_pen = pen
+                best_dx, best_dy = dx, dy
+
+    # Stage 3: Exact 16x16 fine refinement (4px -> 2px -> 1px)
+    best_ncc = _eval_fine(best_dx, best_dy)
+    best_fine_pen = best_ncc - 0.010 * (best_dx * best_dx + best_dy * best_dy) * inv_r2
+    for step3 in (4, 2, 1):
+        b_dx, b_dy = best_dx, best_dy
+        for oy_s in (-step3, 0, step3):
+            for ox_s in (-step3, 0, step3):
+                if ox_s == 0 and oy_s == 0:
+                    continue
+                dx = float(np.clip(b_dx + ox_s, -rad, rad))
+                dy = float(np.clip(b_dy + oy_s, -rad, rad))
+                sc = _eval_fine(dx, dy)
+                pen = sc - 0.010 * (dx * dx + dy * dy) * inv_r2
+                if pen > best_fine_pen:
+                    best_fine_pen = pen
+                    best_ncc = sc
+                    best_dx, best_dy = dx, dy
+
+    nx0 = float(np.clip(x0 + best_dx, 0.0, float(w - 2)))
+    ny0 = float(np.clip(y0 + best_dy, 0.0, float(h - 2)))
+    nx1 = float(np.clip(x1 + best_dx, nx0 + 2.0, float(w)))
+    ny1 = float(np.clip(y1 + best_dy, ny0 + 2.0, float(h)))
+    return best_ncc >= float(min_ncc), float(best_ncc), (nx0, ny0, nx1, ny1), float(best_dx), float(best_dy)

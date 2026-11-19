@@ -124,23 +124,23 @@ def _perturb_corners_core_impl(
     # 1. Temporal AR(1) correlated 8-DOF noise + per-corner sub-pixel jitter
     dof_ar = torch.matmul(l_ar, dof_bt_n) * (0.34 * stage_scale)  # (B, T, 9)
 
-    # Global translation jitter: ±6.5px / 160 in X, ±5.0px / 80 in Y
-    tx_seq = ((dof_seq_u[:, 0:1] * 2.0 - 1.0) * (6.5 / 160.0)) * stage_scale
-    ty_seq = ((dof_seq_u[:, 1:2] * 2.0 - 1.0) * (5.0 / 80.0)) * stage_scale
-    tx_bt = (tx_seq + dof_ar[:, :, 0] * (3.2 / 160.0)).clamp(-7.5 / 160.0, 7.5 / 160.0)
-    ty_bt = (ty_seq + dof_ar[:, :, 1] * (2.6 / 80.0)).clamp(-6.0 / 80.0, 6.0 / 80.0)
+    # Global translation jitter: up to ±10.5px / 160 in X (handles off-center Stage-2 crops), ±5.5px / 80 in Y
+    tx_seq = ((dof_seq_u[:, 0:1] * 2.0 - 1.0) * (10.5 / 160.0)) * stage_scale
+    ty_seq = ((dof_seq_u[:, 1:2] * 2.0 - 1.0) * (5.5 / 80.0)) * stage_scale
+    tx_bt = (tx_seq + dof_ar[:, :, 0] * (3.2 / 160.0)).clamp(-12.0 / 160.0, 12.0 / 160.0)
+    ty_bt = (ty_seq + dof_ar[:, :, 1] * (2.6 / 80.0)).clamp(-6.5 / 80.0, 6.5 / 80.0)
 
     # Independent 4-edge margins relative to base margin_ratio=0.05:
-    # 55% full wide [-0.03, +0.12], 45% tight [0.025, 0.075]
+    # 55% full wide [-0.04, +0.15], 45% tight [0.025, 0.075]
     use_wide = (dof_seq_u[:, 2:3] < 0.55) & (stage_scale > 0.6)
-    m_wide = -0.03 + 0.15 * dof_seq_u[:, 3:7]   # (B, 4) in [-0.03, +0.12]
+    m_wide = -0.04 + 0.19 * dof_seq_u[:, 3:7]   # (B, 4) in [-0.04, +0.15]
     m_tight = 0.025 + 0.050 * dof_seq_u[:, 3:7]  # (B, 4) in [0.025, 0.075]
     m_edges = torch.where(use_wide, m_wide, m_tight)
     dm_seq = (m_edges - 0.05) * stage_scale  # (B, 4): [left, right, top, bot]
-    dm_l = (dm_seq[:, 0:1] + dof_ar[:, :, 2] * 0.018).clamp(-0.082, 0.075)
-    dm_r = (dm_seq[:, 1:2] + dof_ar[:, :, 3] * 0.018).clamp(-0.082, 0.075)
-    dm_t = (dm_seq[:, 2:3] + dof_ar[:, :, 4] * 0.020).clamp(-0.082, 0.075)
-    dm_b = (dm_seq[:, 3:4] + dof_ar[:, :, 5] * 0.020).clamp(-0.082, 0.075)
+    dm_l = (dm_seq[:, 0:1] + dof_ar[:, :, 2] * 0.018).clamp(-0.092, 0.105)
+    dm_r = (dm_seq[:, 1:2] + dof_ar[:, :, 3] * 0.018).clamp(-0.092, 0.105)
+    dm_t = (dm_seq[:, 2:3] + dof_ar[:, :, 4] * 0.020).clamp(-0.082, 0.085)
+    dm_b = (dm_seq[:, 3:4] + dof_ar[:, :, 5] * 0.020).clamp(-0.082, 0.085)
 
     # Residual keystone / trapezoid & shear skew
     kh = (((dof_seq_u[:, 7:8] * 2.0 - 1.0) * 0.026) * stage_scale + dof_ar[:, :, 6] * 0.014).clamp(-0.036, 0.036)
@@ -187,7 +187,7 @@ def _overhang_umbra_roi_impl(
     u_overhang: torch.Tensor,
     v_jitter_bt: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dump-truck tailgate overhang upper-half umbra shadow + lower-half asphalt bounce light (~16% of RGB seqs)."""
+    """Bumper / tailgate overhang upper-row umbra shadow (top 35-48%, darkening region & class) + lower bounce (~26% RGB seqs)."""
     bsz, t_len, _, h_r, w_r = hdr_roi_rgb.shape
     dev = hdr_roi_rgb.device
 
@@ -201,30 +201,39 @@ def _overhang_umbra_roi_impl(
 
     p_top = 0.5 * (corners_roi_gt[:, :, 0] + corners_roi_gt[:, :, 1])
     p_bot = 0.5 * (corners_roi_gt[:, :, 3] + corners_roi_gt[:, :, 2])
+    p_left = 0.5 * (corners_roi_gt[:, :, 0] + corners_roi_gt[:, :, 3])
+    p_right = 0.5 * (corners_roi_gt[:, :, 1] + corners_roi_gt[:, :, 2])
     axis_v = p_bot - p_top
-    len2 = (axis_v[..., 0] ** 2 + axis_v[..., 1] ** 2).clamp_min(4.0)
+    axis_u = p_right - p_left
+    len2_v = (axis_v[..., 0] ** 2 + axis_v[..., 1] ** 2).clamp_min(4.0)
+    len2_u = (axis_u[..., 0] ** 2 + axis_u[..., 1] ** 2).clamp_min(4.0)
 
     u_grid = torch.arange(w_r, device=dev, dtype=torch.float32).view(1, 1, 1, w_r) + 0.5
     v_grid = torch.arange(h_r, device=dev, dtype=torch.float32).view(1, 1, h_r, 1) + 0.5
     v_plate = (
         (u_grid - p_top[..., 0:1, None]) * axis_v[..., 0:1, None]
         + (v_grid - p_top[..., 1:2, None]) * axis_v[..., 1:2, None]
-    ) / len2[:, :, None, None]
+    ) / len2_v[:, :, None, None]
+    u_plate = (
+        (u_grid - p_left[..., 0:1, None]) * axis_u[..., 0:1, None]
+        + (v_grid - p_left[..., 1:2, None]) * axis_u[..., 1:2, None]
+    ) / len2_u[:, :, None, None]
 
-    v_cut = (0.32 + 0.20 * u_overhang[:, 1:2] + 0.025 * (v_jitter_bt - 0.5))[:, :, None, None]
-    u_dark = (0.06 + 0.12 * u_overhang[:, 2:3])[:, :, None, None]
-    w_pen = (0.035 + 0.050 * u_overhang[:, 3:4])[:, :, None, None]
-    b_asph = (1.03 + 0.09 * u_overhang[:, 4:5])[:, :, None, None]
+    slant = ((u_overhang[:, 5:6] * 2.0 - 1.0) * 0.10)[:, :, None, None]
+    v_cut = (0.35 + 0.13 * u_overhang[:, 1:2] + 0.025 * (v_jitter_bt - 0.5))[:, :, None, None] + slant * (u_plate - 0.5)
+    u_dark = (0.14 + 0.20 * u_overhang[:, 2:3])[:, :, None, None]
+    w_pen = (0.032 + 0.052 * u_overhang[:, 3:4])[:, :, None, None]
+    b_asph = (1.03 + 0.10 * u_overhang[:, 4:5])[:, :, None, None]
 
     s_lit = torch.sigmoid((v_plate - v_cut) / (w_pen * 0.35)).unsqueeze(2)  # (B, T, 1, H, W)
-    umbra_tint = torch.tensor([0.92, 0.97, 1.08], device=dev, dtype=torch.float32).view(1, 1, 3, 1, 1)
+    umbra_tint = torch.tensor([0.90, 0.96, 1.09], device=dev, dtype=torch.float32).view(1, 1, 3, 1, 1)
     bounce_tint = torch.tensor([1.02, 1.00, 0.97], device=dev, dtype=torch.float32).view(1, 1, 3, 1, 1)
     sh_mult = (u_dark.unsqueeze(2) * umbra_tint) * (1.0 - s_lit) + (b_asph.unsqueeze(2) * bounce_tint) * s_lit
 
     hdr_out = torch.where(has_overhang[:, None, None, None, None], hdr_roi_rgb * sh_mult, hdr_roi_rgb)
 
-    # Lower-row serial slots (7..11) stay 100% un-attenuated; upper-row slots attenuate only under deepest 0.06x umbra
-    upper_surv = (u_overhang[:, 2:3] * (0.12 / 0.14) + (0.06 / 0.14)).clamp(0.42, 1.0)[:, :, None]
+    # Lower-row serial slots (7..11) stay 100% un-attenuated; upper-row slots keep >= 0.45 readability so OCR learns to read in deep shadow
+    upper_surv = (0.45 + 0.55 * u_overhang[:, 2:3]).clamp(0.45, 1.0)[:, :, None]
     cs_upper = torch.where(has_overhang[:, None, None], contrast_survival[:, :, :7] * upper_surv, contrast_survival[:, :, :7])
     cs_out = torch.cat([cs_upper, contrast_survival[:, :, 7:]], dim=-1)
     return hdr_out, cs_out, has_overhang
@@ -864,9 +873,9 @@ class GPUSynthSequenceEngine:
         gen = torch.Generator(device=dev)
         gen.manual_seed((step_seed * 1103515245 + 12345) & 0x7FFFFFFF)
 
-        # 4b. Dump-truck tailgate overhang upper-half umbra shadow + lower-half asphalt bounce (~16% in stage >= 2)
+        # 4b. Bumper / tailgate overhang upper-row umbra shadow (top 35-48%) + lower bounce (~26% in stage >= 2)
         if self.train_mode and stage >= 2 and regime_override is None:
-            u_overhang = torch.rand((bsz, 5), generator=gen, device=dev)
+            u_overhang = torch.rand((bsz, 6), generator=gen, device=dev)
             v_jitter_bt = torch.rand((bsz, t_len), generator=gen, device=dev)
             shaded.hdr_roi_rgb, shaded.contrast_survival, has_overhang = _dispatch_seq_cuda(
                 "overhang_umbra",
@@ -976,8 +985,9 @@ class GPUSynthSequenceEngine:
         crops = crops_flat.reshape(bsz, t_len, 3, target_hw[0], target_hw[1])
 
         # 7c. Rolling multi-frame sub-pixel canonical Drizzle super-resolution on `w_t < 54px` sequences
+        # Keep 45% un-drizzled so Stage-3 learns both raw multi-frame neural SR and drizzled runtime crops
         if self.train_mode and stage >= 2 and t_len >= 2:
-            enable_drizzle = torch.rand((bsz,), generator=gen, device=dev) < 0.75
+            enable_drizzle = torch.rand((bsz,), generator=gen, device=dev) < 0.55
             crops = _rolling_canonical_drizzle_impl(
                 crops=crops,
                 noisy_full_corners=noisy_full_corners,

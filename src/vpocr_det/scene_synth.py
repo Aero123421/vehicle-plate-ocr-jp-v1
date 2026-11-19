@@ -156,6 +156,9 @@ class _SceneAssetBank:
         self.frameless_decal_rgba: list[np.ndarray] = []
         self.bordered_decal_patches: list[np.ndarray] = []
         self.multiline_parking_patches: list[np.ndarray] = []
+        self.machinery_placard_patches: list[np.ndarray] = []
+        self.tv_badge_patches: list[np.ndarray] = []
+        self.chevron_patches: list[np.ndarray] = []
         self.stratified_plate_buckets: dict[tuple[str, int, bool], list[tuple[_CachedPlateEntry, int]]] = defaultdict(list)
         self.temporary_plate_pairs: dict[int, list[tuple[_CachedPlateEntry, int]]] = {SIDE_FRONT: [], SIDE_REAR: []}
 
@@ -509,9 +512,98 @@ class _SceneAssetBank:
         cv2.line(out, (2, top_h), (w - 3, top_h), border_rgb, 1)
         return out
 
+    @classmethod
+    def _render_tv_badge_patch(
+        cls,
+        tag_text: str,
+        main_text: str,
+        pill_rgb: tuple[int, int, int],
+        bg_rgb: tuple[int, int, int],
+        fg_rgb: tuple[int, int, int],
+        border_rgb: tuple[int, int, int],
+    ) -> np.ndarray:
+        """Render a realistic rounded Japanese TV broadcast corner overlay badge (`(72, 160, 4)` RGBA)."""
+        w, h = 160, 72
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        r = 14
+        # Rounded mask
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask, (r, 2), (w - r, h - 2), 255, -1)
+        cv2.rectangle(mask, (2, r), (w - 2, h - r), 255, -1)
+        for cx_c, cy_c in ((r, r), (w - r, r), (r, h - r), (w - r, h - r)):
+            cv2.circle(mask, (cx_c, cy_c), r - 2, 255, -1, lineType=cv2.LINE_AA)
+        # Main rounded body
+        body = cls._render_label_patch(main_text, w, h - 24, bg_rgb, fg_rgb, None)
+        header = cls._render_label_patch(tag_text, w, 24, pill_rgb, (250, 250, 252), None)
+        comp = np.vstack([header, body])
+        # Border ring on mask edge
+        edge = cv2.subtract(mask, cv2.erode(mask, np.ones((5, 5), dtype=np.uint8)))
+        comp[edge > 0] = border_rgb
+        # Small live/status dot icon on header left
+        cv2.circle(comp, (14, 12), 5, (250, 246, 84), -1, lineType=cv2.LINE_AA)
+        rgba[:, :, :3] = comp
+        rgba[:, :, 3] = (mask.astype(np.float32) * 0.94).astype(np.uint8)
+        return rgba
+
+    @staticmethod
+    def _render_chevron_patch(
+        width: int,
+        height: int,
+        c_hi: tuple[int, int, int],
+        c_lo: tuple[int, int, int],
+        stripe_w: int = 18,
+        flip: bool = False,
+    ) -> np.ndarray:
+        """Render high-contrast yellow-black hazard chevrons or red-white reflector strips."""
+        patch = np.empty((height, width, 3), dtype=np.uint8)
+        patch[:] = c_hi
+        slant = -height if flip else height
+        for sx in range(-height - stripe_w, width + height + stripe_w, stripe_w * 2):
+            pts = np.array(
+                [[sx, height], [sx + stripe_w, height], [sx + stripe_w + slant, 0], [sx + slant, 0]],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(patch, pts, c_lo, lineType=cv2.LINE_AA)
+        cv2.rectangle(patch, (0, 0), (width - 1, height - 1), (36, 38, 42), 2)
+        return patch
+
     def _build_stage2_extended_assets(self, seed: int) -> None:
         """Build Stage-2 structured hard-negative assets & stratified 4-color x class-length plate buckets."""
         ext_rng = random.Random(int(seed) + 99199)
+
+        # Gen-7 machinery placards, TV broadcast corner badges, and hazard chevron/reflector strips
+        for label, bg_c, fg_c, bd_c in (
+            ("除雪車", (244, 206, 30), (20, 22, 24), (20, 22, 24)),
+            ("清掃車", (246, 248, 248), (22, 108, 62), (22, 108, 62)),
+            ("作業中注意", (242, 198, 28), (22, 22, 24), (204, 34, 34)),
+            ("高圧ガス", (22, 24, 28), (246, 214, 38), (246, 214, 38)),
+            ("ハイブリッド", (240, 246, 250), (22, 92, 168), (22, 92, 168)),
+            ("UH20A-50", (242, 244, 246), (26, 30, 36), (176, 38, 38)),
+            ("最大積載量 2000kg", (244, 246, 242), (22, 24, 28), (24, 26, 30)),
+            ("制限速度 40km", (246, 214, 34), (20, 22, 24), (196, 32, 34)),
+        ):
+            w_m = 112 if len(label) <= 4 else 164
+            h_m = 52 if len(label) <= 4 else 44
+            self.machinery_placard_patches.append(self._render_label_patch(label, w_m, h_m, bg_c, fg_c, bd_c))
+
+        for tag_t, main_t, p_rgb, b_rgb, f_rgb, bd_rgb in (
+            ("LIVE 中継", "渋谷駅前", (214, 34, 42), (248, 248, 250), (22, 26, 34), (244, 246, 250)),
+            ("ニュース", "最新交通情報", (24, 86, 178), (248, 246, 240), (20, 32, 74), (246, 214, 42)),
+            ("天気予報", "東京 24℃", (26, 146, 92), (248, 250, 248), (20, 48, 34), (246, 248, 246)),
+            ("速報", "首都高 渋滞", (216, 48, 38), (250, 232, 62), (24, 24, 26), (248, 248, 248)),
+            ("密着24時", "現場カメラ", (196, 42, 128), (250, 248, 252), (34, 22, 48), (250, 216, 68)),
+            ("特集", "働くくるま", (234, 126, 24), (248, 248, 244), (32, 28, 22), (248, 248, 248)),
+        ):
+            self.tv_badge_patches.append(self._render_tv_badge_patch(tag_t, main_t, p_rgb, b_rgb, f_rgb, bd_rgb))
+
+        for c_hi, c_lo, sw, fl in (
+            ((244, 206, 28), (22, 24, 26), 18, False),
+            ((244, 206, 28), (22, 24, 26), 14, True),
+            ((246, 248, 250), (212, 34, 38), 18, False),
+            ((246, 248, 250), (212, 34, 38), 14, True),
+            ((246, 152, 28), (246, 248, 250), 16, False),
+        ):
+            self.chevron_patches.append(self._render_chevron_patch(164, 42, c_hi, c_lo, stripe_w=sw, flip=fl))
 
         # 1. Blue highway / national-route signs (`"319"`, `"246"`, `"16"`, `"R17"`, `"1"`, `"58"`, `"20"`, `"4"`)
         for r_txt in ("319", "246", "16", "R17", "1", "58", "20", "4"):
@@ -1651,6 +1743,13 @@ class FullSceneDetSynthesizer:
 
         # Lower body & bumper
         cv2.rectangle(canvas, (ix0, int(round(belt_y))), (ix1, int(round(bmp_bot_y))), body_col, -1)
+        # Commercial utility van horizontal blue/red/green livery stripe on bright white/silver rear/front doors
+        if archetype == "commercial_van" and rng.random() < 0.62:
+            raw_st = rng.choice(((24, 96, 192), (204, 38, 42), (26, 136, 74), (232, 136, 26)))
+            st_col = (int(raw_st[0] * dim), int(raw_st[1] * dim), int(raw_st[2] * dim))
+            sy0_v = int(round(vy0 + vh * 0.50))
+            sy1_v = max(sy0_v + 2, int(round(vy0 + vh * 0.58)))
+            cv2.rectangle(canvas, (ix0, sy0_v), (ix1, sy1_v), st_col, -1)
         cv2.line(canvas, (ix0, int(round(vy0 + vh * 0.66))), (ix1, int(round(vy0 + vh * 0.66))), dark_body, 1)
 
         # Headlights (front) or Taillights (rear)
@@ -1695,7 +1794,13 @@ class FullSceneDetSynthesizer:
             py_top = int(round(vy0 + vh * (0.58 if archetype in ("minivan", "suv", "commercial_van") else 0.65)))
             if archetype in ("minivan", "suv"):
                 cv2.rectangle(canvas, (pcx - pocket_w // 2 - 2, py_top - max(2, int(vh * 0.04))), (pcx + pocket_w // 2 + 2, py_top), chrome_col, -1)
-            cv2.rectangle(canvas, (pcx - pocket_w // 2, py_top), (pcx + pocket_w // 2, py_top + max(3, int(vh * 0.14))), dark_body, -1)
+            # White utility van rear door often has a shallow low-contrast white-on-white recessed pocket
+            if archetype == "commercial_van" and (body_col[0] + body_col[1] + body_col[2]) > 480:
+                pocket_col = (max(0, body_col[0] - 24), max(0, body_col[1] - 24), max(0, body_col[2] - 22))
+                cv2.rectangle(canvas, (pcx - pocket_w // 2, py_top), (pcx + pocket_w // 2, py_top + max(3, int(vh * 0.14))), pocket_col, -1)
+                cv2.rectangle(canvas, (pcx - pocket_w // 2, py_top), (pcx + pocket_w // 2, py_top + max(3, int(vh * 0.14))), dark_body, 1)
+            else:
+                cv2.rectangle(canvas, (pcx - pocket_w // 2, py_top), (pcx + pocket_w // 2, py_top + max(3, int(vh * 0.14))), dark_body, -1)
             py_c = vy0 + vh * (0.67 if archetype in ("minivan", "suv", "commercial_van") else 0.73)
             return (0.5 * (vx0 + vx1), py_c)
 
@@ -2095,6 +2200,14 @@ class QuadCropSynthesizer:
         "building_window_grid_and_reflectors",
     )
 
+    GEN7_STRUCTURED_HARD_NEG_MODES: tuple[str, ...] = (
+        "tv_broadcast_corner_badge",
+        "crumpled_plastic_bags_tarp",
+        "hazard_chevron_reflector",
+        "cartoon_mascot_sky_cloud",
+        "machinery_placard_decal",
+    )
+
     HARD_NEG_MODES: tuple[str, ...] = (
         "radiator_grille",
         "headlight_taillight",
@@ -2233,14 +2346,119 @@ class QuadCropSynthesizer:
     def _synthesize_hard_negative(self, rng: random.Random) -> QuadCropTrainingSample:
         """Synthesize realistic non-plate false-positive trap ROI (`is_plate = 0.0`)."""
         roi = np.empty((QUAD_ROI_H, QUAD_ROI_W, 3), dtype=np.uint8)
-        if self.config.domain_split == "train" and rng.random() < 0.76:
-            mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES)
+        if self.config.domain_split == "train" and rng.random() < 0.80:
+            mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES + self.GEN7_STRUCTURED_HARD_NEG_MODES)
         else:
             mode = rng.choice(self.HARD_NEG_MODES)
         bg_body = rng.choice(FullSceneDetSynthesizer.BODY_COLORS)
         roi[:] = (int(bg_body[0] * 0.75), int(bg_body[1] * 0.75), int(bg_body[2] * 0.75))
 
-        if mode == "blue_highway_route_sign":
+        if mode == "tv_broadcast_corner_badge":
+            # Rounded colorful Japanese TV broadcast corner chyron / live badge over daylight street/sky
+            bg_tv = rng.choice([(138, 178, 224), (168, 176, 184), (92, 118, 86), (186, 176, 160), (34, 42, 58)])
+            roi[:] = bg_tv
+            # Subtle background street/building bands behind badge
+            cv2.rectangle(roi, (0, rng.randint(44, 66)), (QUAD_ROI_W, QUAD_ROI_H), (76, 80, 86), -1)
+            cv2.rectangle(roi, (rng.randint(0, 32), 0), (rng.randint(110, QUAD_ROI_W), rng.randint(36, 56)), (196, 192, 184), -1)
+            badge_rgba = rng.choice(self.bank.tv_badge_patches)
+            bx0 = rng.uniform(10.0, 28.0)
+            by0 = rng.uniform(10.0, 22.0)
+            bx1 = QUAD_ROI_W - rng.uniform(10.0, 28.0)
+            by1 = QUAD_ROI_H - rng.uniform(10.0, 22.0)
+            dst_q = np.array([[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]], dtype=np.float32)
+            _warp_rgba_patch_into_canvas(roi, badge_rgba, dst_q, opacity=rng.uniform(0.88, 0.98))
+
+        elif mode == "crumpled_plastic_bags_tarp":
+            # Glossy crinkled white/pink plastic bags & wrinkled blue vinyl tarp inside truck hopper or sidewalk
+            is_blue_tarp = rng.random() < 0.38
+            roi[:] = (26, 72, 152) if is_blue_tarp else rng.choice([(82, 86, 92), (142, 146, 150), (42, 54, 68)])
+            if is_blue_tarp:
+                # Wrinkled glossy blue tarpaulin ridges + specular streaks
+                for _ in range(rng.randint(6, 11)):
+                    p0 = (rng.randint(-10, QUAD_ROI_W), rng.randint(-10, QUAD_ROI_H))
+                    p1 = (p0[0] + rng.randint(25, 75), p0[1] + rng.randint(-30, 30))
+                    p2 = (p0[0] + rng.randint(-20, 60), p0[1] + rng.randint(15, 55))
+                    shade = rng.choice([(18, 52, 118), (44, 108, 204), (96, 162, 236), (176, 212, 248)])
+                    cv2.fillConvexPoly(roi, np.array([p0, p1, p2], dtype=np.int32), shade, lineType=cv2.LINE_AA)
+            else:
+                # Pile of glossy crumpled white / pale-pink / pale-blue translucent plastic bags
+                for _ in range(rng.randint(4, 8)):
+                    cx_b = rng.randint(22, QUAD_ROI_W - 22)
+                    cy_b = rng.randint(18, QUAD_ROI_H - 18)
+                    rx_b = rng.randint(18, 42)
+                    ry_b = rng.randint(14, 30)
+                    base_c = rng.choice([(236, 238, 242), (246, 206, 218), (224, 236, 246), (244, 240, 224)])
+                    sh_c = (max(120, base_c[0] - 48), max(120, base_c[1] - 48), max(120, base_c[2] - 44))
+                    cv2.ellipse(roi, (cx_b, cy_b), (rx_b, ry_b), rng.randint(-35, 35), 0, 360, base_c, -1, lineType=cv2.LINE_AA)
+                    # Crease folds and glossy highlight glints
+                    for _ in range(3):
+                        x_a = cx_b + rng.randint(-rx_b // 2, rx_b // 2)
+                        y_a = cy_b + rng.randint(-ry_b // 2, ry_b // 2)
+                        cv2.line(roi, (x_a, y_a), (x_a + rng.randint(-18, 18), y_a + rng.randint(-12, 12)), sh_c, rng.choice([1, 2]), lineType=cv2.LINE_AA)
+                    cv2.ellipse(roi, (cx_b - rx_b // 4, cy_b - ry_b // 4), (max(4, rx_b // 3), max(3, ry_b // 4)), rng.randint(-20, 20), 0, 360, (252, 253, 255), -1, lineType=cv2.LINE_AA)
+
+        elif mode == "hazard_chevron_reflector":
+            # Yellow-black diagonal hazard chevrons & red-white conspicuity reflector bars on steel panels
+            roi[:] = rng.choice([(46, 50, 56), (186, 192, 198), (226, 180, 32), (54, 78, 112)])
+            chv = rng.choice(self.bank.chevron_patches)
+            dst_q = np.array(
+                [
+                    [rng.uniform(8, 24), rng.uniform(16, 30)],
+                    [rng.uniform(136, 152), rng.uniform(16, 30)],
+                    [rng.uniform(136, 152), rng.uniform(66, 80)],
+                    [rng.uniform(8, 24), rng.uniform(66, 80)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(roi, chv, dst_q)
+
+        elif mode == "cartoon_mascot_sky_cloud":
+            if rng.random() < 0.52:
+                # Bright fluffy sunlit white cumulus cloud blob against vivid blue sky
+                roi[:] = rng.choice([(82, 156, 232), (104, 174, 240), (64, 138, 218)])
+                cx_c, cy_c = rng.randint(56, 104), rng.randint(36, 58)
+                for dx_c, dy_c, rr_c in ((-28, 6, 22), (-10, -8, 26), (14, -6, 25), (30, 8, 20), (0, 8, 24)):
+                    cv2.circle(roi, (cx_c + dx_c, cy_c + dy_c + 4), rr_c, (206, 216, 228), -1, lineType=cv2.LINE_AA)
+                for dx_c, dy_c, rr_c in ((-28, 4, 20), (-10, -10, 24), (14, -8, 23), (30, 6, 18), (0, 6, 22)):
+                    cv2.circle(roi, (cx_c + dx_c, cy_c + dy_c), rr_c, (248, 250, 252), -1, lineType=cv2.LINE_AA)
+                roi[:] = cv2.GaussianBlur(roi, (5, 5), 1.4)
+            else:
+                # Colorful rounded cartoon/mascot character blob on commercial wrap / shop sign
+                roi[:] = rng.choice([(244, 236, 204), (206, 234, 248), (248, 218, 228), (236, 244, 218)])
+                mc = rng.choice([(246, 198, 46), (242, 128, 156), (92, 198, 236), (132, 214, 108), (248, 248, 250)])
+                cx_m, cy_m = rng.randint(62, 98), rng.randint(38, 58)
+                rx_m, ry_m = rng.randint(26, 40), rng.randint(22, 32)
+                cv2.ellipse(roi, (cx_m, cy_m), (rx_m, ry_m), 0, 0, 360, mc, -1, lineType=cv2.LINE_AA)
+                cv2.ellipse(roi, (cx_m, cy_m), (rx_m, ry_m), 0, 0, 360, (34, 30, 28), 3, lineType=cv2.LINE_AA)
+                # Cartoon eyes, blush cheeks & smile
+                cv2.circle(roi, (cx_m - rx_m // 3, cy_m - 4), 4, (28, 26, 28), -1, lineType=cv2.LINE_AA)
+                cv2.circle(roi, (cx_m + rx_m // 3, cy_m - 4), 4, (28, 26, 28), -1, lineType=cv2.LINE_AA)
+                cv2.circle(roi, (cx_m - rx_m // 2, cy_m + 5), 5, (246, 138, 152), -1, lineType=cv2.LINE_AA)
+                cv2.circle(roi, (cx_m + rx_m // 2, cy_m + 5), 5, (246, 138, 152), -1, lineType=cv2.LINE_AA)
+                cv2.ellipse(roi, (cx_m, cy_m + 6), (8, 5), 0, 15, 165, (34, 30, 28), 2, lineType=cv2.LINE_AA)
+
+        elif mode == "machinery_placard_decal":
+            # Heavy construction yellow/white/orange engine hood panel + bold `除雪車` / `清掃車` / `UH20A-50` placard
+            hood_c = rng.choice([(232, 184, 30), (236, 134, 28), (228, 232, 236), (48, 108, 72), (42, 86, 148)])
+            roi[:] = hood_c
+            # Engine hood louvers / rivets flanking placard
+            lv_c = (max(16, hood_c[0] - 58), max(16, hood_c[1] - 58), max(16, hood_c[2] - 48))
+            for ly_m in range(10, QUAD_ROI_H - 10, 10):
+                cv2.line(roi, (4, ly_m), (18, ly_m), lv_c, 2)
+                cv2.line(roi, (QUAD_ROI_W - 18, ly_m), (QUAD_ROI_W - 4, ly_m), lv_c, 2)
+            mp_p = rng.choice(self.bank.machinery_placard_patches)
+            dst_q = np.array(
+                [
+                    [rng.uniform(18, 36), rng.uniform(14, 26)],
+                    [rng.uniform(124, 142), rng.uniform(14, 26)],
+                    [rng.uniform(124, 142), rng.uniform(68, 82)],
+                    [rng.uniform(18, 36), rng.uniform(68, 82)],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(roi, mp_p, dst_q)
+
+        elif mode == "blue_highway_route_sign":
             # Sky / highway gantry truss + MLIT blue route sign ("319", "246", "16", "R17")
             roi[:] = rng.choice([(148, 178, 214), (168, 176, 186), (26, 32, 46)])
             px_pole = rng.randint(68, 92)
@@ -2704,17 +2922,17 @@ class QuadCropSynthesizer:
         if self.config.domain_split == "train":
             entry, _ = self.bank.pick_stratified_plate(plate_side, rng, p_temporary=self.config.p_temporary_plate)
             if entry.plate_type_str in (PlateType.KEI_COMMERCIAL.value, PlateType.KEI_PRIVATE.value):
-                ctx_style = "kei_offset" if (plate_side == SIDE_FRONT and rng.random() < 0.72) else rng.choice(("sedan_bumper", "minivan_garnish"))
+                ctx_style = "kei_offset" if (plate_side == SIDE_FRONT and rng.random() < 0.72) else rng.choice(("sedan_bumper", "minivan_garnish", "white_utility_van_recess"))
             elif entry.plate_type_str == PlateType.STANDARD_COMMERCIAL.value:
                 ctx_style = rng.choices(
-                    ["truck_recessed", "tractor_exposed_chassis", "mixer_chevron_rear", "bus_flat_panel", "high_grille_work_truck"],
-                    weights=[0.30, 0.22, 0.18, 0.18, 0.12],
+                    ["truck_recessed", "tractor_exposed_chassis", "mixer_chevron_rear", "bus_flat_panel", "high_grille_work_truck", "machinery_side_hood"],
+                    weights=[0.24, 0.18, 0.16, 0.16, 0.12, 0.14],
                     k=1,
                 )[0]
             else:
                 ctx_style = rng.choices(
-                    ["sedan_bumper", "minivan_garnish", "truck_recessed", "bus_flat_panel"],
-                    weights=[0.44, 0.34, 0.12, 0.10],
+                    ["sedan_bumper", "minivan_garnish", "white_utility_van_recess", "truck_recessed", "bus_flat_panel", "machinery_side_hood"],
+                    weights=[0.32, 0.24, 0.20, 0.10, 0.08, 0.06],
                     k=1,
                 )[0]
         else:
@@ -2751,14 +2969,22 @@ class QuadCropSynthesizer:
             entry = self.bank.pick_plate(p_cat, plate_side, rng, p_temporary=self.config.p_temporary_plate)
         pw_m, ph_m = (0.440, 0.220) if entry.is_large else (0.330, 0.165)
 
-        # 3D perspective yaw (-68..+68), context-conditional bracket pitch, roll (-18..+18), and distance keystone z ~ logU(2.1, 26.0)
+        # 3D perspective yaw (-72..+72 on train), context-conditional bracket pitch, roll (-18..+18), and distance keystone z ~ logU(2.1, 26.0)
         r_yaw = rng.random()
-        if r_yaw < 0.24:
-            yaw_deg = rng.choice([-1.0, 1.0]) * rng.uniform(44.0, 67.0)
-        elif r_yaw < 0.62:
-            yaw_deg = rng.uniform(-44.0, 44.0)
+        if self.config.domain_split == "train":
+            if r_yaw < 0.28:
+                yaw_deg = rng.choice([-1.0, 1.0]) * rng.uniform(48.0, 72.0)
+            elif r_yaw < 0.64:
+                yaw_deg = rng.uniform(-48.0, 48.0)
+            else:
+                yaw_deg = rng.uniform(-22.0, 22.0)
         else:
-            yaw_deg = rng.uniform(-22.0, 22.0)
+            if r_yaw < 0.24:
+                yaw_deg = rng.choice([-1.0, 1.0]) * rng.uniform(44.0, 67.0)
+            elif r_yaw < 0.62:
+                yaw_deg = rng.uniform(-44.0, 44.0)
+            else:
+                yaw_deg = rng.uniform(-22.0, 22.0)
         if ctx_style in ("tractor_exposed_chassis", "mixer_chevron_rear") and rng.random() < 0.60:
             pitch_deg = rng.uniform(-26.0, -6.0)
         else:
@@ -2913,6 +3139,38 @@ class QuadCropSynthesizer:
             cv2.rectangle(roi, (8, 8), (QUAD_ROI_W - 8, QUAD_ROI_H - 8), (30, 32, 36), -1)
             for gy_s in range(12, QUAD_ROI_H - 10, rng.choice([6, 8, 10])):
                 cv2.line(roi, (10, gy_s), (QUAD_ROI_W - 10, gy_s), (136, 142, 150), 1)
+        elif ctx_style == "white_utility_van_recess":
+            # Glossy white utility van rear tailgate with horizontal blue/red/green stripe & low-contrast white recessed pocket!
+            van_w = rng.choice([(240, 242, 246), (234, 238, 242), (246, 246, 248)])
+            roi[:] = van_w
+            st_c = rng.choice([(22, 92, 188), (204, 36, 40), (24, 134, 70), (232, 132, 24)])
+            st_y0 = max(0, py0_i - rng.randint(12, 22))
+            st_y1 = max(st_y0 + 5, py0_i - rng.randint(3, 8))
+            cv2.rectangle(roi, (0, st_y0), (QUAD_ROI_W, st_y1), st_c, -1)
+            # Shallow low-contrast off-white recessed plate cavity + subtle top tailgate handle seam
+            cav_c = (van_w[0] - 24, van_w[1] - 24, van_w[2] - 22)
+            cv2.rectangle(roi, (max(0, px0_i - 9), max(0, py0_i - 6)), (min(QUAD_ROI_W - 1, px1_i + 9), min(QUAD_ROI_H - 1, py1_i + 5)), cav_c, -1)
+            cv2.rectangle(roi, (max(0, px0_i - 9), max(0, py0_i - 6)), (min(QUAD_ROI_W - 1, px1_i + 9), min(QUAD_ROI_H - 1, py1_i + 5)), (178, 182, 188), 1)
+            if py1_i + 14 < QUAD_ROI_H:
+                cv2.line(roi, (0, py1_i + 10), (QUAD_ROI_W, py1_i + 10), (156, 160, 166), 2)
+        elif ctx_style == "machinery_side_hood":
+            # Yellow/orange construction wheel loader / crane rear engine hood side-mounted plate beside warning placard!
+            mach_c = rng.choice([(232, 182, 28), (238, 132, 26), (218, 174, 36), (196, 154, 32)])
+            roi[:] = mach_c
+            lv_c = (max(16, mach_c[0] - 62), max(16, mach_c[1] - 58), max(14, mach_c[2] - 22))
+            # Dark horizontal engine hood ventilation louvers
+            for ly_v in range(8, QUAD_ROI_H - 8, 9):
+                cv2.line(roi, (2, ly_v), (max(6, px0_i - 6), ly_v), lv_c, 2)
+            # Optional non-overlapping `除雪車` / warning placard beside plate on opposite side
+            if px1_i < QUAD_ROI_W - 26 and self.bank.machinery_placard_patches:
+                mp_p = rng.choice(self.bank.machinery_placard_patches)
+                pw_m2 = min(44, QUAD_ROI_W - px1_i - 4)
+                ph_m2 = max(14, int(pw_m2 * 0.45))
+                py_m2 = max(2, min(QUAD_ROI_H - ph_m2 - 2, py0_i))
+                roi[py_m2 : py_m2 + ph_m2, px1_i + 3 : px1_i + 3 + pw_m2] = cv2.resize(mp_p, (pw_m2, ph_m2), interpolation=cv2.INTER_AREA)
+            elif py0_i > 18 and self.bank.chevron_patches:
+                ch_h = min(14, py0_i - 3)
+                roi[2 : 2 + ch_h, 6 : QUAD_ROI_W - 6] = cv2.resize(rng.choice(self.bank.chevron_patches), (QUAD_ROI_W - 12, ch_h), interpolation=cv2.INTER_AREA)
         else:
             roi[:] = body_c
             # Road asphalt strip below lower bumper edge (with granular road texture)
@@ -3057,12 +3315,147 @@ class QuadCropSynthesizer:
         horizon_y: int,
         rng: random.Random,
     ) -> tuple[float, float, float, float, float]:
-        """Render one of the 6 structured hard-negative traps onto `(320, 480, 3)` `canvas`; return `(x0, y0, x1, y1, obj_w)`."""
+        """Render one of the structured hard-negative traps onto `(320, 480, 3)` `canvas`; return `(x0, y0, x1, y1, obj_w)`."""
         h_c, w_c = canvas.shape[:2]
         dim = 0.50 if weather == "night" else (0.85 if weather in ("sunset", "wet_road") else 1.0)
         cx_t = rng.uniform(0.30, 0.70) * float(w_c)
         cy_t = rng.uniform(0.32, 0.68) * float(h_c)
         tw = rng.uniform(44.0, 118.0)
+
+        if mode == "tv_broadcast_corner_badge":
+            # Rounded Japanese TV broadcast corner badge overlaid on street/sky background
+            th = tw * rng.uniform(0.42, 0.54)
+            cx_t = rng.choice([rng.uniform(0.18, 0.34), rng.uniform(0.66, 0.82)]) * float(w_c)
+            cy_t = rng.choice([rng.uniform(0.16, 0.30), rng.uniform(0.70, 0.84)]) * float(h_c)
+            badge_rgba = rng.choice(self.bank.tv_badge_patches)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_rgba_patch_into_canvas(canvas, badge_rgba, dst_q, opacity=rng.uniform(0.90, 0.98))
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "crumpled_plastic_bags_tarp":
+            # Glossy crumpled white/pink plastic bags & wrinkled blue tarp inside open truck hopper or sidewalk
+            cy_t = rng.uniform(max(float(horizon_y) + 24.0, 124.0), float(h_c) - 52.0)
+            th = tw * rng.uniform(0.55, 0.82)
+            x0_b = max(12, int(round(cx_t - 0.75 * tw)))
+            x1_b = min(w_c - 12, int(round(cx_t + 0.75 * tw)))
+            y0_b = max(16, int(round(cy_t - 0.65 * th)))
+            y1_b = min(h_c - 12, int(round(cy_t + 0.65 * th)))
+            if rng.random() < 0.48:
+                # Open truck hopper rim surrounding bag pile
+                cv2.rectangle(canvas, (x0_b - 14, y0_b - 8), (x1_b + 14, y1_b + 16), (int(56 * dim), int(78 * dim), int(112 * dim)), -1)
+                cv2.rectangle(canvas, (x0_b, y0_b), (x1_b, y1_b), (28, 32, 38), -1)
+            is_tarp = rng.random() < 0.36
+            if is_tarp:
+                cv2.rectangle(canvas, (x0_b, y0_b), (x1_b, y1_b), (int(28 * dim), int(78 * dim), int(162 * dim)), -1)
+                for _ in range(9):
+                    px0 = rng.randint(x0_b, max(x0_b + 2, x1_b - 2))
+                    py0 = rng.randint(y0_b, max(y0_b + 2, y1_b - 2))
+                    pts_t = np.array(
+                        [[px0, py0], [min(x1_b, px0 + rng.randint(14, 46)), max(y0_b, py0 - rng.randint(4, 24))], [min(x1_b, px0 + rng.randint(8, 38)), min(y1_b, py0 + rng.randint(8, 28))]],
+                        dtype=np.int32,
+                    )
+                    tc = rng.choice([(20, 56, 126), (52, 118, 214), (118, 178, 242), (192, 224, 250)])
+                    cv2.fillConvexPoly(canvas, pts_t, (int(tc[0] * dim), int(tc[1] * dim), int(tc[2] * dim)), lineType=cv2.LINE_AA)
+            else:
+                for _ in range(rng.randint(5, 10)):
+                    bx_p = rng.randint(x0_b + 12, max(x0_b + 14, x1_b - 12))
+                    by_p = rng.randint(y0_b + 10, max(y0_b + 12, y1_b - 10))
+                    rx_p = rng.randint(max(10, int(tw * 0.14)), max(14, int(tw * 0.32)))
+                    ry_p = rng.randint(max(8, int(th * 0.16)), max(12, int(th * 0.34)))
+                    raw_bc = rng.choice([(238, 240, 244), (246, 206, 220), (222, 236, 248), (244, 240, 224)])
+                    bc = (int(raw_bc[0] * dim), int(raw_bc[1] * dim), int(raw_bc[2] * dim))
+                    cv2.ellipse(canvas, (bx_p, by_p), (rx_p, ry_p), rng.randint(-35, 35), 0, 360, bc, -1, lineType=cv2.LINE_AA)
+                    sh_bc = (max(0, bc[0] - 42), max(0, bc[1] - 42), max(0, bc[2] - 38))
+                    cv2.line(canvas, (bx_p - rx_p // 2, by_p), (bx_p + rx_p // 2, by_p + rng.randint(-8, 8)), sh_bc, 2, lineType=cv2.LINE_AA)
+                    cv2.ellipse(canvas, (bx_p - rx_p // 4, by_p - ry_p // 4), (max(3, rx_p // 3), max(2, ry_p // 4)), 0, 0, 360, (int(252 * dim), int(252 * dim), int(255 * dim)), -1, lineType=cv2.LINE_AA)
+            return (cx_t - 0.5 * tw, cy_t - 0.5 * th, cx_t + 0.5 * tw, cy_t + 0.5 * th, tw)
+
+        if mode == "hazard_chevron_reflector":
+            # Truck/machinery rear steel bumper or construction barrier with yellow-black or red-white diagonal chevrons
+            cy_t = rng.uniform(max(float(horizon_y) + 22.0, 120.0), float(h_c) - 48.0)
+            th = tw * rng.uniform(0.24, 0.38)
+            vx0 = max(10, int(round(cx_t - tw * 1.4)))
+            vx1 = min(w_c - 10, int(round(cx_t + tw * 1.4)))
+            vy0 = max(14, int(round(cy_t - tw * 0.95)))
+            vy1 = min(h_c - 16, int(round(cy_t + th * 1.1)))
+            raw_v = rng.choice([(226, 180, 32), (218, 222, 228), (52, 58, 66), (48, 86, 134)])
+            cv2.rectangle(canvas, (vx0, vy0), (vx1, vy1), (int(raw_v[0] * dim), int(raw_v[1] * dim), int(raw_v[2] * dim)), -1)
+            chv = rng.choice(self.bank.chevron_patches)
+            if dim < 0.99:
+                chv = np.clip(chv.astype(np.float32) * max(0.55, dim), 0.0, 255.0).astype(np.uint8)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th + rng.uniform(-3.0, 3.0)],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + rng.uniform(-3.0, 3.0)],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(canvas, chv, dst_q)
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
+
+        if mode == "cartoon_mascot_sky_cloud":
+            if rng.random() < 0.50:
+                # Fluffy sunlit sky cloud blob high above horizon
+                cy_t = rng.uniform(36.0, max(62.0, float(horizon_y) - 10.0))
+                th = tw * rng.uniform(0.48, 0.72)
+                for dx_f, dy_f, rf in ((-0.32, 0.08, 0.24), (-0.12, -0.10, 0.30), (0.14, -0.08, 0.28), (0.34, 0.10, 0.22)):
+                    cv2.circle(canvas, (int(cx_t + dx_f * tw), int(cy_t + dy_f * th)), max(6, int(tw * rf)), (int(246 * max(0.65, dim)), int(248 * max(0.65, dim)), int(252 * max(0.65, dim))), -1, lineType=cv2.LINE_AA)
+            else:
+                # Colorful cartoon mascot sign / commercial van livery wrap
+                th = tw * rng.uniform(0.62, 0.86)
+                vx0 = max(12, int(round(cx_t - tw * 1.2)))
+                vx1 = min(w_c - 12, int(round(cx_t + tw * 1.2)))
+                vy0 = max(14, int(round(cy_t - th * 1.1)))
+                vy1 = min(h_c - 14, int(round(cy_t + th * 1.1)))
+                bg_m = rng.choice([(244, 236, 204), (206, 234, 248), (248, 220, 230)])
+                cv2.rectangle(canvas, (vx0, vy0), (vx1, vy1), (int(bg_m[0] * dim), int(bg_m[1] * dim), int(bg_m[2] * dim)), -1)
+                mc_raw = rng.choice([(246, 198, 46), (242, 128, 156), (92, 198, 236), (132, 214, 108)])
+                mc = (int(mc_raw[0] * dim), int(mc_raw[1] * dim), int(mc_raw[2] * dim))
+                rx_m, ry_m = max(12, int(tw * 0.44)), max(10, int(th * 0.44))
+                cv2.ellipse(canvas, (int(cx_t), int(cy_t)), (rx_m, ry_m), 0, 0, 360, mc, -1, lineType=cv2.LINE_AA)
+                cv2.ellipse(canvas, (int(cx_t), int(cy_t)), (rx_m, ry_m), 0, 0, 360, (32, 28, 26), 2, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, (int(cx_t - rx_m * 0.32), int(cy_t - ry_m * 0.12)), max(2, rx_m // 8), (26, 24, 26), -1, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, (int(cx_t + rx_m * 0.32), int(cy_t - ry_m * 0.12)), max(2, rx_m // 8), (26, 24, 26), -1, lineType=cv2.LINE_AA)
+                cv2.ellipse(canvas, (int(cx_t), int(cy_t + ry_m * 0.16)), (max(4, rx_m // 4), max(3, ry_m // 6)), 0, 15, 165, (28, 26, 26), 2, lineType=cv2.LINE_AA)
+            return (cx_t - 0.5 * tw, cy_t - 0.5 * th, cx_t + 0.5 * tw, cy_t + 0.5 * th, tw)
+
+        if mode == "machinery_placard_decal":
+            # Heavy construction yellow/orange engine hood + bold `除雪車` / `清掃車` / `UH20A-50` warning placard
+            vx0 = max(12, int(round(cx_t - tw * 1.5)))
+            vx1 = min(w_c - 12, int(round(cx_t + tw * 1.5)))
+            vy0 = max(14, int(round(cy_t - tw * 0.9)))
+            vy1 = min(h_c - 18, int(round(cy_t + tw * 0.85)))
+            raw_h = rng.choice([(234, 184, 28), (236, 134, 26), (226, 230, 236), (48, 108, 72)])
+            hood_c = (int(raw_h[0] * dim), int(raw_h[1] * dim), int(raw_h[2] * dim))
+            cv2.rectangle(canvas, (vx0, vy0), (vx1, vy1), hood_c, -1)
+            # Heavy tire visible below engine hood
+            cv2.circle(canvas, (vx0 + int((vx1 - vx0) * 0.22), min(h_c - 14, vy1 + 10)), 24, (22, 24, 28), -1, lineType=cv2.LINE_AA)
+            cv2.circle(canvas, (vx0 + int((vx1 - vx0) * 0.22), min(h_c - 14, vy1 + 10)), 12, (int(228 * dim), int(178 * dim), int(28 * dim)), -1, lineType=cv2.LINE_AA)
+            mp_p = rng.choice(self.bank.machinery_placard_patches)
+            if dim < 0.99:
+                mp_p = np.clip(mp_p.astype(np.float32) * max(0.58, dim), 0.0, 255.0).astype(np.uint8)
+            th = tw * rng.uniform(0.32, 0.50)
+            dst_q = np.array(
+                [
+                    [cx_t - 0.5 * tw, cy_t - 0.5 * th],
+                    [cx_t + 0.5 * tw, cy_t - 0.5 * th + rng.uniform(-4.0, 4.0)],
+                    [cx_t + 0.5 * tw, cy_t + 0.5 * th + rng.uniform(-4.0, 4.0)],
+                    [cx_t - 0.5 * tw, cy_t + 0.5 * th],
+                ],
+                dtype=np.float32,
+            )
+            _warp_patch_into_canvas(canvas, mp_p, dst_q)
+            return (float(dst_q[:, 0].min()), float(dst_q[:, 1].min()), float(dst_q[:, 0].max()), float(dst_q[:, 1].max()), tw)
 
         if mode == "blue_highway_route_sign":
             cy_t = rng.uniform(max(44.0, horizon_y - 42.0), min(float(h_c) - 60.0, horizon_y + 38.0))
@@ -3293,7 +3686,10 @@ class QuadCropSynthesizer:
         )
 
         if not is_pos:
-            mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES)
+            if self.config.domain_split == "train":
+                mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES + self.GEN7_STRUCTURED_HARD_NEG_MODES)
+            else:
+                mode = rng.choice(self.STRUCTURED_HARD_NEG_MODES)
             tx0, ty0, tx1, ty1, obj_w = self._render_structured_hardneg_on_canvas(
                 canvas, mode=mode, weather=weather, horizon_y=horizon_y, rng=rng
             )
@@ -3378,17 +3774,26 @@ class QuadCropSynthesizer:
         # Render crisp base canvas width `42..118 px`; 45% coupled low-res pass downsamples to 12..30 px!
         target_canvas_pw = rng.uniform(44.0, 116.0)
         r_yaw = rng.random()
-        if r_yaw < 0.22:
-            yaw_deg = rng.choice((-1.0, 1.0)) * rng.uniform(42.0, 64.0)
-        elif r_yaw < 0.62:
-            yaw_deg = rng.uniform(-42.0, 42.0)
+        if self.config.domain_split == "train":
+            if r_yaw < 0.24:
+                yaw_deg = rng.choice((-1.0, 1.0)) * rng.uniform(48.0, 72.0)
+            elif r_yaw < 0.62:
+                yaw_deg = rng.uniform(-48.0, 48.0)
+            else:
+                yaw_deg = rng.uniform(-20.0, 20.0)
+            cos_yaw = max(0.30, math.cos(math.radians(yaw_deg)))
         else:
-            yaw_deg = rng.uniform(-20.0, 20.0)
+            if r_yaw < 0.22:
+                yaw_deg = rng.choice((-1.0, 1.0)) * rng.uniform(42.0, 64.0)
+            elif r_yaw < 0.62:
+                yaw_deg = rng.uniform(-42.0, 42.0)
+            else:
+                yaw_deg = rng.uniform(-20.0, 20.0)
+            cos_yaw = max(0.42, math.cos(math.radians(yaw_deg)))
         pitch_deg = rng.uniform(-30.0, 18.0)
         roll_deg = rng.uniform(-14.0, 14.0)
 
         fx = 465.0
-        cos_yaw = max(0.42, math.cos(math.radians(yaw_deg)))
         z_m = max(1.65, (fx * pw_m * cos_yaw) / target_canvas_pw)
         veh_w_px = min(float(w_c) * 0.86, fx * (vw_m * max(0.78, cos_yaw) + 0.85 * abs(math.sin(math.radians(yaw_deg)))) / z_m)
         veh_h_px = min(float(h_c) * 0.82, fx * vh_m / z_m)

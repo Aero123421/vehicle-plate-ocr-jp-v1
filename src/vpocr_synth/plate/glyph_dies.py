@@ -101,7 +101,7 @@ def smin_poly(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
 class DieStyleParams:
     """Parametric variations for Japanese MLIT stamped metal character dies."""
 
-    stroke_jitter: float = 0.0      # Fractional stroke radius delta in [-0.14, +0.14]
+    stroke_jitter: float = 0.0      # Fractional stroke radius delta in [-0.18, +0.18]
     fillet_k: float = 0.018         # Smooth-minimum inner junction fillet radius
     ink_wear: float = 0.0           # Subtle high-frequency edge micro-wear in [0.0, 0.25]
     closed_four: bool = True        # Closed-top triangle vs open-top '4' die variant
@@ -207,7 +207,7 @@ class MLITVectorDieEngine:
         if token not in cls.SUPPORTED_TOKENS:
             raise ValueError(f"Token {token!r} is not in MLITVectorDieEngine.SUPPORTED_TOKENS")
         p = params or DieStyleParams()
-        jitter = float(np.clip(p.stroke_jitter, -0.14, 0.14))
+        jitter = float(np.clip(p.stroke_jitter, -0.18, 0.18))
         aspect = float(np.clip(aspect_w_over_h, 0.40, 1.60))
 
         # Normalized UV grid at pixel centers in [0, 1]
@@ -512,80 +512,80 @@ class GlyphSDFAtlas:
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=0.00, fillet_k=0.018, closed_four=True, hooked_seven=True,
+                stroke_jitter=0.04, fillet_k=0.019, closed_four=True, hooked_seven=True,
                 curved_nine=True, flat_top_three=False, curled_six=True, seed=1,
             ),
-            1.02,
+            1.05,
         ),
         (
             str(_REPO_FONTS_DIR / "ZenMaruGothic-Bold.ttf"),
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=-0.05, fillet_k=0.016, closed_four=True, hooked_seven=True,
+                stroke_jitter=0.00, fillet_k=0.018, closed_four=True, hooked_seven=True,
                 curved_nine=True, flat_top_three=True, curled_six=True, seed=2,
             ),
-            0.96,
+            1.01,
         ),
         (
             str(_REPO_FONTS_DIR / "BIZUDPGothic-Bold.ttf"),
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=0.08, fillet_k=0.022, closed_four=True, hooked_seven=False,
+                stroke_jitter=0.14, fillet_k=0.023, closed_four=True, hooked_seven=False,
                 curved_nine=True, flat_top_three=True, curled_six=True, seed=3,
             ),
-            1.08,
+            1.14,
         ),
         (
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=0.03, fillet_k=0.019, closed_four=True, hooked_seven=True,
+                stroke_jitter=0.07, fillet_k=0.020, closed_four=True, hooked_seven=True,
                 tiny_cut_one=True, curved_nine=True, flat_top_three=False, curled_six=True, seed=4,
             ),
-            1.02,
+            1.07,
         ),
         (
             str(_REPO_FONTS_DIR / "MPLUSRounded1c-Medium.ttf"),
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=-0.09, fillet_k=0.013, ink_wear=0.07, closed_four=False, hooked_seven=False,
+                stroke_jitter=-0.03, fillet_k=0.016, ink_wear=0.06, closed_four=False, hooked_seven=False,
                 curved_nine=True, flat_top_three=True, curled_six=True, seed=5,
             ),
-            0.92,
+            0.97,
         ),
         (
             str(_REPO_FONTS_DIR / "ZenMaruGothic-Medium.ttf"),
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=0.10, fillet_k=0.024, ink_wear=0.05, closed_four=True, hooked_seven=True,
+                stroke_jitter=0.12, fillet_k=0.024, ink_wear=0.05, closed_four=True, hooked_seven=True,
                 curved_nine=False, flat_top_three=False, curled_six=False, seed=6,
             ),
-            1.05,
+            1.11,
         ),
         (
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=-0.06, fillet_k=0.016, ink_wear=0.10, closed_four=True, hooked_seven=False,
+                stroke_jitter=0.02, fillet_k=0.018, ink_wear=0.09, closed_four=True, hooked_seven=False,
                 tiny_cut_one=True, curved_nine=True, flat_top_three=False, curled_six=True, seed=7,
             ),
-            0.96,
+            1.02,
         ),
         (
             str(_REPO_FONTS_DIR / "BIZUDPGothic-Bold.ttf"),
             0,
             "mlit_die",
             DieStyleParams(
-                stroke_jitter=0.06, fillet_k=0.020, ink_wear=0.11, closed_four=True, hooked_seven=True,
+                stroke_jitter=0.09, fillet_k=0.021, ink_wear=0.09, closed_four=True, hooked_seven=True,
                 curved_nine=True, flat_top_three=True, curled_six=True, seed=8,
             ),
-            1.04,
+            1.09,
         ),
     )
 
@@ -1210,6 +1210,7 @@ class GlyphSDFAtlas:
         phys_hw: tuple[int, int] = (64, 38),
         style_idx: int = 0,
         condensed: bool | None = None,
+        sdf_threshold_offset: float = 0.0,
     ) -> np.ndarray:
         """Render binary `{0, 1}` glyph mask at physical slot dimensions `phys_hw`."""
         tid = (
@@ -1234,7 +1235,8 @@ class GlyphSDFAtlas:
             (pw, ph),
             interpolation=cv2.INTER_LINEAR,
         )
-        return (sdf_p >= float(self.SDF_ZERO_U8)).astype(np.uint8)
+        thresh_u8 = float(self.SDF_ZERO_U8) - float(sdf_threshold_offset) * float(self.SDF_SCALE_U8)
+        return (sdf_p >= thresh_u8).astype(np.uint8)
 
     @classmethod
     def instance(cls, vocab: PlateVocab | None = None) -> "GlyphSDFAtlas":

@@ -61,6 +61,8 @@ class LossWeightsV2:
     statutory_len: float = 0.35
     innovation_nll: float = 0.02
     terminal_risk: float = 0.25
+    memory_sr: float = 0.14
+    f1_sr: float = 0.08
 
 
 def _safe_bce_prob_v2(pred_prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -106,23 +108,24 @@ def synthesize_gpu_garbage_frames_v2(
     hw: tuple[int, int],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Synthesize diverse construction & roadside non-plate hard-negative crops + multi-scale geom_meta."""
+    """Synthesize diverse construction, vehicle-body & roadside non-plate hard-negative crops + geom_meta."""
     h, w = hw
     total = max(1, batch_size * num_garbage)
-    k = max(1, total // 7)
-    n1 = min(total, k)
-    n2 = min(max(0, total - n1), k)
-    n3 = min(max(0, total - n1 - n2), k)
-    n4 = min(max(0, total - n1 - n2 - n3), k)
-    n5 = min(max(0, total - n1 - n2 - n3 - n4), k)
-    n6 = min(max(0, total - n1 - n2 - n3 - n4 - n5), k)
-    n7 = max(0, total - n1 - n2 - n3 - n4 - n5 - n6)
+    k = max(1, total // 10)
+    counts: list[int] = []
+    rem = total
+    for _ in range(9):
+        c_i = min(rem, k)
+        counts.append(c_i)
+        rem -= c_i
+    counts.append(max(0, rem))
+    n1, n2, n3, n4, n5, n6, n7, n8, n9, n10 = counts
 
     parts: list[torch.Tensor] = []
 
     # 1. Specular headlight whiteout / IR halation blowout
     if n1 > 0:
-        w_low = 0.92 + 0.08 * torch.rand((n1, 3, 4, 8), device=device)
+        w_low = 0.90 + 0.10 * torch.rand((n1, 3, 4, 8), device=device)
         g1 = F.interpolate(w_low, size=(h, w), mode="bilinear", align_corners=False)
         parts.append(torch.clamp(g1 + 0.02 * torch.randn_like(g1), 0.0, 1.0))
 
@@ -146,7 +149,7 @@ def synthesize_gpu_garbage_frames_v2(
         xx = torch.linspace(0.0, 4.0, w, device=device).reshape(1, 1, 1, w)
         ph4 = torch.rand((n4, 1, 1, 1), device=device) * 4.0
         diag = ((xx + yy + ph4) % 1.0 > 0.5).float()
-        is_hazard = (torch.rand((n4, 1, 1, 1), device=device) > 0.5).float()
+        is_hazard = (torch.rand((n4, 1, 1, 1), device=device) > 0.40).float()
         col_a = is_hazard * torch.tensor([0.92, 0.78, 0.08], device=device).view(1, 3, 1, 1) + (
             1.0 - is_hazard
         ) * torch.tensor([0.90, 0.14, 0.12], device=device).view(1, 3, 1, 1)
@@ -156,7 +159,7 @@ def synthesize_gpu_garbage_frames_v2(
         g4 = diag * col_a + (1.0 - diag) * col_b + 0.04 * torch.randn((n4, 3, h, w), device=device)
         parts.append(torch.clamp(g4, 0.0, 1.0))
 
-    # 5. Real Japanese text-bearing non-plate stencils (`319`, `スケルトン車`, `最大積載量`, `春日 2503`, `50`)
+    # 5. Real Japanese & Latin text-bearing non-plate stencils (`319`, `スケルトン車`, `TOLL GATE`, etc.)
     from vpocr_synth.plate.surface_25d import get_default_nonplate_stencil_atlas
 
     if n5 > 0:
@@ -189,6 +192,44 @@ def synthesize_gpu_garbage_frames_v2(
         g7 = (0.14 + 0.86 * glow) * red_base + 0.35 * (glow ** 3) * core
         g7 = torch.clamp(g7 + 0.04 * torch.randn((n7, 3, h, w), device=device), 0.0, 1.0)
         parts.append(g7)
+
+    # 8. Glossy white / pink / pastel specular blobs (common bumper/taillight/signage false positives)
+    if n8 > 0:
+        yy8 = torch.linspace(-1.0, 1.0, h, device=device).view(1, 1, h, 1)
+        xx8 = torch.linspace(-1.0, 1.0, w, device=device).view(1, 1, 1, w)
+        cx8 = (torch.rand((n8, 1, 1, 1), device=device) * 1.2 - 0.6)
+        cy8 = (torch.rand((n8, 1, 1, 1), device=device) * 0.8 - 0.4)
+        blob = torch.exp(-(((xx8 - cx8) / 0.52) ** 2 + ((yy8 - cy8) / 0.48) ** 2))
+        is_pink = (torch.rand((n8, 1, 1, 1), device=device) < 0.55).float()
+        pink_col = torch.tensor([0.95, 0.58, 0.72], device=device).view(1, 3, 1, 1)
+        white_col = torch.tensor([0.92, 0.93, 0.95], device=device).view(1, 3, 1, 1)
+        base_b = is_pink * pink_col + (1.0 - is_pink) * white_col
+        bg_b = 0.12 + 0.25 * torch.rand((n8, 3, 1, 1), device=device)
+        g8 = bg_b * (1.0 - blob) + (base_b + 0.22 * blob.pow(3)) * blob
+        parts.append(torch.clamp(g8 + 0.025 * torch.randn((n8, 3, h, w), device=device), 0.0, 1.0))
+
+    # 9. Pure blank brushed metal / empty plate-colored aluminum panel (zero characters!)
+    if n9 > 0:
+        gx9 = torch.linspace(-0.5, 0.5, w, device=device).view(1, 1, 1, w)
+        gy9 = torch.linspace(-0.5, 0.5, h, device=device).view(1, 1, h, 1)
+        grain = 0.03 * torch.randn((n9, 1, h, 1), device=device).expand(n9, 1, h, w)
+        base_m = 0.52 + 0.36 * torch.rand((n9, 1, 1, 1), device=device)
+        tint_m = torch.tensor([1.0, 0.99, 0.98], device=device).view(1, 3, 1, 1)
+        grad_m = 1.0 + 0.18 * gx9 - 0.14 * gy9
+        g9 = base_m * tint_m * grad_m + grain + 0.015 * torch.randn((n9, 3, h, w), device=device)
+        parts.append(torch.clamp(g9, 0.0, 1.0))
+
+    # 10. Extreme high-frequency Gaussian / salt-and-pepper / blocky sensor noise
+    if n10 > 0:
+        hi_n = torch.rand((n10, 3, h, w), device=device)
+        blk_n = F.interpolate(
+            torch.rand((n10, 3, max(4, h // 8), max(8, w // 8)), device=device),
+            size=(h, w),
+            mode="nearest",
+        )
+        mix_w = torch.rand((n10, 1, 1, 1), device=device)
+        g10 = mix_w * hi_n + (1.0 - mix_w) * blk_n
+        parts.append(torch.clamp(g10, 0.0, 1.0))
 
     all_g = torch.cat(parts, dim=0)[:total]
     perm = torch.randperm(total, device=device)
@@ -267,6 +308,22 @@ class OCRLossV2(nn.Module):
         self.risk_config = terminal_risk_config or SessionConfigV2()
         self.risk_vocab = vocab or PlateVocab()
         self.risk_grammar = JPPlateGrammar(self.risk_vocab)
+        sobel_xy = (
+            torch.tensor(
+                [
+                    [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+                    [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+                ],
+                dtype=torch.float32,
+            )
+            * 0.25
+        )
+        self.register_buffer("sobel_xy", sobel_xy, persistent=False)
+
+    def _sobel_xy_grads(self, img_1ch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        k = self.sobel_xy.to(device=img_1ch.device, dtype=torch.float32)
+        gxy = F.conv2d(F.pad(img_1ch.float(), (1, 1, 1, 1), mode="replicate"), k)
+        return gxy[:, 0:1], gxy[:, 1:2]
 
     def forward(
         self,
@@ -441,6 +498,9 @@ class OCRLossV2(nn.Module):
         )
         fv_mse = (seq_out.frame_valid_gate.float() - fv_target).pow(2)
         loss_valid_cal = ((fv_bce + fv_mse) * non_pad_f).sum() / non_pad_f.sum().clamp_min(1.0)
+        invalid_non_pad = non_pad_mask & (frame_valid_mask < 0.5)
+        if bool(invalid_non_pad.any()):
+            loss_valid_cal = loss_valid_cal + 0.35 * seq_out.frame_lambda_prec[invalid_non_pad].float().mean()
 
         sq_bce = F.binary_cross_entropy_with_logits(
             seq_out.slot_quality_logits.float(), eff_read, reduction="none"
@@ -681,6 +741,10 @@ class OCRLossV2(nn.Module):
                 torch.zeros_like(g_enc.frame_valid_logit.float()),
             )
             g_gate_pen = g_enc.frame_valid_gate.float().pow(2).mean()
+            g_prec_pen = (
+                g_enc.lambda_prec.float().mean()
+                + 0.25 * g_enc.lambda_color.float().mean()
+            )
 
             d_dim = model.config.d_model
             dc_dim = model.config.d_color
@@ -716,12 +780,12 @@ class OCRLossV2(nn.Module):
             drift_h = (st_g.mem_h.float() - seq_out.memory.mem_h.float().detach()).pow(2).mean()
             drift_p = (st_g.mem_P.float() - seq_out.memory.mem_P.float().detach()).pow(2).mean()
             drift_c = (st_g.color_h.float() - seq_out.memory.color_h.float().detach()).pow(2).mean()
-            loss_garbage = g_bce + g_gate_pen + 2.0 * (drift_h + drift_p + drift_c)
+            loss_garbage = g_bce + g_gate_pen + 0.50 * g_prec_pen + 2.0 * (drift_h + drift_p + drift_c)
         else:
             loss_garbage = zero_anchor
 
         # ------------------------------------------------------------------
-        # 6. Training-Only Text Gestalt Stroke-Mask Loss (Sub-Stroke J-Hook / 角頭3 Fidelity)
+        # 6. Training-Only Text Gestalt Stroke-Mask & Full-Res F1 SR Loss
         # ------------------------------------------------------------------
         sm_logits = getattr(seq_out, "stroke_mask_logits", None)
         sm_gt_raw = batch.get("stroke_mask_gt")
@@ -742,6 +806,74 @@ class OCRLossV2(nn.Module):
             loss_stroke = 0.60 * bce_sm + 0.40 * dice_sm
         else:
             loss_stroke = zero_anchor
+
+        f1_sr_logits = getattr(seq_out, "f1_sr_logits", None)
+        if f1_sr_logits is not None and sm_gt_raw is not None and is_primary_frame.any():
+            f1_pred_p = f1_sr_logits[is_primary_frame].float()
+            f1_tgt_p = sm_gt_raw[is_primary_frame].float().clamp(0.0, 1.0)
+            if f1_tgt_p.ndim == 3:
+                f1_tgt_p = f1_tgt_p.unsqueeze(1)
+            if f1_tgt_p.shape[-2:] != f1_pred_p.shape[-2:]:
+                f1_tgt_p = F.interpolate(
+                    f1_tgt_p, size=f1_pred_p.shape[-2:], mode="bilinear", align_corners=False
+                )
+            bce_f1 = F.binary_cross_entropy_with_logits(f1_pred_p, f1_tgt_p)
+            prob_f1 = torch.sigmoid(f1_pred_p)
+            inter_f1 = (prob_f1 * f1_tgt_p).sum(dim=(1, 2, 3))
+            denom_f1 = (prob_f1 + f1_tgt_p).sum(dim=(1, 2, 3)) + 1.0
+            dice_f1 = (1.0 - (2.0 * inter_f1 + 1.0) / denom_f1).mean()
+            gx_f1, gy_f1 = self._sobel_xy_grads(prob_f1)
+            gx_gt1, gy_gt1 = self._sobel_xy_grads(f1_tgt_p)
+            edge_f1 = (gx_f1 - gx_gt1).abs().mean() + (gy_f1 - gy_gt1).abs().mean()
+            loss_f1_sr = 0.50 * bce_f1 + 0.35 * dice_f1 + 0.45 * edge_f1
+        else:
+            loss_f1_sr = zero_anchor
+
+        # ------------------------------------------------------------------
+        # 6b. Training-Only Multi-Frame Memory Super-Resolution Loss (L1 + Sobel Gradient)
+        #     Directly supervises fused posterior `mu_z = mem_h / mem_P` to reconstruct clean
+        #     canonical 80x160 plate luminance + sharp Sobel stroke edges from low-res sequences!
+        # ------------------------------------------------------------------
+        mem_sr_pred = getattr(seq_out, "memory_sr_pred", None)
+        canon_clean = batch.get("canon_clean_crop", None)
+        if mem_sr_pred is not None and canon_clean is not None:
+            sr_pred_f = mem_sr_pred.float()  # (B, 2, H_sr, W_sr)
+            cc = canon_clean.float()
+            if cc.shape[-2:] != sr_pred_f.shape[-2:]:
+                cc = F.interpolate(cc, size=sr_pred_f.shape[-2:], mode="bilinear", align_corners=False)
+            y_clean = (0.299 * cc[:, 0:1] + 0.587 * cc[:, 1:2] + 0.114 * cc[:, 2:3]).clamp(0.0, 1.0)
+            gx_c, gy_c = self._sobel_xy_grads(y_clean)
+            edge_c = torch.sqrt(gx_c * gx_c + gy_c * gy_c + 1e-6)
+
+            y_hat = sr_pred_f[:, 0:1]
+            edge_hat = sr_pred_f[:, 1:2]
+            gx_p, gy_p = self._sobel_xy_grads(y_hat)
+
+            sr_seq_mask = is_readable_seq & (seq_out.memory.mem_P.float().mean(dim=(1, 2)) > 1e-4)
+            if bool(sr_seq_mask.any()):
+                h_sr = sr_pred_f.shape[-2]
+                row_y = torch.linspace(0.0, 1.0, h_sr, device=dev, dtype=torch.float32).view(1, 1, h_sr, 1)
+                upper_band = ((row_y >= 0.08) & (row_y <= 0.44)).float()
+                sp_w = 1.0 + 0.35 * upper_band + 0.25 * (edge_c > 0.10).float()
+
+                geom_b = batch.get("geom_meta", None)
+                if geom_b is not None:
+                    # Upweight persistent low-res sequences (max projected plate width <= ~36px) by 1.5x
+                    is_lr_seq = geom_b[:, :, 0].float().amax(dim=1) < -0.42
+                    seq_w_sr = torch.where(is_lr_seq, 1.5, 1.0) * sr_seq_mask.float()
+                else:
+                    seq_w_sr = sr_seq_mask.float()
+
+                lum_l1 = (y_hat - y_clean).abs()
+                sobel_grad_l1 = (gx_p - gx_c).abs() + (gy_p - gy_c).abs()
+                sobel_mag_l1 = (edge_hat - edge_c).abs()
+                elem_sr = 1.0 * lum_l1 + 1.2 * sobel_grad_l1 + 0.6 * sobel_mag_l1
+                tot_w_sr = sp_w * seq_w_sr.view(bsz, 1, 1, 1)
+                loss_memory_sr = (elem_sr * tot_w_sr).sum() / tot_w_sr.sum().clamp_min(1e-6)
+            else:
+                loss_memory_sr = zero_anchor
+        else:
+            loss_memory_sr = zero_anchor
 
         # ------------------------------------------------------------------
         # 7. Statutory Length-Conditioned Slot Anchor Supervision (Region 1..4, Class 1..3)
@@ -802,6 +934,8 @@ class OCRLossV2(nn.Module):
             + self.weights.cf_conflict * loss_cf_conflict
             + self.weights.garbage_invariance * loss_garbage
             + self.weights.stroke_gestalt * loss_stroke
+            + self.weights.f1_sr * loss_f1_sr
+            + self.weights.memory_sr * loss_memory_sr
             + self.weights.statutory_len * loss_statutory_len
             + self.weights.innovation_nll * loss_innovation
             + self.weights.terminal_risk * loss_risk
@@ -824,6 +958,8 @@ class OCRLossV2(nn.Module):
             "loss_cf_conflict": float(loss_cf_conflict.detach().item()),
             "loss_garbage": float(loss_garbage.detach().item()),
             "loss_stroke": float(loss_stroke.detach().item()),
+            "loss_f1_sr": float(loss_f1_sr.detach().item()),
+            "loss_memory_sr": float(loss_memory_sr.detach().item()),
             "loss_statutory_len": float(loss_statutory_len.detach().item()),
         }
         return total_loss, metrics

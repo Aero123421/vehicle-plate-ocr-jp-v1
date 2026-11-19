@@ -217,7 +217,7 @@ def test_calibration_audit_only_in_fresh_clone(tmp_path, monkeypatch, capsys):
         assert f"web/models/{name}.int8.onnx:" in output
     expected = sum((MODELS / name).stat().st_size for name in ARTIFACTS)
     assert expected <= 15 * 1024**2
-    assert round(expected / 1024**2, 2) == 12.38
+    assert round(expected / 1024**2, 2) == 13.72
     assert f"TOTAL: {expected} bytes" in output
     assert "15.000 MiB" in output
     assert "Synthetic MP4 smoke passed:" in output

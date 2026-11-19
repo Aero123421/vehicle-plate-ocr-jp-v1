@@ -86,18 +86,26 @@ def _sep_blur5(x: torch.Tensor, k5_h: torch.Tensor, k5_v: torch.Tensor) -> torch
     return F.conv2d(F.pad(xh, (0, 0, 2, 2), mode="replicate"), k5_v, groups=3)
 
 
+def _sep_blur3(x: torch.Tensor, k3_h: torch.Tensor, k3_v: torch.Tensor) -> torch.Tensor:
+    xh = F.conv2d(F.pad(x, (1, 1, 0, 0), mode="replicate"), k3_h, groups=3)
+    return F.conv2d(F.pad(xh, (0, 0, 1, 1), mode="replicate"), k3_v, groups=3)
+
+
 def _optics_halation_blur_impl(
-    x: torch.Tensor,             # (N, 3, 112, 176)
+    x: torch.Tensor,             # (N, 3, 96, 160)
     hal_gain: torch.Tensor,      # (N, 1, 1, 1)
     ir_mode: torch.Tensor,       # (N,) int64
+    is_lowres_sr: torch.Tensor,  # (N,) bool
     r_vec: torch.Tensor,         # (N, 8)
     mv: torch.Tensor,            # (N, 2)
-    base_grid: torch.Tensor,     # (1, 112, 176, 2)
+    base_grid: torch.Tensor,     # (1, 96, 160, 2)
+    k3_h: torch.Tensor,
+    k3_v: torch.Tensor,
     k5_h: torch.Tensor,
     k5_v: torch.Tensor,
     defoc_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pre-clamp HDR IR halation, 940nm AGC gain, defocus & 3-tap exposure motion blur."""
+    """Pre-clamp HDR IR halation, 940nm AGC gain, camera optical PSF + defocus & 9-tap exposure motion blur."""
     h_r, w_r = x.shape[-2], x.shape[-1]
     over = F.relu(x - 0.84) * hal_gain
     b1 = _sep_blur5(over, k5_h, k5_v)
@@ -107,7 +115,19 @@ def _optics_halation_blur_impl(
     is_940 = ir_mode == 2
     x = torch.where(is_940[:, None, None, None], x * 1.58, x)
 
-    defocus_amt = (F.relu(r_vec[:, 0] - 0.22) * (1.28 * defoc_scale)).clamp(0.0, 1.0)[:, None, None, None]
+    # Calibrated 3x3 camera optical PSF (Airy/anti-aliasing sensor PSF) + 5x5 lens defocus:
+    # Low-res SR sequences (12..26px plates) receive gentle sub-pixel-compatible 3x3 optical PSF + minimal 5x5 defocus
+    # so sub-pixel stroke phase survives across T=16..24 frames instead of being wiped by a wide kernel.
+    x_psf3 = _sep_blur3(x, k3_h, k3_v)
+    psf3_w = torch.where(
+        is_lowres_sr,
+        0.02 + 0.08 * r_vec[:, 0],
+        0.08 + 0.26 * r_vec[:, 0],
+    )[:, None, None, None]
+    x = x * (1.0 - psf3_w) + x_psf3 * psf3_w
+
+    raw_defoc = (F.relu(r_vec[:, 0] - 0.22) * (1.28 * defoc_scale)).clamp(0.0, 1.0)
+    defocus_amt = torch.where(is_lowres_sr, raw_defoc * 0.02, raw_defoc)[:, None, None, None]
     x_defoc = _sep_blur5(x, k5_h, k5_v)
     x = x * (1.0 - defocus_amt) + x_defoc * defocus_amt
 
@@ -438,6 +458,64 @@ def _yuv420_h264_mb_deadzone_impl(
     return torch.clamp(out, 0.0, 1.0)
 
 
+def _h264_av1_deblock_smear_impl(
+    x: torch.Tensor,             # (N, 3, H, W) in [0, 1]
+    ox: torch.Tensor,            # (N,) int64 in [0, 7]
+    oy: torch.Tensor,            # (N,) int64 in [0, 7]
+    q_val: torch.Tensor,         # (N,) float32
+    is_lowres_sr: torch.Tensor,  # (N,) bool
+    r_deb: torch.Tensor,         # (N, 2) float32 in [0, 1)
+    x_idx_roi: torch.Tensor,     # (1, W) int64
+    y_idx_roi: torch.Tensor,     # (1, H) int64
+) -> torch.Tensor:
+    """H.264/AV1 in-loop macroblock-edge deblocking + edge-adaptive CDEF plastic smear."""
+    q_str = ((62.0 - q_val) / 50.0).clamp(0.0, 1.0)
+    prob = torch.where(is_lowres_sr, torch.full_like(q_str, 0.55), torch.full_like(q_str, 0.50))
+    active = ((r_deb[:, 0] < prob) & (q_str > 0.02)).float()[:, None, None, None]
+    q_w = q_str[:, None, None, None] * active
+
+    # 1. Macroblock-boundary (8px grid aligned to (ox, oy)) directional deblocking filter
+    x_pad = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    x_l = x_pad[:, :, 1:-1, :-2]
+    x_r = x_pad[:, :, 1:-1, 2:]
+    x_u = x_pad[:, :, :-2, 1:-1]
+    x_d = x_pad[:, :, 2:, 1:-1]
+
+    mod_x = (x_idx_roi + ox[:, None]) & 7
+    mod_y = (y_idx_roi + oy[:, None]) & 7
+    v_edge = ((mod_x == 0) | (mod_x == 7)).float()[:, None, None, :]
+    h_edge = ((mod_y == 0) | (mod_y == 7)).float()[:, None, :, None]
+
+    thr = 0.06 + 0.22 * q_w
+    dh_step = (x_l - x_r).abs().mean(dim=1, keepdim=True)
+    dv_step = (x_u - x_d).abs().mean(dim=1, keepdim=True)
+    w_v = v_edge * torch.exp(-dh_step / thr.clamp_min(1e-3))
+    w_h = h_edge * torch.exp(-dv_step / thr.clamp_min(1e-3))
+
+    deb_gain = (0.35 + 0.45 * r_deb[:, 1])[:, None, None, None] * q_w
+    x_havg = 0.25 * x_l + 0.50 * x + 0.25 * x_r
+    x_deb = x + (deb_gain * w_v) * (x_havg - x)
+    x_vavg = 0.25 * x_u + 0.50 * x_deb + 0.25 * x_d
+    x_deb = x_deb + (deb_gain * w_h) * (x_vavg - x_deb)
+
+    # 2. AV1 CDEF / H.264 plastic ringing-suppression edge-adaptive smear
+    d_pad = F.pad(x_deb, (1, 1, 1, 1), mode="replicate")
+    dl = d_pad[:, :, 1:-1, :-2]
+    dr = d_pad[:, :, 1:-1, 2:]
+    du = d_pad[:, :, :-2, 1:-1]
+    dd = d_pad[:, :, 2:, 1:-1]
+    sig_r2 = (0.045 + 0.145 * q_w) ** 2
+    wl = torch.exp(-((x_deb - dl).abs().mean(dim=1, keepdim=True) ** 2) / sig_r2.clamp_min(1e-4))
+    wr = torch.exp(-((x_deb - dr).abs().mean(dim=1, keepdim=True) ** 2) / sig_r2.clamp_min(1e-4))
+    wu = torch.exp(-((x_deb - du).abs().mean(dim=1, keepdim=True) ** 2) / sig_r2.clamp_min(1e-4))
+    wd = torch.exp(-((x_deb - dd).abs().mean(dim=1, keepdim=True) ** 2) / sig_r2.clamp_min(1e-4))
+    x_cdef = (x_deb + wl * dl + wr * dr + wu * du + wd * dd) / (1.0 + wl + wr + wu + wd)
+
+    lr_boost = torch.where(is_lowres_sr, torch.full_like(q_str, 0.45), torch.full_like(q_str, 0.50))[:, None, None, None]
+    cdef_w = ((0.14 + 0.44 * q_str[:, None, None, None]) * lr_boost * active).clamp(0.0, 0.52)
+    return torch.clamp(x_deb * (1.0 - cdef_w) + x_cdef * cdef_w, 0.0, 1.0)
+
+
 def _tdnr_and_isp_tail_impl(
     x_seq: torch.Tensor,
     is_night: torch.Tensor,
@@ -526,11 +604,16 @@ class SensorCodecGPU:
         yy, xx = torch.meshgrid(gy, gx, indexing="ij")
         base_grid = torch.stack([xx, yy], dim=-1)[None]  # (1, 96, 160, 2)
 
+        g3_1d = torch.tensor([0.20, 0.60, 0.20], device=dev, dtype=torch.float32)
+        k3_h = g3_1d.view(1, 1, 1, 3).expand(3, 1, 1, 3).contiguous()
+        k3_v = g3_1d.view(1, 1, 3, 1).expand(3, 1, 3, 1).contiguous()
         g5_1d = torch.tensor([0.0625, 0.25, 0.375, 0.25, 0.0625], device=dev, dtype=torch.float32)
         k5_h = g5_1d.view(1, 1, 1, 5).expand(3, 1, 1, 5).contiguous()
         k5_v = g5_1d.view(1, 1, 5, 1).expand(3, 1, 5, 1).contiguous()
         y_phase = torch.linspace(0.0, 1.0, SENSOR_ROI_H, device=dev)[None, None, :, None]
         xx_r = torch.linspace(0.0, 1.0, SENSOR_ROI_W, device=dev)[None, None, None, :]
+        x_idx_roi = torch.arange(SENSOR_ROI_W, device=dev, dtype=torch.long)[None, :]
+        y_idx_roi = torch.arange(SENSOR_ROI_H, device=dev, dtype=torch.long)[None, :]
 
         out = (
             dct_m,
@@ -544,10 +627,14 @@ class SensorCodecGPU:
             dz8_intra,
             dz4_intra,
             base_grid,
+            k3_h,
+            k3_v,
             k5_h,
             k5_v,
             y_phase,
             xx_r,
+            x_idx_roi,
+            y_idx_roi,
         )
         self._cache[dev] = out
         return out
@@ -608,10 +695,14 @@ class SensorCodecGPU:
             dz8_intra,
             dz4_intra,
             base_grid,
+            k3_h,
+            k3_v,
             k5_h,
             k5_v,
             y_phase,
             xx_r,
+            x_idx_roi,
+            y_idx_roi,
         ) = self._get_device_tables(dev)
         gen = torch.Generator(device=dev)
         gen.manual_seed((seed * 2654435761 + 97531) & 0x7FFFFFFF)
@@ -622,8 +713,13 @@ class SensorCodecGPU:
         reg_bt = traj.regime_ids[:, None].expand(bsz, seq_len).reshape(n_bt)
         night_bt = traj.is_night.reshape(n_bt)
         mv = traj.motion_vec_px.reshape(n_bt, 2)
+        if traj.is_lowres_sr is not None:
+            is_lr_seq = traj.is_lowres_sr.to(device=dev, dtype=torch.bool)
+        else:
+            is_lr_seq = torch.zeros((bsz,), device=dev, dtype=torch.bool)
+        is_lr_flat = is_lr_seq[:, None].expand(bsz, seq_len).reshape(n_bt)
 
-        # 1. Fused Pre-clamp HDR IR halation + 940nm AGC + defocus + 3-tap motion blur
+        # 1. Fused Pre-clamp HDR IR halation + 940nm AGC + camera optical PSF + defocus + 9-tap motion blur
         if halation_boost_override is not None:
             hal_gain = torch.full((n_bt, 1, 1, 1), float(halation_boost_override), device=dev)
         else:
@@ -637,9 +733,12 @@ class SensorCodecGPU:
             x,
             hal_gain,
             ir_mode,
+            is_lr_flat,
             r_vec,
             mv,
             base_grid,
+            k3_h,
+            k3_v,
             k5_h,
             k5_v,
             defoc_scale,
@@ -717,7 +816,12 @@ class SensorCodecGPU:
         else:
             q_lo = {1: 50.0, 2: 28.0, 3: 10.0, 4: 8.0}[stage]
             q_hi = 76.0
-            q_seq_base = q_lo + (q_hi - q_lo) * torch.rand((bsz, 1), generator=gen, device=dev)
+            u_q = torch.rand((bsz, 1), generator=gen, device=dev)
+            q_seq_std = q_lo + (q_hi - q_lo) * u_q
+            # Low-res 480x270 streaming clips sit predominantly in low-to-mid bitrate Q=10..54
+            q_hi_lr = min(q_hi, max(q_lo + 12.0, 54.0))
+            q_seq_lr = q_lo + (q_hi_lr - q_lo) * u_q
+            q_seq_base = torch.where(is_lr_seq[:, None], q_seq_lr, q_seq_std)
             q_jit = -4.0 + 8.0 * torch.rand((bsz, seq_len), generator=gen, device=dev)
             q_val = (q_seq_base + q_jit).clamp(q_lo, q_hi).reshape(n_bt)
 
@@ -806,6 +910,22 @@ class SensorCodecGPU:
             x_seq = torch.stack(out_frames, dim=1)
         else:
             x_seq = x_iframe
+
+        # 4b. H.264/AV1 In-Loop Macroblock Deblocking + CDEF Plastic Smear
+        if stage >= 2:
+            r_deb = torch.rand((bsz, 2), generator=gen, device=dev)[:, None, :].expand(bsz, seq_len, 2).reshape(n_bt, 2)
+            x_seq = _dispatch_codec_cuda(
+                "h264_av1_deblock",
+                _h264_av1_deblock_smear_impl,
+                x_seq.reshape(n_bt, 3, h_r, w_r),
+                ox_flat,
+                oy_flat,
+                q_val,
+                is_lr_flat,
+                r_deb,
+                x_idx_roi,
+                y_idx_roi,
+            ).reshape(bsz, seq_len, 3, h_r, w_r)
 
         # 5. Fused Temporal 3DNR Ghosting + ISP Readability Multiplier
         r_tdnr = torch.rand((bsz, max(1, seq_len - 1)), generator=gen, device=dev)

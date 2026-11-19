@@ -359,6 +359,16 @@ _SENSITIVE_ENCODER_FP32_HEADS: tuple[str, ...] = (
     "measurement_scale_head",
 )
 
+_SENSITIVE_READOUT_FP32_HEADS: tuple[str, ...] = (
+    "slot_classifier",
+    "color_classifier",
+    "slot_readability_head",
+    "status_head",
+    "readout_color_proj",
+    "readout_pol_proj",
+    "readout_prec_proj",
+)
+
 
 def quantize_onnx_v2_for_cpu(
     onnx_dir: str | Path,
@@ -370,8 +380,9 @@ def quantize_onnx_v2_for_cpu(
       keeping coordinate/length/precision gate heads (`offset_head_1/2`, `reg_len_head`, `cls_len_head`,
       `prec_head`, `measurement_scale_head`) in exact FP32 via `nodes_to_exclude`.
     - `memory_step.int8.onnx`: exact FP32 elementwise natural-parameter filter copy.
-    - `memory_readout.int8.onnx`: exact FP32 copy (~0.28 MiB, runs ONCE per track at `finish()`),
-      eliminating 100% of final logit/confidence quantization drift!
+    - `memory_readout.int8.onnx`: hybrid INT8 quantizing internal `readout_sa`/`readout_mlp` linear
+      weights while keeping all terminal logit & calibration heads (`slot_classifier`, `color_classifier`,
+      `slot_readability_head`, `status_head`, context projections) in exact FP32!
     """
     from onnxruntime.quantization import QuantType, quantize_dynamic
 
@@ -426,8 +437,40 @@ def quantize_onnx_v2_for_cpu(
         nodes_to_exclude=nodes_to_exclude,
         weight_type=QuantType.QUInt8,
     )
-    # memory_readout runs ONCE per vehicle track: keep exact FP32 copy for zero readout logit drift!
-    shutil.copyfile(read_fp32, read_int8)
+
+    # Hybrid INT8 memory_readout: quantize internal readout_sa/readout_mlp blocks while keeping
+    # all terminal logit, color, readability, status & context projection heads in exact FP32!
+    read_proto = onnx.load(str(read_fp32))
+    read_exclude: list[str] = []
+    read_renamed = False
+    for idx, node in enumerate(read_proto.graph.node):
+        if node.op_type not in ("MatMul", "Gemm"):
+            continue
+        haystacks = [node.name, *list(node.input), *list(node.output)]
+        is_sensitive_ro = any(
+            marker in text
+            for text in haystacks
+            for marker in _SENSITIVE_READOUT_FP32_HEADS
+        )
+        if is_sensitive_ro:
+            if not node.name:
+                node.name = f"fp32_ro_sensitive_{node.op_type}_{idx}"
+                read_renamed = True
+            read_exclude.append(node.name)
+            if node.op_type == "Gemm":
+                read_exclude.append(f"{node.name}_MatMul")
+                read_exclude.append(f"{node.name}_matmul")
+    if read_renamed:
+        onnx.save(read_proto, str(read_fp32))
+
+    quantize_dynamic(
+        model_input=str(read_fp32),
+        model_output=str(read_int8),
+        op_types_to_quantize=["MatMul", "Gemm"],
+        nodes_to_exclude=read_exclude,
+        weight_type=QuantType.QUInt8,
+    )
+
     # memory_step is pure FP32 elementwise natural-parameter filter with zero MatMul weights
     shutil.copyfile(step_fp32, step_int8)
 

@@ -11,13 +11,64 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from vpocr_ocr.vocab import NUM_SLOTS
 
 
+def _bn_safe_checkpoint(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Bit-exact activation checkpointing that updates BatchNorm running stats exactly once."""
+    return _bn_safe_checkpoint_fn(module, (module,), x)
+
+
+def _bn_safe_checkpoint_fn(
+    fn,
+    bn_roots: tuple[nn.Module, ...],
+    *args: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact activation checkpointing for a callable spanning one or more modules with BatchNorm."""
+    bns = [
+        m
+        for root in bn_roots
+        for m in root.modules()
+        if isinstance(m, nn.modules.batchnorm._BatchNorm)
+    ]
+    ran = [False]
+    fwd_training: list[bool] = []
+
+    def _run(*inps: torch.Tensor) -> torch.Tensor:
+        if not ran[0]:
+            ran[0] = True
+            fwd_training[:] = [bn.training for bn in bns]
+            return fn(*inps)
+        if bns:
+            saved = [
+                (
+                    bn.training,
+                    bn.momentum,
+                    bn.num_batches_tracked.clone() if bn.num_batches_tracked is not None else None,
+                )
+                for bn in bns
+            ]
+            try:
+                for bn, tr in zip(bns, fwd_training):
+                    bn.training = tr
+                    bn.momentum = 0.0
+                return fn(*inps)
+            finally:
+                for bn, (tr, mom, nbt) in zip(bns, saved):
+                    bn.training = tr
+                    bn.momentum = mom
+                    if nbt is not None and bn.num_batches_tracked is not None:
+                        bn.num_batches_tracked.copy_(nbt)
+        return fn(*inps)
+
+    return _grad_checkpoint(_run, *args, use_reentrant=False)
+
+
 @dataclass
 class ModelConfigV2:
-    """Architecture configuration for `MFJPPlateOCRV2` ('base' Teacher & 'nano' Stage-3 Nano-Plus)."""
+    """Architecture configuration for `MFJPPlateOCRV2` ('base' Teacher & 'nano' Stage-3 Nano-Pro)."""
 
     vocab_size: int = 254
     num_plate_types: int = 5
@@ -26,12 +77,12 @@ class ModelConfigV2:
     canonical_margin: float = 0.05
     is_v2: bool = True
     gen5_arch: bool = True
-    d_model: int = 192
-    c0: int = 0
+    d_model: int = 216
+    c0: int = 48
     c1: int = 64
     c2: int = 128
-    c3: int = 192
-    blocks: tuple[int, int, int] = (3, 6, 3)
+    c3: int = 216
+    blocks: tuple[int, int, int] = (3, 6, 4)
     d_color: int = 48
     num_heads: int = 6
     mlp_ratio: float = 2.0
@@ -42,10 +93,12 @@ class ModelConfigV2:
     latent_prior_variance: float = 100.0
     nuisance_variance_init: float = 0.025
     nuisance_time_constant_s_init: float = 1.0
+    stem_channels: int = 6
+    readout_layers: int = 3
 
     @classmethod
     def from_preset(cls, preset: str = "base", vocab_size: int = 254) -> ModelConfigV2:
-        """Create validated Stage-3 preset ('base' teacher or 'nano' Nano-Plus)."""
+        """Create validated Stage-3 preset ('base' teacher or 'nano' Nano-Pro)."""
         p = preset.lower().strip()
         if p == "base":
             return cls(
@@ -54,17 +107,19 @@ class ModelConfigV2:
                 canonical_margin=0.05,
                 is_v2=True,
                 gen5_arch=True,
-                d_model=192,
+                d_model=216,
                 c0=48,
                 c1=64,
                 c2=128,
-                c3=192,
-                blocks=(3, 6, 3),
+                c3=216,
+                blocks=(3, 6, 4),
                 d_color=48,
                 num_heads=6,
                 mlp_ratio=2.0,
                 conv_expansion=2,
                 nuisance_variance_init=0.025,
+                stem_channels=6,
+                readout_layers=3,
             )
         if p == "nano":
             return cls(
@@ -73,17 +128,19 @@ class ModelConfigV2:
                 canonical_margin=0.05,
                 is_v2=True,
                 gen5_arch=True,
-                d_model=112,
-                c0=32,
-                c1=48,
-                c2=96,
-                c3=128,
-                blocks=(3, 5, 3),
-                d_color=32,
-                num_heads=4,
+                d_model=144,
+                c0=36,
+                c1=56,
+                c2=112,
+                c3=152,
+                blocks=(3, 6, 3),
+                d_color=40,
+                num_heads=6,
                 mlp_ratio=2.0,
                 conv_expansion=2,
                 nuisance_variance_init=0.025,
+                stem_channels=6,
+                readout_layers=3,
             )
         raise ValueError(f"Unknown ModelConfigV2 preset: {preset!r} (expected 'base' or 'nano')")
 
@@ -173,6 +230,8 @@ class SequenceOutputV2(NamedTuple):
     prefix_next_risk: torch.Tensor | None = None
     innovation_nll: torch.Tensor | None = None
     vault_bypass_mask: torch.Tensor | None = None
+    memory_sr_pred: torch.Tensor | None = None      # Training-only (B, 2, H, W) [lum, sobel_edge] from fused memory
+    f1_sr_logits: torch.Tensor | None = None        # Training-only (B, T, 1, H, W) full-res F1 auxiliary SR logits
 
 
 def _fuse_conv_bn_double(
@@ -188,10 +247,31 @@ def _fuse_conv_bn_double(
 
 
 class PhotometricStem(nn.Module):
-    """Zero-parameter 4-channel stem: `[2*RGB - 1, 0.5*(Y - mu_Y)/clamp(std_Y, min=0.05)]`."""
+    """Zero-parameter multi-scale local contrast + Sobel stroke stem (`3ch RGB -> 6ch` internal).
 
-    def __init__(self) -> None:
+    Takes standard `(N, 3, H, W)` RGB crops in `[0, 1]` (zero ONNX input signature change) and outputs:
+      - `0..2`: normalized RGB (`2*RGB - 1`)
+      - `3`: fine-scale `5x5` local contrast luminance (pops thin `12-26px` Kanji strokes)
+      - `4`: coarse-scale `13x13` local contrast luminance (cancels overhang shadows & dark-plate low contrast)
+      - `5`: locally-normalized `3x3` Sobel stroke edge magnitude (pops faint white-on-white & dark-green edges)
+    """
+
+    def __init__(self, out_channels: int = 6) -> None:
         super().__init__()
+        if out_channels not in (4, 6):
+            raise ValueError(f"PhotometricStem out_channels must be 4 or 6, got {out_channels}")
+        self.out_channels = int(out_channels)
+        sobel_xy = (
+            torch.tensor(
+                [
+                    [[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]],
+                    [[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]],
+                ],
+                dtype=torch.float32,
+            )
+            * 0.25
+        )
+        self.register_buffer("sobel_xy", sobel_xy, persistent=False)
 
     def forward(self, crops: torch.Tensor) -> torch.Tensor:
         r = crops[:, 0:1]
@@ -199,13 +279,40 @@ class PhotometricStem(nn.Module):
         b = crops[:, 2:3]
         y = 0.299 * r + 0.587 * g + 0.114 * b
 
-        y_pad = F.pad(y, (4, 4, 4, 4), mode="replicate")
-        mu_y = F.avg_pool2d(y_pad, kernel_size=9, stride=1)
-        mu_y2 = F.avg_pool2d(y_pad * y_pad, kernel_size=9, stride=1)
-        var_y = torch.clamp(mu_y2 - mu_y * mu_y, min=0.0)
-        std_y = torch.clamp(torch.sqrt(var_y + 1e-6), min=0.05)
-        y_lcn = torch.clamp(0.5 * (y - mu_y) / std_y, -3.0, 3.0)
-        return torch.cat([crops * 2.0 - 1.0, y_lcn], dim=1)
+        if self.out_channels == 4:
+            y_pad = F.pad(y, (4, 4, 4, 4), mode="replicate")
+            mu_y = F.avg_pool2d(y_pad, kernel_size=9, stride=1)
+            mu_y2 = F.avg_pool2d(y_pad * y_pad, kernel_size=9, stride=1)
+            var_y = torch.clamp(mu_y2 - mu_y * mu_y, min=0.0)
+            std_y = torch.clamp(torch.sqrt(var_y + 1e-6), min=0.05)
+            y_lcn = torch.clamp(0.5 * (y - mu_y) / std_y, -3.0, 3.0)
+            return torch.cat([crops * 2.0 - 1.0, y_lcn], dim=1)
+
+        # Fine 5x5 local contrast normalization
+        y_p2 = F.pad(y, (2, 2, 2, 2), mode="replicate")
+        mu5 = F.avg_pool2d(y_p2, kernel_size=5, stride=1)
+        mu5_2 = F.avg_pool2d(y_p2 * y_p2, kernel_size=5, stride=1)
+        var5 = torch.clamp(mu5_2 - mu5 * mu5, min=0.0)
+        std5 = torch.clamp(torch.sqrt(var5 + 1e-6), min=0.04)
+        y_lcn_fine = torch.clamp(0.5 * (y - mu5) / std5, -3.0, 3.0)
+
+        # Coarse 13x13 local contrast normalization (shadow & dark-plate equalization)
+        y_p6 = F.pad(y, (6, 6, 6, 6), mode="replicate")
+        mu13 = F.avg_pool2d(y_p6, kernel_size=13, stride=1)
+        mu13_2 = F.avg_pool2d(y_p6 * y_p6, kernel_size=13, stride=1)
+        var13 = torch.clamp(mu13_2 - mu13 * mu13, min=0.0)
+        std13 = torch.clamp(torch.sqrt(var13 + 1e-6), min=0.04)
+        y_lcn_coarse = torch.clamp(0.5 * (y - mu13) / std13, -3.0, 3.0)
+
+        # Locally-normalized 3x3 Sobel stroke gradient magnitude (whitelisted Conv + Mul + Add + Sqrt)
+        y_p1 = F.pad(y, (1, 1, 1, 1), mode="replicate")
+        gxy = F.conv2d(y_p1, self.sobel_xy.to(dtype=y.dtype))
+        gx = gxy[:, 0:1]
+        gy = gxy[:, 1:2]
+        sobel_mag = torch.sqrt(gx * gx + gy * gy + 1e-6)
+        y_sobel = torch.clamp(0.65 * sobel_mag / std5, 0.0, 3.0) - 0.5
+
+        return torch.cat([crops * 2.0 - 1.0, y_lcn_fine, y_lcn_coarse, y_sobel], dim=1)
 
 
 class RepConv3x3(nn.Module):
@@ -809,8 +916,165 @@ def noncharacter_quality_features(state, support, geometry_variance):
         support.float(), geometry_variance.float()), -1)
 
 
+class _CrossSlotSpatialAttn(nn.Module):
+    """Training-only 2D spatial-query cross-attention into fused 12-slot memory latents."""
+
+    def __init__(self, q_dim: int, kv_dim: int, num_heads: int = 4) -> None:
+        super().__init__()
+        if q_dim % num_heads != 0:
+            raise ValueError(f"q_dim ({q_dim}) must be divisible by num_heads ({num_heads})")
+        self.q_dim = q_dim
+        self.num_heads = num_heads
+        self.head_dim = q_dim // num_heads
+        self.scale = 1.0 / math.sqrt(float(self.head_dim))
+
+        self.q_norm = nn.LayerNorm(q_dim)
+        self.kv_norm = nn.LayerNorm(kv_dim)
+        self.q_proj = nn.Linear(q_dim, q_dim)
+        self.kv_proj = nn.Linear(kv_dim, q_dim * 2)
+        self.out_proj = nn.Linear(q_dim, q_dim)
+
+        self.ffn_norm = nn.LayerNorm(q_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(q_dim, q_dim * 2),
+            nn.SiLU(),
+            nn.Linear(q_dim * 2, q_dim),
+        )
+
+    def forward(self, q_in: torch.Tensor, kv_in: torch.Tensor) -> torch.Tensor:
+        bsz, n_q, _ = q_in.shape
+        n_kv = kv_in.shape[1]
+        qn = self.q_norm(q_in)
+        kvn = self.kv_norm(kv_in)
+        q = self.q_proj(qn).reshape(bsz, n_q, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.kv_proj(kvn).reshape(bsz, n_kv, 2, self.num_heads, self.head_dim)
+        k = kv[:, :, 0].transpose(1, 2)
+        v = kv[:, :, 1].transpose(1, 2)
+        attn = F.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale, dim=-1)
+        ctx = torch.matmul(attn, v).transpose(1, 2).reshape(bsz, n_q, self.q_dim)
+        x = q_in + self.out_proj(ctx)
+        return x + self.ffn(self.ffn_norm(x))
+
+
+class MemorySRDecoder(nn.Module):
+    """Training-only Multi-Frame Super-Resolution decoder attached directly to `EvidenceMemoryV2`.
+
+    Decodes the fused posterior latent (`mu_z = mem_h / mem_P`) plus decoupled color/polarity state
+    into a clean canonical `80x160` high-resolution plate luminance + Sobel stroke edge map
+    (`(B, 2, H, W)`). Contains ZERO BatchNorm layers and is completely excluded from ONNX export
+    (`0` runtime bytes, 100% vocabulary-free collection compliance).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_color: int,
+        out_hw: tuple[int, int] = (80, 160),
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_color = d_color
+        self.out_hw = (int(out_hw[0]), int(out_hw[1]))
+        self.h8 = max(2, self.out_hw[0] // 8)
+        self.w8 = max(4, self.out_hw[1] // 8)
+        self.h4 = max(4, self.out_hw[0] // 4)
+        self.w4 = max(8, self.out_hw[1] // 4)
+
+        c_coarse = 96
+        c_mid = 64
+        self.slot_embed = nn.Parameter(torch.randn(1, NUM_SLOTS, d_model) * 0.02)
+        self.color_proj = nn.Linear(d_color, d_model)
+        self.pol_proj = nn.Linear(2, d_model)
+        nn.init.zeros_(self.color_proj.weight)
+        nn.init.zeros_(self.color_proj.bias)
+        nn.init.zeros_(self.pol_proj.weight)
+        nn.init.zeros_(self.pol_proj.bias)
+        self.slot_in_norm = nn.LayerNorm(d_model)
+
+        p8_y, p8_x = _build_1d_sincos_pos_pair_v2(c_coarse, self.h8, self.w8)
+        q8_init = torch.cat(
+            [p8_y.expand(1, c_coarse // 2, self.h8, self.w8), p8_x.expand(1, c_coarse // 2, self.h8, self.w8)],
+            dim=1,
+        ).flatten(2).transpose(1, 2).contiguous()
+        self.q_coarse = nn.Parameter(q8_init * 0.25)
+
+        p4_y, p4_x = _build_1d_sincos_pos_pair_v2(c_mid, self.h4, self.w4)
+        q4_init = torch.cat(
+            [p4_y.expand(1, c_mid // 2, self.h4, self.w4), p4_x.expand(1, c_mid // 2, self.h4, self.w4)],
+            dim=1,
+        ).flatten(2).transpose(1, 2).contiguous()
+        self.q_mid_pos = nn.Parameter(q4_init * 0.20)
+
+        self.xattn_coarse = _CrossSlotSpatialAttn(c_coarse, d_model, num_heads=4)
+        self.up_10_to_20 = nn.Sequential(
+            nn.Conv2d(c_coarse, c_mid, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(c_mid, c_mid, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.xattn_mid = _CrossSlotSpatialAttn(c_mid, d_model, num_heads=4)
+        self.up_20_to_40 = nn.Sequential(
+            nn.Conv2d(c_mid, 32, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.up_40_to_80 = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 2, kernel_size=1),
+        )
+
+    def forward(
+        self,
+        mem_h: torch.Tensor,
+        mem_P: torch.Tensor,
+        color_h: torch.Tensor,
+        color_P: torch.Tensor,
+        pol_h: torch.Tensor,
+        pol_P: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz = mem_h.shape[0]
+        dt = self.slot_embed.dtype
+
+        mp = torch.clamp(mem_P.float(), min=0.0)
+        mu_z = mem_h.float() / (mp + 1e-5)
+        obs_gate = mp / (mp + 0.05)
+        slot_mu = (mu_z * obs_gate).to(dtype=dt)
+
+        cp = torch.clamp(color_P.float(), min=0.0)
+        color_vec = ((color_h.float() / (cp + 1e-5)) * (cp / (cp + 0.05))).to(dtype=dt)
+        pp = torch.clamp(pol_P.float(), min=0.0)
+        pol_logit = pol_h.float() / (pp + 1e-5)
+        pol_obs = pp / (pp + 0.05)
+        pol_feat = torch.stack([torch.tanh(0.25 * pol_logit) * pol_obs, pol_obs], dim=-1).to(dtype=dt)
+
+        ctx = (self.color_proj(color_vec) + self.pol_proj(pol_feat)).unsqueeze(1)
+        kv = self.slot_in_norm(slot_mu + self.slot_embed + ctx)  # (B, 12, D)
+
+        q8 = self.q_coarse.expand(bsz, -1, -1)
+        f8 = self.xattn_coarse(q8, kv).transpose(1, 2).reshape(bsz, -1, self.h8, self.w8)
+
+        f4_up = F.interpolate(f8, size=(self.h4, self.w4), mode="bilinear", align_corners=False)
+        f4_conv = self.up_10_to_20(f4_up)
+        q4 = f4_conv.flatten(2).transpose(1, 2) + self.q_mid_pos
+        f4_att = self.xattn_mid(q4, kv).transpose(1, 2).reshape(bsz, -1, self.h4, self.w4)
+
+        f2 = self.up_20_to_40(
+            F.interpolate(f4_att, size=(self.h4 * 2, self.w4 * 2), mode="bilinear", align_corners=False)
+        )
+        raw = self.up_40_to_80(
+            F.interpolate(f2, size=self.out_hw, mode="bilinear", align_corners=False)
+        )
+        lum = torch.sigmoid(raw[:, 0:1])
+        edge = F.softplus(raw[:, 1:2])
+        return torch.cat([lum, edge], dim=1)
+
+
 class MFJPPlateOCRV2(nn.Module):
-    """Stage-3 Multi-Frame Japanese License Plate OCR (`Base` Teacher & `Nano-Plus` Student)."""
+    """Stage-3 Multi-Frame Japanese License Plate OCR (`Base` Teacher & `Nano-Pro` Student)."""
 
     is_v2: bool = True
 
@@ -829,12 +1093,13 @@ class MFJPPlateOCRV2(nn.Module):
         h4, w4 = h_in // 4, w_in // 4
         h8, w8 = h_in // 8, w_in // 8
 
-        # 1. Photometric stem + Full-Res F1 stage + RepMobile backbone (zero runtime BN after reparameterize())
-        self.photo_stem = PhotometricStem()
+        # 1. Multi-scale photometric stem + Full-Res F1 stage + RepMobile backbone (zero runtime BN after reparameterize())
+        stem_ch = int(getattr(self.config, "stem_channels", 6))
+        self.photo_stem = PhotometricStem(out_channels=stem_ch)
         if self.config.gen5_arch:
             c0 = self.config.c0 if self.config.c0 > 0 else max(16, c1 // 2)
             self.pre_s1: RepConv3x3 | None = RepConv3x3(
-                4, c0, stride=1, groups=1, act=True, deployed=dep
+                stem_ch, c0, stride=1, groups=1, act=True, deployed=dep
             )
             self.stage0: RepMobileBlock | None = RepMobileBlock(
                 c0, expansion=exp, deployed=dep
@@ -844,7 +1109,7 @@ class MFJPPlateOCRV2(nn.Module):
             c0 = 0
             self.pre_s1 = None
             self.stage0 = None
-            self.ds1 = RepConv3x3(4, c1, stride=2, groups=1, act=True, deployed=dep)
+            self.ds1 = RepConv3x3(stem_ch, c1, stride=2, groups=1, act=True, deployed=dep)
         self.stage1 = nn.Sequential(
             *[RepMobileBlock(c1, expansion=exp, deployed=dep) for _ in range(b1)]
         )
@@ -1039,11 +1304,23 @@ class MFJPPlateOCRV2(nn.Module):
         nn.init.zeros_(self.measurement_scale_head[-1].weight)
         nn.init.zeros_(self.measurement_scale_head[-1].bias)
 
-        # Training-only Text Gestalt stroke-mask decoder (zero BN layers; excluded from ONNX export)
+        # Training-only Text Gestalt stroke-mask decoder & full-res F1 SR head (zero BN; excluded from ONNX export)
         self.stroke_mask_head = nn.Sequential(
             nn.Conv2d(d, 16, kernel_size=3, padding=1, bias=True),
             nn.SiLU(),
             nn.Conv2d(16, 1, kernel_size=1, bias=True),
+        )
+        self.f1_sr_head = nn.Sequential(
+            nn.Conv2d(d, 16, kernel_size=1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1, bias=True),
+        )
+        # Training-only Multi-Frame Memory Super-Resolution Decoder on fused EvidenceMemoryV2 posterior
+        # (zero BN layers, completely discarded at ONNX export -> 0 runtime bytes, 100% JP7029732B2 clean!)
+        self.memory_sr_decoder = MemorySRDecoder(
+            d_model=d,
+            d_color=dc,
+            out_hw=self.config.input_hw,
         )
 
         # Polarity-aware rim + mid-plate + stroke-zone color & luminance polarity heads
@@ -1105,17 +1382,22 @@ class MFJPPlateOCRV2(nn.Module):
             self.readout_pol_proj: nn.Linear | None = nn.Linear(2, d)
             nn.init.zeros_(self.readout_pol_proj.weight)
             nn.init.zeros_(self.readout_pol_proj.bias)
+            self.readout_prec_proj: nn.Linear | None = nn.Linear(3, d)
+            nn.init.zeros_(self.readout_prec_proj.weight)
+            nn.init.zeros_(self.readout_prec_proj.bias)
+            n_ro_layers = max(1, int(getattr(self.config, "readout_layers", 3)))
             self.readout_sa: nn.Module | None = nn.Sequential(
-                IntraSlotAttention(
-                    d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
-                ),
-                IntraSlotAttention(
-                    d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
-                ),
+                *[
+                    IntraSlotAttention(
+                        d, num_heads=self.config.num_heads, mlp_ratio=1.5, dropout=self.config.dropout
+                    )
+                    for _ in range(n_ro_layers)
+                ]
             )
         else:
             self.readout_color_proj = None
             self.readout_pol_proj = None
+            self.readout_prec_proj = None
             self.readout_sa = None
         self.slot_classifier = nn.Linear(d, self.config.vocab_size)
 
@@ -1280,6 +1562,26 @@ class MFJPPlateOCRV2(nn.Module):
             return F.interpolate(raw_s4, size=out_hw, mode="bilinear", align_corners=False)
         return raw_s4
 
+    def decode_f1_sr(
+        self, f1_feat: torch.Tensor, out_hw: tuple[int, int] | None = None
+    ) -> torch.Tensor:
+        """Training-only full-res `F1` single-frame auxiliary SR / stroke decoder."""
+        raw_s1 = self.f1_sr_head(f1_feat)
+        if out_hw is not None and raw_s1.shape[-2:] != out_hw:
+            return F.interpolate(raw_s1, size=out_hw, mode="bilinear", align_corners=False)
+        return raw_s1
+
+    def decode_memory_sr(self, state: MemoryStateV2) -> torch.Tensor:
+        """Training-only Multi-Frame Memory Super-Resolution decoder on fused posterior `(mem_h, mem_P)`."""
+        return self.memory_sr_decoder(
+            mem_h=state.mem_h,
+            mem_P=state.mem_P,
+            color_h=state.color_h,
+            color_P=state.color_P,
+            pol_h=state.pol_h,
+            pol_P=state.pol_P,
+        )
+
     def _encode_frames_impl(
         self,
         crops: torch.Tensor,
@@ -1288,14 +1590,16 @@ class MFJPPlateOCRV2(nn.Module):
         return_f4: bool = False,
         return_len_logits: bool = False,
         return_ungated_prec: bool = False,
+        return_f1_sr: bool = False,
     ) -> tuple[
         FrameEncodingV2,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
         tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        torch.Tensor | None,
     ]:
-        """Internal encoder returning `(FrameEncodingV2, optional_f4, reg_len, cls_len, optional_ungated)`."""
+        """Internal encoder returning `(FrameEncodingV2, optional_f4, reg_len, cls_len, optional_ungated, optional_f1_sr)`."""
         n = crops.shape[0]
         if plate_sides is None:
             plate_sides = torch.zeros(n, dtype=torch.long, device=crops.device)
@@ -1307,16 +1611,17 @@ class MFJPPlateOCRV2(nn.Module):
             and not torch.is_grad_enabled()
             and n > 48
         ):
-            encs, f4s, rls, cls_ls, ugs = [], [], [], [], []
+            encs, f4s, rls, cls_ls, ugs, f1_srs = [], [], [], [], [], []
             for i in range(0, n, 48):
                 j = min(n, i + 48)
-                e_i, f4_i, rl_i, cl_i, ug_i = self._encode_frames_impl(
+                e_i, f4_i, rl_i, cl_i, ug_i, f1_i = self._encode_frames_impl(
                     crops[i:j],
                     plate_sides[i:j],
                     geom_meta[i:j],
                     return_f4=return_f4,
                     return_len_logits=return_len_logits,
                     return_ungated_prec=return_ungated_prec,
+                    return_f1_sr=return_f1_sr,
                 )
                 encs.append(e_i)
                 if f4_i is not None:
@@ -1327,6 +1632,8 @@ class MFJPPlateOCRV2(nn.Module):
                     cls_ls.append(cl_i)
                 if ug_i is not None:
                     ugs.append(ug_i)
+                if f1_i is not None:
+                    f1_srs.append(f1_i)
             enc_cat = FrameEncodingV2(
                 z=torch.cat([e.z for e in encs], dim=0),
                 lambda_prec=torch.cat([e.lambda_prec for e in encs], dim=0),
@@ -1353,33 +1660,67 @@ class MFJPPlateOCRV2(nn.Module):
                 (torch.cat(rls, dim=0) if rls else None),
                 (torch.cat(cls_ls, dim=0) if cls_ls else None),
                 ug_cat,
+                (torch.cat(f1_srs, dim=0) if f1_srs else None),
             )
 
-        # 1. Stem + Full-Res Stride-1 Stage (`80x160`) + RepMobile Backbone
-        x0 = self.photo_stem(crops)           # (N, 4, H, W)
+        # 1. Multi-scale photometric stem + Full-Res Stride-1 Stage (`80x160`) + RepMobile Backbone
+        use_ckpt = (
+            self.training
+            and torch.is_grad_enabled()
+            and not torch.jit.is_tracing()
+            and not torch.onnx.is_in_onnx_export()
+            and crops.is_cuda
+            and n >= 32
+        )
+        x0 = self.photo_stem(crops)           # (N, stem_ch, H, W)
         if self.pre_s1 is not None and self.stage0 is not None:
-            x1: torch.Tensor | None = self.stage0(self.pre_s1(x0))  # (N, c0, H, W)
-            x2 = self.stage1(self.ds1(x1))    # (N, c1, H/2, W/2)
+            if use_ckpt:
+                x1_pre = _bn_safe_checkpoint(self.pre_s1, x0)
+                x1: torch.Tensor | None = _bn_safe_checkpoint(self.stage0, x1_pre)
+                x2 = _bn_safe_checkpoint(self.stage1, self.ds1(x1))
+            else:
+                x1 = self.stage0(self.pre_s1(x0))  # (N, c0, H, W)
+                x2 = self.stage1(self.ds1(x1))    # (N, c1, H/2, W/2)
         else:
             x1 = None
-            x2 = self.stage1(self.ds1(x0))    # (N, c1, H/2, W/2)
-        x4 = self.stage2(self.ds2(x2))        # (N, c2, H/4, W/4)
+            x2 = _bn_safe_checkpoint(self.stage1, self.ds1(x0)) if use_ckpt else self.stage1(self.ds1(x0))
+        x4 = _bn_safe_checkpoint(self.stage2, self.ds2(x2)) if use_ckpt else self.stage2(self.ds2(x2))
         x8 = self.stage3(self.ds3(x4))        # (N, c3, H/8, W/8)
 
         # 2. 4-Level Asymmetric Multi-Scale FPN (F1: 80x160, F2: 40x80, F4: 20x40, F8: 10x20)
         l8 = self.f8_lat(x8)
-        l8_up = F.interpolate(l8, scale_factor=2.0, mode="bilinear", align_corners=False)
+        l8_up = F.interpolate(l8, scale_factor=2.0, mode="bilinear", align_corners=False).to(dtype=l8.dtype)
         f4_feat = self.f4_refine(self.f4_lat(x4) + l8_up)
         f8_feat = self.f8_refine(l8)
-        f4_up = F.interpolate(f4_feat, scale_factor=2.0, mode="bilinear", align_corners=False)
+        f4_up = F.interpolate(f4_feat, scale_factor=2.0, mode="bilinear", align_corners=False).to(dtype=f4_feat.dtype)
         f2_raw = self.f2_lat(x2) + f4_up
-        f2_feat = self.f2_refine(f2_raw) if self.f2_refine is not None else f2_raw
+        if self.f2_refine is not None:
+            f2_feat = _bn_safe_checkpoint(self.f2_refine, f2_raw) if use_ckpt else self.f2_refine(f2_raw)
+        else:
+            f2_feat = f2_raw
 
         if x1 is not None and self.f1_lat is not None and self.f1_refine is not None:
-            f2_up = F.interpolate(f2_feat, scale_factor=2.0, mode="bilinear", align_corners=False)
-            f1_feat = self.f1_refine(self.f1_lat(x1) + f2_up)
+            if use_ckpt and len(self.f1_refine) == 2:
+                f1_lat_mod = self.f1_lat
+                f1_r0 = self.f1_refine[0]
+                f1_r1 = self.f1_refine[1]
+
+                def _f1_stage_a(x1_t: torch.Tensor, f2_t: torch.Tensor) -> torch.Tensor:
+                    f2_u = F.interpolate(f2_t, scale_factor=2.0, mode="bilinear", align_corners=False).to(
+                        dtype=f2_t.dtype
+                    )
+                    return f1_r0(f1_lat_mod(x1_t) + f2_u)
+
+                f1_mid = _bn_safe_checkpoint_fn(_f1_stage_a, (f1_lat_mod, f1_r0), x1, f2_feat)
+                f1_feat: torch.Tensor | None = _bn_safe_checkpoint(f1_r1, f1_mid)
+            else:
+                f2_up = F.interpolate(f2_feat, scale_factor=2.0, mode="bilinear", align_corners=False).to(
+                    dtype=f2_feat.dtype
+                )
+                f1_feat = self.f1_refine(self.f1_lat(x1) + f2_up)
             f1: torch.Tensor | None = _add_separable_2d_pos_v2(f1_feat, self.pos_f1_y, self.pos_f1_x)
         else:
+            f1_feat = None
             f1 = None
 
         f2 = _add_separable_2d_pos_v2(f2_feat, self.pos_f2_y, self.pos_f2_x)
@@ -1617,12 +1958,18 @@ class MFJPPlateOCRV2(nn.Module):
             if return_ungated_prec
             else None
         )
+        f1_sr_out = (
+            self.decode_f1_sr(f1_feat, out_hw=(crops.shape[-2], crops.shape[-1]))
+            if (return_f1_sr and f1_feat is not None)
+            else None
+        )
         return (
             enc_out,
             (f4_feat if return_f4 else None),
             (reg_len_logits.float() if (return_len_logits and reg_len_logits is not None) else None),
             (cls_len_logits.float() if (return_len_logits and cls_len_logits is not None) else None),
             ungated_tuple,
+            f1_sr_out,
         )
 
     def encode_frames(
@@ -1632,13 +1979,14 @@ class MFJPPlateOCRV2(nn.Module):
         geom_meta: torch.Tensor | None = None,
     ) -> FrameEncodingV2:
         """Encode `(N, 3, H, W)` canonical crops into decoupled latent & precision observations."""
-        enc_out, _, _, _, _ = self._encode_frames_impl(
+        enc_out, _, _, _, _, _ = self._encode_frames_impl(
             crops,
             plate_sides,
             geom_meta,
             return_f4=False,
             return_len_logits=False,
             return_ungated_prec=False,
+            return_f1_sr=False,
         )
         return enc_out
 
@@ -1739,12 +2087,21 @@ class MFJPPlateOCRV2(nn.Module):
 
         mu = mh / (mp + 1e-5)
         obs_gate = mp / (mp + 0.05)
+        slot_mass = torch.clamp(mp.mean(dim=-1), 0.0, 24.0)
+        log_mass = torch.log1p(slot_mass)
+        clamped_conf = torch.clamp(mc, 0.0, 6.0)
         slot_in = (mu * obs_gate).to(dtype=self.readout_slot_embed.dtype)
         if self.readout_color_proj is not None and self.readout_sa is not None:
             ctx_ro = self.readout_color_proj(color_vec)
             if self.readout_pol_proj is not None:
                 ctx_ro = ctx_ro + self.readout_pol_proj(pol_feat)
-            h = self.readout_sa(self.refine_slot_features(slot_in + ctx_ro.unsqueeze(1)))
+            slot_ctx = slot_in + ctx_ro.unsqueeze(1)
+            if self.readout_prec_proj is not None:
+                prec_ctx = torch.stack(
+                    [log_mass, obs_gate.mean(dim=-1), clamped_conf], dim=-1
+                ).to(dtype=self.readout_slot_embed.dtype)
+                slot_ctx = slot_ctx + self.readout_prec_proj(prec_ctx)
+            h = self.readout_sa(self.refine_slot_features(slot_ctx))
         else:
             h = self.refine_slot_features(slot_in)
         slot_logits = self.slot_classifier(h)  # (B, 12, V)
@@ -1755,10 +2112,7 @@ class MFJPPlateOCRV2(nn.Module):
         log_v = math.log(float(self.config.vocab_size))
         norm_entropy = -(probs * torch.log(torch.clamp(probs, min=1e-8))).sum(dim=-1) / log_v
 
-        slot_mass = torch.clamp(mp.mean(dim=-1), 0.0, 24.0)
         slot_p_std = torch.clamp(mp.std(dim=-1, unbiased=False), 0.0, 12.0)
-        log_mass = torch.log1p(slot_mass)
-        clamped_conf = torch.clamp(mc, 0.0, 6.0)
 
         read_in = torch.cat(
             [
@@ -1842,6 +2196,7 @@ class MFJPPlateOCRV2(nn.Module):
         compute_prefix_readout: bool = False,
         prefix_len: int | None = None,
         compute_stroke_mask: bool = False,
+        compute_memory_sr: bool = False,
         init_state: MemoryStateV2 | None = None,
         target_status: torch.Tensor | None = None,
     ) -> SequenceOutputV2:
@@ -1859,18 +2214,22 @@ class MFJPPlateOCRV2(nn.Module):
             flat_geom = geom_meta.reshape(bsz * seq_len, self.config.geom_dim)
 
         do_vault_bypass = bool(self.training and target_status is not None)
-        enc, f4_raw, flat_reg_len, flat_cls_len, ungated_prec = self._encode_frames_impl(
+        enc, f4_raw, flat_reg_len, flat_cls_len, ungated_prec, f1_sr_raw = self._encode_frames_impl(
             flat_crops,
             flat_sides,
             flat_geom,
             return_f4=bool(compute_stroke_mask),
             return_len_logits=True,
             return_ungated_prec=do_vault_bypass,
+            return_f1_sr=bool(compute_stroke_mask),
         )
         stroke_mask_logits: torch.Tensor | None = None
         if compute_stroke_mask and f4_raw is not None:
             sm_flat = self.decode_stroke_mask(f4_raw, out_hw=(h, w))
             stroke_mask_logits = sm_flat.reshape(bsz, seq_len, 1, h, w)
+        f1_sr_logits: torch.Tensor | None = (
+            f1_sr_raw.reshape(bsz, seq_len, 1, h, w) if f1_sr_raw is not None else None
+        )
         reg_len_seq = (
             flat_reg_len.reshape(bsz, seq_len, 4) if flat_reg_len is not None else None
         )
@@ -2001,6 +2360,7 @@ class MFJPPlateOCRV2(nn.Module):
             state.pol_h,
             state.pol_P,
         )
+        memory_sr_pred = self.decode_memory_sr(state) if compute_memory_sr else None
         return SequenceOutputV2(
             slot_logits=ro.slot_logits,
             plate_type_logits=ro.plate_type_logits,
@@ -2030,6 +2390,8 @@ class MFJPPlateOCRV2(nn.Module):
             next_prefix_readout=next_prefix_readout,
             innovation_nll=torch.stack(innovation_losses).mean(),
             vault_bypass_mask=vault_bypass_mask,
+            memory_sr_pred=memory_sr_pred,
+            f1_sr_logits=f1_sr_logits,
         )
 
     def forward(

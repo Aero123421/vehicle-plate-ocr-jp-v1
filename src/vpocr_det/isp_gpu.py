@@ -78,7 +78,7 @@ class GPUISPConfig:
                 f"GPUISPConfig.domain_split must be one of {VALID_ISP_DOMAIN_SPLITS}, got {self.domain_split!r}"
             )
         if self.p_lowres_capture is None:
-            self.p_lowres_capture = 0.36 if self.domain_split == "train" else 0.55
+            self.p_lowres_capture = 0.42 if self.domain_split == "train" else 0.55
         else:
             self.p_lowres_capture = float(self.p_lowres_capture)
         if self.p_block_quant is not None:
@@ -386,8 +386,16 @@ class GPUCameraISPAugmenter(nn.Module):
 
         min_h = 8 if is_train else 12
         min_w = 12 if is_train else 16
-        lh = min(h, max(min_h, int(round(h * sy))))
-        lw = min(w, max(min_w, int(round(w * sx))))
+        # Dedicated 480x270 (270p) web/substream downscale-upscale profile on full-frame train clips
+        is_full_frame_train = is_train and (sub.dtype != torch.float64) and (h >= 64) and (w >= 128)
+        use_270p_stream = is_full_frame_train and (h >= 270) and (w >= 480) and (not interlaced) and (self._py_rng.random() < 0.38)
+        if use_270p_stream:
+            jit_270 = self._py_rng.uniform(0.88, 1.06)
+            lh = min(h, max(min_h, int(round(270.0 * jit_270))))
+            lw = min(w, max(min_w, int(round(480.0 * jit_270))))
+        else:
+            lh = min(h, max(min_h, int(round(h * sy))))
+            lw = min(w, max(min_w, int(round(w * sx))))
         if (lh % 2) != (h % 2):
             lh = (lh - 1) if lh >= h else (lh + 1)
         if (lw % 2) != (w % 2):
@@ -399,49 +407,51 @@ class GPUCameraISPAugmenter(nn.Module):
         if is_train:
             # Area downsampling preserves exact inter-frame sub-pixel motion phase and 0.000 px centroid alignment!
             low = F.interpolate(sub.to(dtype=work_dtype), size=(lh, lw), mode="area")
-            n_tot = int(low.shape[0])
-            k_f = max(1, int(frames_per_clip))
-            n_c = max(1, n_tot // k_f)
-            dev = low.device
-            if eff_ir_clip is None:
-                ir_c = torch.zeros((n_c,), device=dev, dtype=torch.bool)
-            else:
-                ir_c = eff_ir_clip.to(device=dev, dtype=torch.bool).reshape(n_c)
-            ir_f = ir_c[:, None].expand(n_c, k_f).reshape(n_tot)
+            if is_full_frame_train:
+                n_tot = int(low.shape[0])
+                k_f = max(1, int(frames_per_clip))
+                n_c = max(1, n_tot // k_f)
+                dev = low.device
+                if eff_ir_clip is None:
+                    ir_c = torch.zeros((n_c,), device=dev, dtype=torch.bool)
+                else:
+                    ir_c = eff_ir_clip.to(device=dev, dtype=torch.bool).reshape(n_c)
+                ir_f = ir_c[:, None].expand(n_c, k_f).reshape(n_tot)
 
-            # 1) Per-frame independent Poisson-Gaussian read/shot noise at native low-res sensor raster
-            if self.config.p_sensor_noise > 0.0 and self._py_rng.random() < 0.82:
-                lin_lr = torch.where(
-                    low.float() <= 0.04045,
-                    low.float() / 12.92,
-                    ((low.float() + 0.055) / 1.055).pow(2.4),
-                )
-                sig_c = self._rand_uniform((n_c, 1, 1, 1), 0.005, 0.026, dev, torch.float32)
-                sig_ir = self._rand_uniform((n_c, 1, 1, 1), 0.014, 0.038, dev, torch.float32)
-                sig_use = torch.where(ir_c.view(n_c, 1, 1, 1), sig_ir, sig_c)
-                sig_f = sig_use[:, None].expand(n_c, k_f, 1, 1, 1).reshape(n_tot, 1, 1, 1)
-                ir_m4 = ir_f.view(n_tot, 1, 1, 1)
-                rgb2y_f = self.rgb_to_y.to(device=dev, dtype=torch.float32)
-                lin_lr = torch.where(ir_m4, (lin_lr * rgb2y_f).sum(1, keepdim=True).expand_as(lin_lr), lin_lr)
-                noisy_lr = self._apply_raw_sensor_noise(lin_lr, sig_f.square() * 3.0, sig_f * 0.58, ir_m4)
-                enc_lr = torch.where(
-                    noisy_lr <= 0.0031308,
-                    12.92 * noisy_lr,
-                    1.055 * noisy_lr.clamp_min(1e-8).pow(1.0 / 2.4) - 0.055,
-                )
-                low = self._highlight_shoulder(enc_lr).clamp(0.0, 1.0).to(dtype=work_dtype)
+                # 1) Per-frame independent Poisson-Gaussian read/shot noise at native low-res sensor raster
+                if self.config.p_sensor_noise > 0.0 and self._py_rng.random() < 0.82:
+                    lin_lr = torch.where(
+                        low.float() <= 0.04045,
+                        low.float() / 12.92,
+                        ((low.float() + 0.055) / 1.055).pow(2.4),
+                    )
+                    sig_c = self._rand_uniform((n_c, 1, 1, 1), 0.005, 0.026, dev, torch.float32)
+                    sig_ir = self._rand_uniform((n_c, 1, 1, 1), 0.014, 0.038, dev, torch.float32)
+                    sig_use = torch.where(ir_c.view(n_c, 1, 1, 1), sig_ir, sig_c)
+                    sig_f = sig_use[:, None].expand(n_c, k_f, 1, 1, 1).reshape(n_tot, 1, 1, 1)
+                    ir_m4 = ir_f.view(n_tot, 1, 1, 1)
+                    rgb2y_f = self.rgb_to_y.to(device=dev, dtype=torch.float32)
+                    lin_lr = torch.where(ir_m4, (lin_lr * rgb2y_f).sum(1, keepdim=True).expand_as(lin_lr), lin_lr)
+                    noisy_lr = self._apply_raw_sensor_noise(lin_lr, sig_f.square() * 3.0, sig_f * 0.58, ir_m4)
+                    enc_lr = torch.where(
+                        noisy_lr <= 0.0031308,
+                        12.92 * noisy_lr,
+                        1.055 * noisy_lr.clamp_min(1e-8).pow(1.0 / 2.4) - 0.055,
+                    )
+                    low = self._highlight_shoulder(enc_lr).clamp(0.0, 1.0).to(dtype=work_dtype)
 
-            # 2) True YCbCr 4:2:0 2x2 chroma subsampling + bilinear chroma upsampling at native substream resolution
-            if lh >= 4 and lw >= 4 and self._py_rng.random() < 0.88:
-                low = self._apply_ycbcr_420(low.float(), ir_f).to(dtype=work_dtype)
+                # 2) True ITU-R BT.601 yuv420p 4:2:0 2x2 chroma subsampling at native 270p/substream resolution
+                if lh >= 4 and lw >= 4 and (use_270p_stream or self._py_rng.random() < 0.88):
+                    low = self._apply_ycbcr_420(low.float(), ir_f).to(dtype=work_dtype)
 
-            # 3) H.264 8x8 DCT quantization (dct_step up to 0.095) + temporal P-frame residual ghosting
-            if lh >= 8 and lw >= 8 and self._py_rng.random() < 0.85:
-                q_lr = self._rand_uniform((n_c,), 0.014, 0.095, dev, torch.float32)
-                do_pf = self._rand_prob((n_c,), self.config.p_pframe_ghost if k_f >= 2 else 0.0, dev, torch.float32)
-                g_lr = self._rand_uniform((n_c,), 0.07, 0.22, dev, torch.float32) * do_pf
-                low_5d = low.float().view(n_c, k_f, int(low.shape[1]), lh, lw)
-                low = self._apply_h264_dct8x8_and_pframe(low_5d, q_lr, g_lr, ir_c).reshape_as(low).to(dtype=work_dtype)
+                # 3) H.264/AV1 8x8 DCT blockiness (dct_step up to 0.095) + temporal P-frame residual ghosting
+                if lh >= 8 and lw >= 8 and (use_270p_stream or self._py_rng.random() < 0.85):
+                    q_lo_lr = 0.024 if use_270p_stream else 0.014
+                    q_lr = self._rand_uniform((n_c,), q_lo_lr, 0.095, dev, torch.float32)
+                    do_pf = self._rand_prob((n_c,), self.config.p_pframe_ghost if k_f >= 2 else 0.0, dev, torch.float32)
+                    g_lr = self._rand_uniform((n_c,), 0.07, 0.22, dev, torch.float32) * do_pf
+                    low_5d = low.float().view(n_c, k_f, int(low.shape[1]), lh, lw)
+                    low = self._apply_h264_dct8x8_and_pframe(low_5d, q_lr, g_lr, ir_c).reshape_as(low).to(dtype=work_dtype)
         else:
             # Exact legacy holdout path (bit-identical for val_holdout & cal_holdout)
             if h >= 2 * lh and w >= 2 * lw and (h % 2 == 0) and (w % 2 == 0):
@@ -570,7 +580,7 @@ class GPUCameraISPAugmenter(nn.Module):
 
     @staticmethod
     def _apply_lens_bloom(linear_signal: Tensor, strength: Tensor) -> Tensor:
-        """Scatter bright scene radiance through a broad PSF and a central lens ghost.
+        """Scatter bright scene radiance through a multi-scale halation PSF and a central lens ghost.
 
         Dark scenes without bright sources produce no flare. The ghost follows the
         source reflected about the optical centre, and the PSF preserves IR neutrality.
@@ -579,9 +589,35 @@ class GPUCameraISPAugmenter(nn.Module):
         h, w = source.shape[-2:]
         low = F.adaptive_avg_pool2d(source, (max(1, h // 8), max(1, w // 8)))
         spread = F.avg_pool2d(F.pad(low, (3, 3, 3, 3), mode="replicate"), 7, stride=1)
-        halo = F.interpolate(spread, size=(h, w), mode="bilinear", align_corners=False)
+        wide_halo = F.interpolate(spread, size=(h, w), mode="bilinear", align_corners=False)
+        mid = F.adaptive_avg_pool2d(source, (max(1, h // 4), max(1, w // 4)))
+        core_spread = F.avg_pool2d(F.pad(mid, (2, 2, 2, 2), mode="replicate"), 5, stride=1)
+        core_halo = F.interpolate(core_spread, size=(h, w), mode="bilinear", align_corners=False)
         ghost = F.interpolate(torch.flip(spread, (-2, -1)), size=(h, w), mode="bilinear", align_corners=False)
-        return linear_signal + strength * (0.8 * halo + 0.2 * ghost)
+        return linear_signal + strength * (0.34 * core_halo + 0.46 * wide_halo + 0.20 * ghost)
+
+    @staticmethod
+    def _apply_night_lamp_halation(linear_signal: Tensor, strength: Tensor, is_ir_mask: Tensor) -> Tensor:
+        """Localized night headlight/taillight halation (only triggers on dark-scene bright lamps; zero highlight clip)."""
+        n_f, _, h, w = linear_signal.shape
+        if h < 16 or w < 16:
+            return linear_signal
+        mean_y = (
+            0.299 * linear_signal[:, 0:1] + 0.587 * linear_signal[:, 1:2] + 0.114 * linear_signal[:, 2:3]
+        ).mean(dim=(2, 3), keepdim=True)
+        # Smooth gate: active ONLY on dark/night scenes (mean linear luminance < 0.14), strictly 0 on bright scenes!
+        dark_gate = ((0.16 - mean_y) / 0.08).clamp(0.0, 1.0)
+        eff_str = strength * dark_gate
+        if not bool((eff_str > 1e-4).any().item()):
+            return linear_signal
+        head_src = (linear_signal - 0.45).clamp_min(0.0)
+        red_exc = (linear_signal[:, 0:1] - 0.52 * (linear_signal[:, 1:2] + linear_signal[:, 2:3]) - 0.16).clamp_min(0.0)
+        tail_src = torch.cat([red_exc * 1.35, red_exc * 0.18, red_exc * 0.08], dim=1) * (~is_ir_mask).to(linear_signal.dtype)
+        lamp_src = head_src + tail_src
+        q_lo = F.adaptive_avg_pool2d(lamp_src, (max(1, h // 6), max(1, w // 6)))
+        q_sp = F.avg_pool2d(F.pad(q_lo, (2, 2, 2, 2), mode="replicate"), 5, stride=1)
+        halo = F.interpolate(q_sp, size=(h, w), mode="bilinear", align_corners=False)
+        return linear_signal + eff_str * 0.65 * halo
 
     @staticmethod
     def _highlight_shoulder(signal: Tensor, knee: float = 0.80) -> Tensor:
@@ -755,7 +791,10 @@ class GPUCameraISPAugmenter(nn.Module):
                                  ((work.float() + 0.055) / 1.055).pow(2.4))
             if self.config.p_glare_blob > 0.0:
                 glare = self._rand_prob((ba, 1, 1, 1), self.config.p_glare_blob, device, torch.float32)
-                linear = self._apply_lens_bloom(linear, _expand_clip_param(glare))
+                glare_f = _expand_clip_param(glare)
+                linear = self._apply_lens_bloom(linear, glare_f)
+                if is_train_split:
+                    linear = self._apply_night_lamp_halation(linear, glare_f, eff_ir)
             if self.config.p_sensor_noise > 0.0:
                 noise = self._rand_prob((ba, 1, 1, 1), self.config.p_sensor_noise, device, torch.float32)
                 sigma_ir = self._rand_uniform((ba, 1, 1, 1), .018, .042, device, torch.float32)

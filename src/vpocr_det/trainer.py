@@ -110,8 +110,8 @@ class QuadTrainConfig:
 
 @dataclass
 class QuadTrackTrainConfig:
-    base_ch: int = 48
-    surround_ch: int = 32
+    base_ch: int = 64
+    surround_ch: int = 40
     reid_dim: int = 48
     use_v5_heads: bool = True
     total_steps: int = 7200
@@ -948,22 +948,213 @@ class _Scene3DConcentricROIPool:
                     and ((chart > 0) & (chart < 1)).all(-1).sum() >= 2)
 
     def _corrupt_proposal(self, box: Any, corners_xy: Any = None) -> tuple[float, float, float, float]:
-        """Rejection sample a zero-direction-bias disk under observable sensor support."""
+        """Rejection sample a zero-direction-bias disk (up to +/-35%+ offset, 0.58x-1.75x scale) under sensor support."""
         x0, y0, x1, y1 = map(float, box)
         w, h = max(1., x1-x0), max(1., y1-y0)
         if corners_xy is None:
             corners_xy = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+        max_rad_mult = 0.78 if self.domain_split == "train" else 0.65
+        scale_lo, scale_hi = (-0.54, 0.56) if self.domain_split == "train" else (-0.45, 0.55)
+        aspect_lim = 0.40 if self.domain_split == "train" else 0.35
         for _ in range(4096):
             angle = self.rng.uniform(0., 2*math.pi)
-            radius = .65*math.hypot(w, h)*math.sqrt(self.rng.random())
+            radius = max_rad_mult*math.hypot(w, h)*math.sqrt(self.rng.random())
             cx, cy = (x0+x1)/2+radius*math.cos(angle), (y0+y1)/2+radius*math.sin(angle)
-            scale = math.exp(self.rng.uniform(-.45, .55))
-            aspect = math.exp(self.rng.uniform(-.35, .35))
+            scale = math.exp(self.rng.uniform(scale_lo, scale_hi))
+            aspect = math.exp(self.rng.uniform(-aspect_lim, aspect_lim))
             pw, ph = w*scale*aspect, h*scale/aspect
             proposal = (cx-pw/2, cy-ph/2, cx+pw/2, cy+ph/2)
             if self._proposal_observable(proposal, corners_xy):
                 return proposal
         raise RuntimeError("Unable to sample an observable plate proposal")
+
+    def _synthesize_oblique_yaw_view(
+        self,
+        fr_u8: np.ndarray,
+        corners_xy: np.ndarray,
+        blur_xy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float, float]] | None:
+        """Apply exact 3x3 projective homography to simulate extreme +/-62..74 deg oblique yaw (width < height)."""
+        import cv2
+        from vpocr_det.quad_cropper import is_valid_plate_quad
+
+        h_f, w_f = fr_u8.shape[:2]
+        c0 = np.asarray(corners_xy, dtype=np.float64).reshape(4, 2)
+        bw0 = float(c0[:, 0].max() - c0[:, 0].min())
+        bh0 = float(c0[:, 1].max() - c0[:, 1].min())
+        if bw0 < 16.0 or bh0 < 7.0:
+            return None
+
+        cx, cy = float(c0[:, 0].mean()), float(c0[:, 1].mean())
+        # Target horizontal foreshortening: cos(62..74 deg) ~ 0.28..0.48 -> width < height oblique quads!
+        yaw_deg = self.rng.uniform(60.0, 74.0)
+        sx = max(0.28, math.cos(math.radians(yaw_deg)) / max(0.35, min(1.0, bw0 / max(1.0, 2.0 * bh0))))
+        sx = float(np.clip(sx, 0.28, 0.62))
+        sy = self.rng.uniform(0.95, 1.25)
+        taper = self.rng.uniform(0.58, 0.86)
+        flip_side = self.rng.random() < 0.5
+        shear_y = self.rng.uniform(-0.22, 0.22)
+
+        rel = c0 - np.array([cx, cy], dtype=np.float64)
+        dst = np.empty_like(c0)
+        for k in range(4):
+            rx, ry = rel[k, 0], rel[k, 1]
+            # Perspective foreshortening: near side taller, far side compressed
+            is_far = (rx > 0.0) if not flip_side else (rx < 0.0)
+            y_scale = sy * (taper if is_far else 1.0)
+            nx = cx + rx * sx
+            ny = cy + ry * y_scale + rx * sx * shear_y
+            dst[k] = [nx, ny]
+
+        if not is_valid_plate_quad(dst.astype(np.float32)):
+            return None
+        if float(dst[:, 0].min()) < 4.0 or float(dst[:, 0].max()) > (w_f - 4.0) or float(dst[:, 1].min()) < 4.0 or float(dst[:, 1].max()) > (h_f - 4.0):
+            return None
+        nbw = float(dst[:, 0].max() - dst[:, 0].min())
+        nbh = float(dst[:, 1].max() - dst[:, 1].min())
+        if nbw < 7.0 or nbh < 7.0 or (nbw / nbh) > 1.05:
+            return None
+
+        H = cv2.getPerspectiveTransform(c0.astype(np.float32), dst.astype(np.float32))
+        if not np.all(np.isfinite(H)):
+            return None
+        warped = cv2.warpPerspective(
+            fr_u8,
+            H,
+            (w_f, h_f),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        b_new = np.array([float(blur_xy[0]) * sx, float(blur_xy[1]) * sy], dtype=np.float32)
+        new_box = (float(dst[:, 0].min()), float(dst[:, 1].min()), float(dst[:, 0].max()), float(dst[:, 1].max()))
+        return warped, dst.astype(np.float32), b_new, new_box
+
+    def _synthesize_procedural_hard_neg(self, fr_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Pure procedural synthetic adversarial hard-negative (TV logos, hazard chevrons, bags, lamps, signs, clouds)."""
+        import cv2
+
+        h_f, w_f = fr_u8.shape[:2]
+        mode = self.rng.randrange(6)
+        canvas = fr_u8.copy()
+        pw = self.rng.uniform(28.0, min(140.0, 0.30 * float(w_f)))
+        ph = pw / self.rng.uniform(1.15, 3.20)
+        cx = self.rng.uniform(0.18 * w_f, 0.82 * w_f)
+        cy = self.rng.uniform(0.16 * h_f, 0.84 * h_f)
+        x0 = max(2, int(round(cx - 0.5 * pw)))
+        y0 = max(2, int(round(cy - 0.5 * ph)))
+        x1 = min(w_f - 2, max(x0 + 12, int(round(cx + 0.5 * pw))))
+        y1 = min(h_f - 2, max(y0 + 8, int(round(cy + 0.5 * ph))))
+        rw, rh = x1 - x0, y1 - y0
+
+        if mode == 0:
+            # TV broadcast corner watermark / pill logo / news clock badge
+            bg_c = (
+                self.rng.randint(200, 255),
+                self.rng.randint(200, 255),
+                self.rng.randint(200, 255),
+            ) if self.rng.random() < 0.65 else (
+                self.rng.randint(15, 70),
+                self.rng.randint(60, 175),
+                self.rng.randint(150, 245),
+            )
+            fg_c = (20, 24, 30) if sum(bg_c) > 420 else (240, 244, 248)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), bg_c, -1)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), fg_c, max(1, rh // 14))
+            label = self.rng.choice(("LIVE", "HD", "NEWS", "CH-4", "12:34", "08:52", "REC", "CAM1", "TV"))
+            scale_t = max(0.28, min(1.1, rh / 28.0))
+            cv2.putText(
+                canvas, label, (x0 + max(2, rw // 10), y1 - max(2, rh // 4)),
+                cv2.FONT_HERSHEY_SIMPLEX, scale_t, fg_c, max(1, int(round(scale_t * 2.0))), cv2.LINE_AA,
+            )
+        elif mode == 1:
+            # Yellow-black or red-white diagonal hazard chevrons / bumper warning stripes
+            c_a = (242, 208, 24) if self.rng.random() < 0.72 else (225, 36, 32)
+            c_b = (22, 24, 28) if c_a[1] > 100 else (242, 244, 246)
+            patch = np.empty((rh, rw, 3), dtype=np.uint8)
+            yy, xx = np.mgrid[0:rh, 0:rw]
+            slope = self.rng.choice((-1.0, 1.0)) * self.rng.uniform(0.65, 1.55)
+            period = max(4.0, float(rw) / self.rng.uniform(3.5, 9.0))
+            stripe = (((xx + slope * yy) / period) % 1.0) < 0.5
+            patch[stripe] = c_a
+            patch[~stripe] = c_b
+            canvas[y0:y1, x0:x1] = patch
+        elif mode == 2:
+            # Crumpled white/off-white plastic garbage bag / tarp blob on dark ground
+            cv2.rectangle(
+                canvas,
+                (max(0, x0 - rw // 2), max(0, y0 - rh // 2)),
+                (min(w_f - 1, x1 + rw // 2), min(h_f - 1, y1 + rh // 2)),
+                (self.rng.randint(35, 72), self.rng.randint(38, 76), self.rng.randint(42, 80)),
+                -1,
+            )
+            n_pts = self.rng.randint(6, 10)
+            pts = []
+            for k in range(n_pts):
+                ang = 2.0 * math.pi * k / n_pts + self.rng.uniform(-0.22, 0.22)
+                rx_k = 0.5 * rw * self.rng.uniform(0.68, 1.08)
+                ry_k = 0.5 * rh * self.rng.uniform(0.68, 1.08)
+                pts.append([int(round(cx + rx_k * math.cos(ang))), int(round(cy + ry_k * math.sin(ang)))])
+            bag_c = (self.rng.randint(205, 246), self.rng.randint(208, 248), self.rng.randint(210, 250))
+            cv2.fillPoly(canvas, [np.array(pts, dtype=np.int32)], bag_c)
+            cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], True, (150, 155, 162), 1, cv2.LINE_AA)
+            # Soft crease lines
+            for _ in range(3):
+                p1 = (self.rng.randint(x0, x1), self.rng.randint(y0, y1))
+                p2 = (self.rng.randint(x0, x1), self.rng.randint(y0, y1))
+                cv2.line(canvas, p1, p2, (165, 170, 178), 1, cv2.LINE_AA)
+        elif mode == 3:
+            # Bright glowing headlight / red or amber taillight cluster
+            lamp_kind = self.rng.randrange(3)
+            lamp_c = [(250, 248, 230), (240, 32, 24), (248, 168, 28)][lamp_kind]
+            cv2.ellipse(canvas, (int(round(cx)), int(round(cy))), (max(4, rw // 2), max(3, rh // 2)),
+                        self.rng.uniform(-12.0, 12.0), 0, 360, lamp_c, -1)
+            cv2.ellipse(canvas, (int(round(cx)), int(round(cy))), (max(2, rw // 4), max(2, rh // 4)),
+                        0, 0, 360, (255, 255, 248), -1)
+            roi_l = canvas[max(0, y0 - 4):min(h_f, y1 + 4), max(0, x0 - 4):min(w_f, x1 + 4)]
+            if roi_l.size > 0:
+                canvas[max(0, y0 - 4):min(h_f, y1 + 4), max(0, x0 - 4):min(w_f, x1 + 4)] = cv2.GaussianBlur(roi_l, (5, 5), 1.4)
+        elif mode == 4:
+            # Highway route shield / blue or green directional sign / company decal with digits
+            sign_c = self.rng.choice(((24, 92, 188), (22, 124, 62), (242, 244, 248), (235, 198, 28)))
+            txt_c = (242, 246, 250) if sum(sign_c) < 350 else (28, 32, 38)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), sign_c, -1)
+            cv2.rectangle(canvas, (x0 + 1, y0 + 1), (x1 - 1, y1 - 1), txt_c, 1)
+            num_txt = self.rng.choice(("R246", "E1", "50", "80", "MAX 4t", "STOP", "P", "EXIT", "105"))
+            scale_s = max(0.28, min(1.0, rh / 26.0))
+            cv2.putText(
+                canvas, num_txt, (x0 + max(2, rw // 8), y1 - max(2, rh // 4)),
+                cv2.FONT_HERSHEY_SIMPLEX, scale_s, txt_c, max(1, int(round(scale_s * 1.8))), cv2.LINE_AA,
+            )
+        else:
+            # Bright cumulus cloud puffs against blue/gray sky
+            sky_c = (self.rng.randint(100, 155), self.rng.randint(145, 200), self.rng.randint(200, 245))
+            cv2.rectangle(
+                canvas,
+                (max(0, x0 - rw), max(0, y0 - rh)),
+                (min(w_f - 1, x1 + rw), min(h_f - 1, y1 + rh)),
+                sky_c,
+                -1,
+            )
+            for _ in range(5):
+                px = int(round(cx + self.rng.uniform(-0.35, 0.35) * rw))
+                py = int(round(cy + self.rng.uniform(-0.25, 0.25) * rh))
+                rx = max(4, int(round(rw * self.rng.uniform(0.22, 0.45))))
+                ry = max(3, int(round(rh * self.rng.uniform(0.25, 0.50))))
+                cl_v = self.rng.randint(228, 252)
+                cv2.ellipse(canvas, (px, py), (rx, ry), 0, 0, 360, (cl_v, cl_v, min(255, cl_v + 3)), -1)
+            sub = canvas[max(0, y0 - rh // 2):min(h_f, y1 + rh // 2), max(0, x0 - rw // 2):min(w_f, x1 + rw // 2)]
+            if sub.size > 0:
+                canvas[max(0, y0 - rh // 2):min(h_f, y1 + rh // 2), max(0, x0 - rw // 2):min(w_f, x1 + rw // 2)] = cv2.GaussianBlur(sub, (7, 7), 2.0)
+
+        prop = (float(x0), float(y0), float(x1), float(y1))
+        fov_n, sur_n, _, _ = extract_dual_concentric_plate_rois(
+            canvas,
+            prop,
+            gamma=self.rng.uniform(1.0, 1.65),
+            fovea_scale=self.fovea_scale,
+            surround_scale=self.surround_scale,
+        )
+        return fov_n, sur_n
 
     @staticmethod
     def _corner_visibility(pg: Any, cn: np.ndarray, image_hw: tuple[int, int]) -> np.ndarray:
@@ -1132,6 +1323,53 @@ class _Scene3DConcentricROIPool:
                                 }
                             )
 
+                        if self.domain_split == "train" and self.rng.random() < 0.28:
+                            oblique = self._synthesize_oblique_yaw_view(
+                                fr_u8,
+                                np.asarray(pg.corners_xy, dtype=np.float32),
+                                np.asarray(pg.blur_vec_xy, dtype=np.float32),
+                            )
+                            if oblique is not None:
+                                w_fr, c_ob, b_ob, ob_box = oblique
+                                for ob_prop, ob_pol in (
+                                    (ob_box, 0 if even_slot else 3),
+                                    (self._corrupt_proposal(ob_box, c_ob), 2 if even_slot else 1),
+                                ):
+                                    fov_ob, sur_ob, win_ob, _ = extract_dual_concentric_plate_rois(
+                                        w_fr,
+                                        ob_prop,
+                                        gamma=1.0,
+                                        fovea_scale=self.fovea_scale,
+                                        surround_scale=self.surround_scale,
+                                    )
+                                    rx0_o, ry0_o, rw_o, rh_o = win_ob
+                                    cn_o = np.empty((4, 2), dtype=np.float32)
+                                    cn_o[:, 0] = (c_ob[:, 0] - rx0_o) / max(1e-3, rw_o)
+                                    cn_o[:, 1] = (c_ob[:, 1] - ry0_o) / max(1e-3, rh_o)
+                                    bn_o = np.array(
+                                        [float(b_ob[0] / max(1e-3, rw_o)), float(b_ob[1] / max(1e-3, rh_o))],
+                                        dtype=np.float32,
+                                    )
+                                    self.pos_items.append(
+                                        {
+                                            "fovea": fov_ob,
+                                            "surround": sur_ob,
+                                            "is_plate": 1.0,
+                                            "corners_norm": cn_o,
+                                            "blur_vec_norm": bn_o,
+                                            "plate_side": int(pg.plate_side) if 0 <= int(pg.plate_side) < 3 else 0,
+                                            "visible_support_fraction": float(pg.visible_support_fraction),
+                                            "corner_vis_gt": ((cn_o >= 0.0) & (cn_o <= 1.0)).all(-1).astype(np.float32),
+                                            "sampling_policy": ob_pol,
+                                            "min_projected_edge_px": float(min(ob_box[2] - ob_box[0], ob_box[3] - ob_box[1])),
+                                            "blur_magnitude_px": float(np.linalg.norm(b_ob)),
+                                            "local_contrast_snr": float(pg.local_contrast_snr),
+                                            "is_large": 1.0 if bool(pg.is_large) else 0.0,
+                                            "reid_id": int(reid_id),
+                                            "clip_id": self.clip_counter,
+                                        }
+                                    )
+
                         # Structured hard negative: shifted half-plate / adjacent bumper-edge crop (IoU < 0.25)
                         for _ in range(2):
                             sgn_s = -1.0 if self.rng.random() < 0.5 else 1.0
@@ -1150,20 +1388,28 @@ class _Scene3DConcentricROIPool:
                                 )
                                 _append_neg_roi(fov_s, sur_s, hard=True)
                                 break
-                        if self.domain_split == "train" and self.rng.random() < 0.45:
-                            # Explicitly truncated half-plate (< 35% physical plate support across sensor boundary)
-                            cut_left = self.rng.random() < 0.5
-                            keep_frac = self.rng.uniform(0.18, 0.24)
+                        if self.domain_split == "train" and self.rng.random() < 0.60:
+                            # Explicitly truncated half-plate (< 30% physical plate support across horizontal or vertical edge)
+                            cut_mode = self.rng.randrange(4)
+                            keep_frac = self.rng.uniform(0.18, 0.26)
                             fr_trunc = fr_u8.copy()
                             fill_rgb = (self.rng.randint(30, 48), self.rng.randint(34, 52), self.rng.randint(38, 58))
-                            if cut_left:
+                            if cut_mode == 0:
                                 cut_x = max(0, min(w_f, int(round(bx1 - keep_frac * bw))))
                                 fr_trunc[:, :cut_x] = fill_rgb
                                 half_prop = (bx1 - 0.85 * bw, by0, bx1 + 0.15 * bw, by1)
-                            else:
+                            elif cut_mode == 1:
                                 cut_x = max(0, min(w_f, int(round(bx0 + keep_frac * bw))))
                                 fr_trunc[:, cut_x:] = fill_rgb
                                 half_prop = (bx0 - 0.15 * bw, by0, bx0 + 0.85 * bw, by1)
+                            elif cut_mode == 2:
+                                cut_y = max(0, min(h_f, int(round(by1 - keep_frac * bh))))
+                                fr_trunc[:cut_y, :] = fill_rgb
+                                half_prop = (bx0, by1 - 0.85 * bh, bx1, by1 + 0.15 * bh)
+                            else:
+                                cut_y = max(0, min(h_f, int(round(by0 + keep_frac * bh))))
+                                fr_trunc[cut_y:, :] = fill_rgb
+                                half_prop = (bx0, by0 - 0.15 * bh, bx1, by0 + 0.85 * bh)
                             fov_h, sur_h, _, _ = extract_dual_concentric_plate_rois(
                                 fr_trunc,
                                 half_prop,
@@ -1174,13 +1420,16 @@ class _Scene3DConcentricROIPool:
                             _append_neg_roi(fov_h, sur_h, hard=True)
 
                     elif pg.cls_id == CLS_SIGNBOARD_HARDNEG:
-                        # Nonplate ownership is exact renderer truth (2 jittered proposals per signboard/stencil).
-                        n_hn = 2 if self.domain_split == "train" else 1
+                        # Nonplate ownership is exact renderer truth (4 multi-scale proposals per signboard/logo/chevron/bag).
+                        n_hn = 4 if self.domain_split == "train" else 1
                         for _ in range(n_hn):
-                            jx = self.rng.uniform(-0.18, 0.18) * bw
-                            jy = self.rng.uniform(-0.18, 0.18) * bh
-                            gamma_n = self.rng.uniform(1.0, 1.6)
-                            prop_n = (bx0 + jx, by0 + jy, bx1 + jx, by1 + jy)
+                            jx = self.rng.uniform(-0.24, 0.24) * bw
+                            jy = self.rng.uniform(-0.24, 0.24) * bh
+                            sc_n = math.exp(self.rng.uniform(-0.25, 0.25))
+                            ncx = 0.5 * (bx0 + bx1) + jx
+                            ncy = 0.5 * (by0 + by1) + jy
+                            gamma_n = self.rng.uniform(1.0, 1.80)
+                            prop_n = (ncx - 0.5 * bw * sc_n, ncy - 0.5 * bh * sc_n, ncx + 0.5 * bw * sc_n, ncy + 0.5 * bh * sc_n)
                             if not _valid_null_box(prop_n):
                                 continue
                             fov_u8, sur_u8, _, _ = extract_dual_concentric_plate_rois(
@@ -1192,10 +1441,10 @@ class _Scene3DConcentricROIPool:
                             )
                             _append_neg_roi(fov_u8, sur_u8, hard=True)
 
-                # Structured hard negatives on detector FPs + vehicle headlights/grilles/doors (>= 70% of neg_items),
-                # plus at most one general scene background crop so sky/asphalt never dominates.
-                hard_cand_boxes: list[tuple[float, float, float, float]] = list(detector_proposals[k_idx][:3])
-                for vg in fg.vehicles[:5]:
+                # Structured hard negatives on detector FPs + vehicle headlights/grilles/doors/high-contrast patches,
+                # plus procedural adversarial hard negatives (train only) and sky/background clutter.
+                hard_cand_boxes: list[tuple[float, float, float, float]] = list(detector_proposals[k_idx][:4])
+                for vg in fg.vehicles[:6]:
                     vx0, vy0, vx1, vy1 = map(float, vg.bbox_xyxy)
                     vw_v = max(8.0, vx1 - vx0)
                     vh_v = max(8.0, vy1 - vy0)
@@ -1218,6 +1467,19 @@ class _Scene3DConcentricROIPool:
                     dcx_v = vx0 + self.rng.uniform(0.20, 0.80) * vw_v
                     dcy_v = vy0 + self.rng.uniform(0.24, 0.64) * vh_v
                     hard_cand_boxes.append((dcx_v - 0.5 * dw_v, dcy_v - 0.5 * dh_v, dcx_v + 0.5 * dw_v, dcy_v + 0.5 * dh_v))
+                    # 4. High-contrast vehicle body/roof/bumper decal patch (random aspect including oblique)
+                    hcw = vw_v * self.rng.uniform(0.10, 0.28)
+                    hch = hcw / self.rng.uniform(0.70, 2.80)
+                    hcx = vx0 + self.rng.uniform(0.12, 0.88) * vw_v
+                    hcy = vy0 + self.rng.uniform(0.12, 0.88) * vh_v
+                    hard_cand_boxes.append((hcx - 0.5 * hcw, hcy - 0.5 * hch, hcx + 0.5 * hcw, hcy + 0.5 * hch))
+
+                # Upper-frame sky/clouds/overhead sign hard-negative crop
+                sw_u = self.rng.uniform(0.05, 0.26) * max(1.0, float(w_f))
+                sh_u = sw_u / self.rng.uniform(1.1, 2.8)
+                sx_u = self.rng.uniform(0.0, max(0.0, float(w_f) - sw_u))
+                sy_u = self.rng.uniform(0.0, max(0.0, 0.28 * float(h_f) - sh_u))
+                hard_cand_boxes.append((sx_u, sy_u, sx_u + sw_u, sy_u + sh_u))
 
                 for nb in hard_cand_boxes:
                     if not _valid_null_box(nb):
@@ -1230,6 +1492,12 @@ class _Scene3DConcentricROIPool:
                         surround_scale=self.surround_scale,
                     )
                     _append_neg_roi(fov_u8, sur_u8, hard=True)
+
+                # Procedural synthetic adversarial hard negatives (train split only: TV logos, chevrons, bags, lamps, signs, clouds)
+                if self.domain_split == "train":
+                    for _ in range(2):
+                        fov_adv, sur_adv = self._synthesize_procedural_hard_neg(fr_u8)
+                        _append_neg_roi(fov_adv, sur_adv, hard=True)
 
                 # Single general background proposal (<= 15% of neg_items)
                 nw_bg = self.rng.uniform(0.05, 0.35) * max(1.0, float(w_f))
@@ -1376,15 +1644,15 @@ class _Scene3DConcentricROIPool:
                 gen = self.torch_rng = torch.Generator(device="cpu")
                 gen.manual_seed(self.rng.getrandbits(63))
 
-        # 1. Coupled low-res pre-resize (12..30 px plate width) + symmetric motion blur + 8x8 DCT (45% of batch)
-        deg_mask = torch.rand((bsz,), generator=gen) < 0.45
+        # 1. Coupled low-res pre-resize (tiny 12..24 px blurry 480p + 24..34 px) + symmetric motion blur + 8x8 DCT (48% of batch)
+        deg_mask = torch.rand((bsz,), generator=gen) < 0.48
         if allow_lowres_mask is not None:
             deg_mask = deg_mask & allow_lowres_mask.to(device="cpu", dtype=torch.bool)
         deg_idx = torch.nonzero(deg_mask, as_tuple=False).squeeze(1).to(device=device)
         if deg_idx.numel() > 0:
             n_d = int(deg_idx.numel())
-            half_d = max(1, n_d // 2)
-            for grp_idx, (lo_px, hi_px) in ((deg_idx[:half_d], (12.0, 20.0)), (deg_idx[half_d:], (20.0, 30.0))):
+            split_d = max(1, int(round(0.60 * n_d)))
+            for grp_idx, (lo_px, hi_px) in ((deg_idx[:split_d], (12.0, 24.0)), (deg_idx[split_d:], (24.0, 34.0))):
                 if grp_idx.numel() == 0:
                     continue
                 u_px = float(torch.rand((), generator=gen).item())
@@ -1524,8 +1792,23 @@ class _Scene3DConcentricROIPool:
             while len(chosen) < n_pos_pool:
                 chosen.append(self.rng.choice(self.pos_items))
         chosen.extend(dual_pos)
-        for _ in range(n_neg_pool):
-            chosen.append(self.rng.choice(self.neg_items))
+        if getattr(self, "domain_split", "") == "train" and n_neg_pool > 0:
+            neg_key = (id(self.neg_items), len(self.neg_items), id(self.neg_items[0]), id(self.neg_items[-1]))
+            if getattr(self, "_cached_neg_key", None) != neg_key:
+                self._cached_hard_negs = [it for it in self.neg_items if it.get("hard_neg", True)]
+                self._cached_easy_negs = [it for it in self.neg_items if not it.get("hard_neg", True)]
+                self._cached_neg_key = neg_key
+            hard_negs = self._cached_hard_negs or self.neg_items
+            easy_negs = self._cached_easy_negs or self.neg_items
+            # Ensure >= 45% of entire batch (>= 92% of pool negatives + dual hard-negs) are adversarial hard negatives.
+            n_hard_target = min(n_neg_pool, int(math.ceil(0.92 * n_neg_pool)))
+            for _ in range(n_hard_target):
+                chosen.append(self.rng.choice(hard_negs))
+            for _ in range(n_neg_pool - n_hard_target):
+                chosen.append(self.rng.choice(easy_negs))
+        else:
+            for _ in range(n_neg_pool):
+                chosen.append(self.rng.choice(self.neg_items))
         chosen.extend(dual_neg)
         self.rng.shuffle(chosen)
 
@@ -1624,6 +1907,16 @@ def train_plate_quad_track_net(
     t0 = time.perf_counter()
     r_loss = r_cls = r_err = r_reid = 0.0
     skipped_nan = 0
+    # Size microbatch automatically to GPU VRAM so wide Stage-2 (`base_ch=64`) never OOMs on 12-24 GiB GPUs.
+    micro_cap = train_cfg.batch_size
+    if dev.type == "cuda" and train_cfg.base_ch >= 56:
+        vram_gib = float(torch.cuda.get_device_properties(dev).total_memory) / float(1024 ** 3)
+        if vram_gib < 18.0:
+            micro_cap = 32
+        elif vram_gib < 32.0:
+            micro_cap = 64
+    accum_steps = max(1, int(math.ceil(train_cfg.batch_size / max(2, micro_cap))))
+    micro_bs = max(2, int(round(train_cfg.batch_size / accum_steps)))
     model.train()
 
     for step in range(1, train_cfg.total_steps + 1):
@@ -1632,35 +1925,46 @@ def train_plate_quad_track_net(
             pool.ingest_clips(train_cfg.refresh_clips_count)
             model.train()
 
-        batch = pool.sample_batch(train_cfg.batch_size, device=dev)
         optimizer.zero_grad(set_to_none=True)
         aux_warmup = min(1.0, float(step) / max(1.0, 0.20 * float(train_cfg.total_steps)))
-        with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
-            out = model(batch["fovea_rois"], batch["surround_rois"], batch["sampling_policy"])
-            # Compatibility with loss versions retaining a deprecated topology
-            # auxiliary: it supplies no independent observation or gradient.
-            if "topology_logit" in out:
-                out["topology_logit"] = out["topology_logit"].detach()
-            loss_dict = criterion(
-                out,
-                batch["is_plate"],
-                batch["corners_norm"],
-                batch["plate_side"],
-                batch["visible_support_fraction"],
-                is_large_gt=batch["is_large"],
-                blur_vec_norm_gt=batch["blur_vec_norm"],
-                reid_instance_ids=batch["reid_ids"],
-                aux_warmup_scale=aux_warmup,
-                corner_visibility_gt=batch["corner_vis_gt"],
-            )
-            loss = loss_dict["loss"] - aux_warmup*loss_dict.get("loss_topo", 0.)
+        step_finite = True
+        step_loss_val = step_cls_val = step_err_val = step_reid_val = 0.0
+        for _ in range(accum_steps):
+            batch = pool.sample_batch(micro_bs if accum_steps > 1 else train_cfg.batch_size, device=dev)
+            with torch.amp.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=use_bf16):
+                out = model(batch["fovea_rois"], batch["surround_rois"], batch["sampling_policy"])
+                # Compatibility with loss versions retaining a deprecated topology
+                # auxiliary: it supplies no independent observation or gradient.
+                if "topology_logit" in out:
+                    out["topology_logit"] = out["topology_logit"].detach()
+                loss_dict = criterion(
+                    out,
+                    batch["is_plate"],
+                    batch["corners_norm"],
+                    batch["plate_side"],
+                    batch["visible_support_fraction"],
+                    is_large_gt=batch["is_large"],
+                    blur_vec_norm_gt=batch["blur_vec_norm"],
+                    reid_instance_ids=batch["reid_ids"],
+                    aux_warmup_scale=aux_warmup,
+                    corner_visibility_gt=batch["corner_vis_gt"],
+                )
+                loss = loss_dict["loss"] - aux_warmup * loss_dict.get("loss_topo", 0.)
 
-        if not torch.isfinite(loss):
+            if not torch.isfinite(loss):
+                step_finite = False
+                break
+            (loss / float(accum_steps)).backward()
+            step_loss_val += float(loss.detach().item()) / float(accum_steps)
+            step_cls_val += float(loss_dict["loss_cls"].item()) / float(accum_steps)
+            step_err_val += float(loss_dict["mean_corner_err_norm"].item()) / float(accum_steps)
+            step_reid_val += float(loss_dict["loss_reid"].item()) / float(accum_steps)
+
+        if not step_finite:
             skipped_nan += 1
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(cov_readout_params, max_norm=2.0)
         torch.nn.utils.clip_grad_norm_(other_params, max_norm=6.0)
         torch.nn.utils.clip_grad_norm_(disp_readout_params, max_norm=4.0)
@@ -1669,10 +1973,10 @@ def train_plate_quad_track_net(
         scheduler.step()
         ema.update(model)
 
-        r_loss += float(loss.detach().item())
-        r_cls += float(loss_dict["loss_cls"].item())
-        r_err += float(loss_dict["mean_corner_err_norm"].item())
-        r_reid += float(loss_dict["loss_reid"].item())
+        r_loss += step_loss_val
+        r_cls += step_cls_val
+        r_err += step_err_val
+        r_reid += step_reid_val
 
         if step % train_cfg.log_every == 0 or step == train_cfg.total_steps:
             denom = float(
@@ -2607,9 +2911,8 @@ def train_temporal_plate_detector(
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if kd_adapter is not None:
         trainable_params = trainable_params + list(kd_adapter.parameters())
-    # Separate normalized box-coordinate and log-odds/feature gradient metrics.
-    # A large image-to-small-object Jacobian must not rescale every task head.
-    box_mean_params = list(model.veh_query_head.box_polish_pred.parameters())
+    box_polish = getattr(model.veh_query_head, "box_polish_pred", None)
+    box_mean_params = list(box_polish.parameters()) if box_polish is not None else []
     box_mean_ids = {id(p) for p in box_mean_params}
     other_params = [p for p in trainable_params if id(p) not in box_mean_ids]
     optimizer = torch.optim.AdamW(
@@ -2687,7 +2990,8 @@ def train_temporal_plate_detector(
 
         tot_loss.backward()
         torch.nn.utils.clip_grad_norm_(other_params, max_norm=8.0)
-        torch.nn.utils.clip_grad_norm_(box_mean_params, max_norm=8.0)
+        if box_mean_params:
+            torch.nn.utils.clip_grad_norm_(box_mean_params, max_norm=8.0)
         optimizer.step()
         scheduler.step()
         ema.update(model)
@@ -2776,8 +3080,46 @@ def train_temporal_plate_detector(
 
 
 def _quantize_onnx_dense_convs_and_strip(fp32_path: Path, int8_path: Path) -> None:
-    """Quantize dense `group == 1` Conv weights to QUInt8 while keeping depthwise `group > 1` in FP32."""
+    """Quantize dense `group == 1` Conv & MatMul weights to QUInt8 while keeping depthwise `group > 1` in FP32."""
     m_fp32 = onnx.load(str(fp32_path))
+    # Resolve Identity aliases on shared initializers before dynamic quantization so shared MatMul weights quantize cleanly.
+    init_names = {item.name for item in m_fp32.graph.initializer}
+    graph_outputs = {item.name for item in m_fp32.graph.output}
+    aliases: dict[str, str] = {}
+    retained_nodes = []
+    for node in m_fp32.graph.node:
+        for idx, name in enumerate(node.input):
+            if name in aliases:
+                node.input[idx] = aliases[name]
+        if node.op_type == "Identity" and node.input and node.input[0] in init_names and node.output[0] not in graph_outputs:
+            aliases[node.output[0]] = node.input[0]
+        else:
+            retained_nodes.append(node)
+    if aliases:
+        del m_fp32.graph.node[:]
+        m_fp32.graph.node.extend(retained_nodes)
+        # Canonicalize shared transB=1 Gemm weights so ORT does not double-transpose shared initializers.
+        init_map = {item.name: item for item in m_fp32.graph.initializer}
+        transposed: dict[str, str] = {}
+        for node in m_fp32.graph.node:
+            if node.op_type == "Gemm":
+                for attr in node.attribute:
+                    if attr.name == "transB" and attr.i == 1 and len(node.input) > 1 and node.input[1] in init_map:
+                        w_name = node.input[1]
+                        if w_name not in transposed:
+                            t_name = f"{w_name}_t"
+                            m_fp32.graph.initializer.append(
+                                onnx.numpy_helper.from_array(onnx.numpy_helper.to_array(init_map[w_name]).T.copy(), t_name)
+                            )
+                            transposed[w_name] = t_name
+                        node.input[1] = transposed[w_name]
+                        attr.i = 0
+        used_fp32 = {name for node in m_fp32.graph.node for name in node.input} | graph_outputs
+        kept_fp32 = [item for item in m_fp32.graph.initializer if item.name in used_fp32]
+        del m_fp32.graph.initializer[:]
+        m_fp32.graph.initializer.extend(kept_fp32)
+        onnx.save(m_fp32, str(fp32_path))
+
     dw_nodes = [
         n.name
         for n in m_fp32.graph.node
@@ -2791,8 +3133,45 @@ def _quantize_onnx_dense_convs_and_strip(fp32_path: Path, int8_path: Path) -> No
     )
     m_i8 = onnx.load(str(int8_path))
     del m_i8.graph.value_info[:]
-    for n in m_i8.graph.node:
-        n.doc_string = ""
+    # Compact internal edge/initializer/node strings (lossless; preserves all graph I/O & calibration buffer names).
+    has_subgraph = any(
+        a.type in (onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS)
+        for n in m_i8.graph.node
+        for a in n.attribute
+    )
+    if not has_subgraph:
+        preserved = (
+            {item.name for item in m_i8.graph.input}
+            | {item.name for item in m_i8.graph.output}
+            | {
+                item.name
+                for item in m_i8.graph.initializer
+                if item.name.rsplit(".", 1)[-1] in {"cal_temp", "cal_bias", "pi_train"}
+            }
+        )
+        name_map: dict[str, str] = {}
+
+        def _short(old: str) -> str:
+            if not old or old in preserved:
+                return old
+            mapped = name_map.get(old)
+            if mapped is None:
+                mapped = f"t{len(name_map)}"
+                name_map[old] = mapped
+            return mapped
+
+        for init in m_i8.graph.initializer:
+            init.name = _short(init.name)
+        for n in m_i8.graph.node:
+            n.name = ""
+            n.doc_string = ""
+            for idx, inp in enumerate(n.input):
+                n.input[idx] = _short(inp)
+            for idx, outp in enumerate(n.output):
+                n.output[idx] = _short(outp)
+    else:
+        for n in m_i8.graph.node:
+            n.doc_string = ""
     onnx.save(m_i8, str(int8_path))
     onnx.checker.check_model(str(int8_path))
 
@@ -3120,25 +3499,26 @@ def fit_stage1_post_int8_calibration(
     seed: int = 20260601, device: torch.device | str = "cpu", max_iter: int = 80,
     sidecar_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Fit vehicle/background temperature+bias on matched INT8 query outputs.
+    """Audit Stage-1 INT8 outputs on `cal_holdout` while keeping frozen COCO vehicle log-odds untouched.
 
-    Every unmatched query is background, using the same amodal Gaussian/class
-    assignment as training. Re-fitting first inverts existing calibration.
-    This calibrates synthetic query observations, not arbitrary real cameras.
+    Because `dfine_core` is already calibrated on real COCO vehicle probabilities, synthetic vehicle
+    boxes must NOT overwrite `cal_temp` or `cal_bias` (preserved strictly at `cal_temp=1.0, cal_bias=0.0`).
     """
     if min(num_batches, batch_size, num_clips, max_iter) < 1:
         raise ValueError("Calibration counts must be positive")
     path = Path(onnx_path)
     _require_int8_onnx(path)
+    # Enforce identity vehicle calibration before evaluating so frozen COCO vehicle log-odds are uncorrupted.
+    set_unified_onnx_calibration(path, 1.0, 0.0)
     session = _cpu_ort_session(path)
     hw = tuple(map(int, session.get_inputs()[0].shape[-2:]))
     pool = calibration_pool or build_stage1_calibration_pool(image_hw=hw, seed=seed, device=device)
     _require_calibration_pool(pool)
     if not pool.items:
         pool.ingest_clips(num_clips)
-    buffers = _onnx_calibration_buffers(path)
-    old_temp, old_bias = float(buffers["cal_temp"].item()), float(buffers["cal_bias"].item())
     logits, labels = [], []
+    plate_pos_scores: list[float] = []
+    sign_max_plate_scores: list[float] = []
     for _ in range(num_batches):
         clips, targets = pool.sample_batch(batch_size, hw, torch.device(device))
         state = None
@@ -3150,6 +3530,7 @@ def fit_stage1_post_int8_calibration(
             state = [out["h_p3_out"], out["h_p4_out"]]
             score = out["veh_log_odds"]
             nq = score.shape[1]
+            a_pyr = out["cls_logits"].shape[1] - nq
             binary = np.zeros_like(score)
             for bi, target in enumerate(step_targets):
                 gt = target["amodal_boxes"][target["labels"] == CLS_VEHICLE].numpy()
@@ -3161,13 +3542,48 @@ def fit_stage1_post_int8_calibration(
                     cost = .5*white.square().sum(-1)+chol.diagonal(dim1=-2, dim2=-1).log().sum(-1)[None]-torch.from_numpy(score[bi])[None]
                     _, queries = _match_query_nll(cost.numpy())
                     binary[bi, queries] = 1.
-            logits.append((score-old_bias)*old_temp)
-            labels.append(binary)
-    x, y = np.concatenate([a.reshape(-1) for a in logits]), np.concatenate([a.reshape(-1) for a in labels])
-    fit = _fit_binary_calibration(x, y, max_iter)
-    set_unified_onnx_calibration(path, fit["cal_temp"], fit["cal_bias"])
-    result = {"stage": 1, **fit, "num_observations": len(y), "num_positive": int(y.sum()),
-              "num_clips": pool.clip_counter, "seed": seed, "target": "vehicle_query"}
+                if a_pyr > 0:
+                    pyr_boxes = out["pred_boxes"][bi, :a_pyr]
+                    pyr_pl_p = 1.0 / (1.0 + np.exp(-np.clip(out["cls_logits"][bi, :a_pyr, CLS_PLATE].astype(np.float64), -40.0, 40.0)))
+                    pyr_hn_p = 1.0 / (1.0 + np.exp(-np.clip(out["cls_logits"][bi, :a_pyr, CLS_SIGNBOARD_HARDNEG].astype(np.float64), -40.0, 40.0)))
+                    eff_pl = np.where(pyr_pl_p > pyr_hn_p, pyr_pl_p, 0.0)
+                    for cls_id, store in ((CLS_PLATE, plate_pos_scores), (CLS_SIGNBOARD_HARDNEG, sign_max_plate_scores)):
+                        gt_b = target["boxes"][target["labels"] == cls_id].numpy()
+                        for gb in gt_b:
+                            ix0 = np.maximum(pyr_boxes[:, 0], gb[0])
+                            iy0 = np.maximum(pyr_boxes[:, 1], gb[1])
+                            ix1 = np.minimum(pyr_boxes[:, 2], gb[2])
+                            iy1 = np.minimum(pyr_boxes[:, 3], gb[3])
+                            inter = np.maximum(0.0, ix1 - ix0) * np.maximum(0.0, iy1 - iy0)
+                            ga = max(1.0, float((gb[2] - gb[0]) * (gb[3] - gb[1])))
+                            pa = np.maximum(1.0, (pyr_boxes[:, 2] - pyr_boxes[:, 0]) * (pyr_boxes[:, 3] - pyr_boxes[:, 1]))
+                            iou = inter / np.maximum(1.0, ga + pa - inter)
+                            hit = iou >= 0.40
+                            store.append(float(eff_pl[hit].max()) if np.any(hit) else 0.0)
+            logits.append(score.astype(np.float64))
+            labels.append(binary.astype(np.float64))
+    x = torch.as_tensor(np.concatenate([a.reshape(-1) for a in logits]), dtype=torch.float64)
+    y = torch.as_tensor(np.concatenate([a.reshape(-1) for a in labels]), dtype=torch.float64)
+    nll_identity = float(F.binary_cross_entropy_with_logits(x, y))
+    # Keep frozen COCO vehicle calibration strictly at identity (cal_temp=1.0, cal_bias=0.0).
+    set_unified_onnx_calibration(path, 1.0, 0.0)
+    result = {
+        "stage": 1,
+        "cal_temp": 1.0,
+        "cal_bias": 0.0,
+        "nll_before": nll_identity,
+        "nll_after": nll_identity,
+        "vehicle_calibration_frozen_coco": True,
+        "num_observations": int(y.numel()),
+        "num_positive": int(y.sum().item()),
+        "num_clips": pool.clip_counter,
+        "seed": seed,
+        "target": "vehicle_query_identity_preserved",
+        "plate_holdout_count": len(plate_pos_scores),
+        "plate_holdout_recall_at_026": float(np.mean([s >= 0.26 for s in plate_pos_scores])) if plate_pos_scores else 0.0,
+        "signboard_holdout_count": len(sign_max_plate_scores),
+        "signboard_holdout_fp_at_026": float(np.mean([s >= 0.26 for s in sign_max_plate_scores])) if sign_max_plate_scores else 0.0,
+    }
     return _write_calibration_sidecar(Path(sidecar_path) if sidecar_path else path.with_suffix(".calibration.json"), path, result)
 
 

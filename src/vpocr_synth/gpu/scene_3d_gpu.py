@@ -39,6 +39,921 @@ from torch import Tensor
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _HAS_TRITON = False
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _triton_flex_march_kernel(
+        ox_ptr, oy_ptr, oz_ptr, dx_ptr, dy_ptr, dz_ptr,
+        ta_ptr, tb_ptr, dir_ptr, lip_ptr, ins_ptr,
+        t_out_ptr, f_out_ptr,
+        N, tau, amp_f, w_f, ph_f,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        ox = tl.load(ox_ptr + offs, mask=mask, other=0.0)
+        oy = tl.load(oy_ptr + offs, mask=mask, other=0.0)
+        oz = tl.load(oz_ptr + offs, mask=mask, other=0.0)
+        dx = tl.load(dx_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+        dz = tl.load(dz_ptr + offs, mask=mask, other=0.0)
+        t = tl.load(ta_ptr + offs, mask=mask, other=0.0)
+        tb = tl.load(tb_ptr + offs, mask=mask, other=0.0)
+        direc = tl.load(dir_ptr + offs, mask=mask, other=1.0)
+        lip = tl.load(lip_ptr + offs, mask=mask, other=1.0)
+        ins = tl.load(ins_ptr + offs, mask=mask, other=0) != 0
+        found = tl.zeros([BLOCK], dtype=tl.int1)
+        alive = mask
+        while tl.sum(alive.to(tl.int32), axis=0) > 0:
+            yv = oy + t * dy
+            zv = oz + t * dz
+            a1 = w_f * yv + ph_f + 0.35 * tl.sin(2.1 * zv)
+            a2 = 2.3 * w_f * yv - 1.7 * zv + 1.9 * ph_f
+            a3 = 4.1 * w_f * yv + 3.3 * zv
+            f = amp_f * (0.62 * tl.sin(a1) + 0.26 * tl.sin(a2) + 0.12 * tl.cos(a3))
+            res = direc * (tl.abs((ox + t * dx) - f) - tau)
+            at_end = t >= tb
+            contact = alive & ((res <= 1e-5) | (ins & at_end))
+            found = found | contact
+            alive = alive & (~contact) & (~at_end)
+            step = tl.maximum(res, 0.0) / lip
+            next_t = tl.minimum(t + step, tb)
+            stagnant = alive & (next_t <= t)
+            found = found | stagnant
+            alive = alive & (~stagnant)
+            t = tl.where(alive, next_t, t)
+        tl.store(t_out_ptr + offs, t, mask=mask)
+        tl.store(f_out_ptr + offs, found.to(tl.int8), mask=mask)
+
+    @triton.jit
+    def _triton_obb_raycast_kernel(
+        dx_ptr, dy_ptr, dz_ptr,
+        t_best_ptr, pid_ptr, hx_ptr, hy_ptr, hz_ptr, nlx_ptr, nly_ptr, nlz_ptr,
+        prim_data_ptr,  # (P, 20): R00..R22(9), oc0..2(3), sx,sy,sz(3), ny_s(1), u0,u1,v0,v1(4)
+        prim_id_ptr,    # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        dx = tl.load(dx_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+        dz = tl.load(dz_ptr + offs, mask=mask, other=0.0)
+        tb = tl.load(t_best_ptr + offs, mask=mask, other=1e5)
+        best_pid = tl.load(pid_ptr + offs, mask=mask, other=-1).to(tl.int32)
+        best_hx = tl.load(hx_ptr + offs, mask=mask, other=0.0)
+        best_hy = tl.load(hy_ptr + offs, mask=mask, other=0.0)
+        best_hz = tl.load(hz_ptr + offs, mask=mask, other=0.0)
+        best_nx = tl.load(nlx_ptr + offs, mask=mask, other=0.0)
+        best_ny = tl.load(nly_ptr + offs, mask=mask, other=0.0)
+        best_nz = tl.load(nlz_ptr + offs, mask=mask, other=1.0)
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 20
+            u0 = tl.load(prim_data_ptr + base + 16)
+            u1 = tl.load(prim_data_ptr + base + 17)
+            v0 = tl.load(prim_data_ptr + base + 18)
+            v1 = tl.load(prim_data_ptr + base + 19)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                in_roi = mask & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1)
+                r00 = tl.load(prim_data_ptr + base + 0)
+                r01 = tl.load(prim_data_ptr + base + 1)
+                r02 = tl.load(prim_data_ptr + base + 2)
+                r10 = tl.load(prim_data_ptr + base + 3)
+                r11 = tl.load(prim_data_ptr + base + 4)
+                r12 = tl.load(prim_data_ptr + base + 5)
+                r20 = tl.load(prim_data_ptr + base + 6)
+                r21 = tl.load(prim_data_ptr + base + 7)
+                r22 = tl.load(prim_data_ptr + base + 8)
+                oc0 = tl.load(prim_data_ptr + base + 9)
+                oc1 = tl.load(prim_data_ptr + base + 10)
+                oc2 = tl.load(prim_data_ptr + base + 11)
+                sx = tl.load(prim_data_ptr + base + 12)
+                sy = tl.load(prim_data_ptr + base + 13)
+                sz = tl.load(prim_data_ptr + base + 14)
+                ny_s = tl.load(prim_data_ptr + base + 15)
+
+                dlx = r00 * dx + r01 * dy + r02 * dz
+                dly = r10 * dx + r11 * dy + r12 * dz
+                dlz = r20 * dx + r21 * dy + r22 * dz
+                ix = tl.where(tl.abs(dlx) > 1e-6, 1.0 / dlx, tl.where(dlx >= 0.0, 1e6, -1e6))
+                iy = tl.where(tl.abs(dly) > 1e-6, 1.0 / dly, tl.where(dly >= 0.0, 1e6, -1e6))
+                iz = tl.where(tl.abs(dlz) > 1e-6, 1.0 / dlz, tl.where(dlz >= 0.0, 1e6, -1e6))
+                tx0 = (-sx - oc0) * ix
+                tx1 = (sx - oc0) * ix
+                ty0 = (-sy - oc1) * iy
+                ty1 = (sy - oc1) * iy
+                tz0 = (-sz - oc2) * iz
+                tz1 = (sz - oc2) * iz
+                tmin = tl.maximum(tl.maximum(tl.minimum(tx0, tx1), tl.minimum(ty0, ty1)), tl.minimum(tz0, tz1))
+                tmax = tl.minimum(tl.minimum(tl.maximum(tx0, tx1), tl.maximum(ty0, ty1)), tl.maximum(tz0, tz1))
+                sloped_hit = tl.zeros([256], dtype=tl.int1)
+                if ny_s > 0.0:
+                    nz_s = tl.sqrt(tl.maximum(0.1, 1.0 - ny_s * ny_s))
+                    d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
+                    den_s = ny_s * dly + nz_s * dlz
+                    num_s = d_s - (ny_s * oc1 + nz_s * oc2)
+                    t_s = num_s / tl.where(tl.abs(den_s) > 1e-6, den_s, 1e-6)
+                    sloped_hit = (den_s < -1e-6) & (t_s >= tmin)
+                    tmin = tl.where(den_s < -1e-6, tl.maximum(tmin, t_s), tmin)
+                    tmax = tl.where(den_s > 1e-6, tl.minimum(tmax, t_s), tmax)
+                    tmax = tl.where((tl.abs(den_s) <= 1e-6) & (num_s < 0.0), -1.0, tmax)
+                valid = in_roi & (tmin > 0.16) & (tmax >= tmin) & (tmin < tb)
+                if tl.sum(valid.to(tl.int32), axis=0) > 0:
+                    hx = oc0 + tmin * dlx
+                    hy = oc1 + tmin * dly
+                    hz = oc2 + tmin * dlz
+                    ax = tl.abs(hx) / tl.maximum(1e-4, sx)
+                    ay = tl.abs(hy) / tl.maximum(1e-4, sy)
+                    az = tl.abs(hz) / tl.maximum(1e-4, sz)
+                    is_x = (ax >= ay) & (ax >= az)
+                    is_y = (~is_x) & (ay >= az)
+                    sx_h = tl.where(hx > 0.0, 1.0, tl.where(hx < 0.0, -1.0, 0.0))
+                    sy_h = tl.where(hy > 0.0, 1.0, tl.where(hy < 0.0, -1.0, 0.0))
+                    sz_h = tl.where(hz > 0.0, 1.0, tl.where(hz < 0.0, -1.0, 0.0))
+                    nx = tl.where(is_x, sx_h, 0.0)
+                    ny = tl.where(is_y, sy_h, 0.0)
+                    nz = tl.where((~is_x) & (~is_y), sz_h, 0.0)
+                    if ny_s > 0.0:
+                        nz_s2 = tl.sqrt(tl.maximum(0.1, 1.0 - ny_s * ny_s))
+                        nx = tl.where(sloped_hit, 0.0, nx)
+                        ny = tl.where(sloped_hit, ny_s, ny)
+                        nz = tl.where(sloped_hit, nz_s2, nz)
+                    orig_pid = tl.load(prim_id_ptr + i)
+                    tb = tl.where(valid, tmin, tb)
+                    best_pid = tl.where(valid, orig_pid, best_pid)
+                    best_hx = tl.where(valid, hx, best_hx)
+                    best_hy = tl.where(valid, hy, best_hy)
+                    best_hz = tl.where(valid, hz, best_hz)
+                    best_nx = tl.where(valid, nx, best_nx)
+                    best_ny = tl.where(valid, ny, best_ny)
+                    best_nz = tl.where(valid, nz, best_nz)
+
+        tl.store(t_best_ptr + offs, tb, mask=mask)
+        tl.store(pid_ptr + offs, best_pid.to(tl.int16), mask=mask)
+        tl.store(hx_ptr + offs, best_hx, mask=mask)
+        tl.store(hy_ptr + offs, best_hy, mask=mask)
+        tl.store(hz_ptr + offs, best_hz, mask=mask)
+        tl.store(nlx_ptr + offs, best_nx, mask=mask)
+        tl.store(nly_ptr + offs, best_ny, mask=mask)
+        tl.store(nlz_ptr + offs, best_nz, mask=mask)
+
+    @triton.jit
+    def _triton_iso_obb_kernel(
+        dx_ptr, dy_ptr, dz_ptr,
+        t_best_ptr, veh_ptr,
+        prim_data_ptr,  # (P, 20)
+        prim_veh_ptr,   # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        dx = tl.load(dx_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+        dz = tl.load(dz_ptr + offs, mask=mask, other=0.0)
+        tb = tl.load(t_best_ptr + offs, mask=mask, other=1e5)
+        best_v = tl.load(veh_ptr + offs, mask=mask, other=0).to(tl.int32)
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 20
+            u0 = tl.load(prim_data_ptr + base + 16)
+            u1 = tl.load(prim_data_ptr + base + 17)
+            v0 = tl.load(prim_data_ptr + base + 18)
+            v1 = tl.load(prim_data_ptr + base + 19)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                in_roi = mask & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1)
+                r00 = tl.load(prim_data_ptr + base + 0)
+                r01 = tl.load(prim_data_ptr + base + 1)
+                r02 = tl.load(prim_data_ptr + base + 2)
+                r10 = tl.load(prim_data_ptr + base + 3)
+                r11 = tl.load(prim_data_ptr + base + 4)
+                r12 = tl.load(prim_data_ptr + base + 5)
+                r20 = tl.load(prim_data_ptr + base + 6)
+                r21 = tl.load(prim_data_ptr + base + 7)
+                r22 = tl.load(prim_data_ptr + base + 8)
+                oc0 = tl.load(prim_data_ptr + base + 9)
+                oc1 = tl.load(prim_data_ptr + base + 10)
+                oc2 = tl.load(prim_data_ptr + base + 11)
+                sx = tl.load(prim_data_ptr + base + 12)
+                sy = tl.load(prim_data_ptr + base + 13)
+                sz = tl.load(prim_data_ptr + base + 14)
+                ny_s = tl.load(prim_data_ptr + base + 15)
+
+                dlx = r00 * dx + r01 * dy + r02 * dz
+                dly = r10 * dx + r11 * dy + r12 * dz
+                dlz = r20 * dx + r21 * dy + r22 * dz
+                ix = tl.where(tl.abs(dlx) > 1e-6, 1.0 / dlx, tl.where(dlx >= 0.0, 1e6, -1e6))
+                iy = tl.where(tl.abs(dly) > 1e-6, 1.0 / dly, tl.where(dly >= 0.0, 1e6, -1e6))
+                iz = tl.where(tl.abs(dlz) > 1e-6, 1.0 / dlz, tl.where(dlz >= 0.0, 1e6, -1e6))
+                tx0 = (-sx - oc0) * ix
+                tx1 = (sx - oc0) * ix
+                ty0 = (-sy - oc1) * iy
+                ty1 = (sy - oc1) * iy
+                tz0 = (-sz - oc2) * iz
+                tz1 = (sz - oc2) * iz
+                tmin = tl.maximum(tl.maximum(tl.minimum(tx0, tx1), tl.minimum(ty0, ty1)), tl.minimum(tz0, tz1))
+                tmax = tl.minimum(tl.minimum(tl.maximum(tx0, tx1), tl.maximum(ty0, ty1)), tl.maximum(tz0, tz1))
+                if ny_s > 0.0:
+                    nz_s = tl.sqrt(tl.maximum(0.1, 1.0 - ny_s * ny_s))
+                    d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
+                    den_s = ny_s * dly + nz_s * dlz
+                    num_s = d_s - (ny_s * oc1 + nz_s * oc2)
+                    t_s = num_s / tl.where(tl.abs(den_s) > 1e-6, den_s, 1e-6)
+                    tmin = tl.where(den_s < -1e-6, tl.maximum(tmin, t_s), tmin)
+                    tmax = tl.where(den_s > 1e-6, tl.minimum(tmax, t_s), tmax)
+                    tmax = tl.where((tl.abs(den_s) <= 1e-6) & (num_s < 0.0), -1.0, tmax)
+                valid = in_roi & (tmin > 0.16) & (tmax >= tmin) & (tmin < tb)
+                orig_v = tl.load(prim_veh_ptr + i)
+                tb = tl.where(valid, tmin, tb)
+                best_v = tl.where(valid, orig_v, best_v)
+
+        tl.store(t_best_ptr + offs, tb, mask=mask)
+        tl.store(veh_ptr + offs, best_v.to(tl.int16), mask=mask)
+
+    @triton.jit
+    def _triton_obb_shadow_kernel(
+        wx_ptr, wy_ptr, wz_ptr, lit_ptr, pid_ptr, vis_ptr,
+        sdata_ptr,   # (P, 24): R00..R22(9), cx,cy,cz(3), sx,sy,sz(3), sdlx,sdly,sdlz(3), ny_s(1), z_top(1), u0,u1,v0,v1(4)
+        orig_pid_ptr,  # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        lit = (tl.load(lit_ptr + offs, mask=mask, other=0) != 0) & mask
+        vis = tl.load(vis_ptr + offs, mask=mask, other=1.0)
+        if tl.sum((lit & (vis > 0.0)).to(tl.int32), axis=0) == 0:
+            return
+        wx = tl.load(wx_ptr + offs, mask=mask, other=0.0)
+        wy = tl.load(wy_ptr + offs, mask=mask, other=0.0)
+        wz = tl.load(wz_ptr + offs, mask=mask, other=0.0)
+        cur_pid = tl.load(pid_ptr + offs, mask=mask, other=-1).to(tl.int32)
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 24
+            u0 = tl.load(sdata_ptr + base + 20)
+            u1 = tl.load(sdata_ptr + base + 21)
+            v0 = tl.load(sdata_ptr + base + 22)
+            v1 = tl.load(sdata_ptr + base + 23)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                z_top = tl.load(sdata_ptr + base + 19)
+                sub_cand = lit & (vis > 0.0) & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1) & (wz <= z_top + 0.02)
+                if tl.sum(sub_cand.to(tl.int32), axis=0) > 0:
+                    r00 = tl.load(sdata_ptr + base + 0)
+                    r01 = tl.load(sdata_ptr + base + 1)
+                    r02 = tl.load(sdata_ptr + base + 2)
+                    r10 = tl.load(sdata_ptr + base + 3)
+                    r11 = tl.load(sdata_ptr + base + 4)
+                    r12 = tl.load(sdata_ptr + base + 5)
+                    r20 = tl.load(sdata_ptr + base + 6)
+                    r21 = tl.load(sdata_ptr + base + 7)
+                    r22 = tl.load(sdata_ptr + base + 8)
+                    cx = tl.load(sdata_ptr + base + 9)
+                    cy = tl.load(sdata_ptr + base + 10)
+                    cz = tl.load(sdata_ptr + base + 11)
+                    sx = tl.load(sdata_ptr + base + 12)
+                    sy = tl.load(sdata_ptr + base + 13)
+                    sz = tl.load(sdata_ptr + base + 14)
+                    sdlx = tl.load(sdata_ptr + base + 15)
+                    sdly = tl.load(sdata_ptr + base + 16)
+                    sdlz = tl.load(sdata_ptr + base + 17)
+                    ny_s = tl.load(sdata_ptr + base + 18)
+
+                    dx_p = wx - cx
+                    dy_p = wy - cy
+                    dz_p = wz - cz
+                    ox_s = r00 * dx_p + r01 * dy_p + r02 * dz_p
+                    oy_s = r10 * dx_p + r11 * dy_p + r12 * dz_p
+                    oz_s = r20 * dx_p + r21 * dy_p + r22 * dz_p
+
+                    inv_sx = tl.where(tl.abs(sdlx) > 1e-6, 1.0 / sdlx, tl.where(sdlx >= 0.0, 1e6, -1e6))
+                    inv_sy = tl.where(tl.abs(sdly) > 1e-6, 1.0 / sdly, tl.where(sdly >= 0.0, 1e6, -1e6))
+                    inv_sz = tl.where(tl.abs(sdlz) > 1e-6, 1.0 / sdlz, tl.where(sdlz >= 0.0, 1e6, -1e6))
+                    tx0 = (-sx - ox_s) * inv_sx
+                    tx1 = (sx - ox_s) * inv_sx
+                    ty0 = (-sy - oy_s) * inv_sy
+                    ty1 = (sy - oy_s) * inv_sy
+                    tz0 = (-sz - oz_s) * inv_sz
+                    tz1 = (sz - oz_s) * inv_sz
+                    tmin_s = tl.maximum(tl.maximum(tl.minimum(tx0, tx1), tl.minimum(ty0, ty1)), tl.minimum(tz0, tz1))
+                    tmax_s = tl.minimum(tl.minimum(tl.maximum(tx0, tx1), tl.maximum(ty0, ty1)), tl.maximum(tz0, tz1))
+                    if ny_s > 0.0:
+                        nz_s = tl.sqrt(tl.maximum(0.1, 1.0 - ny_s * ny_s))
+                        d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
+                        den_s = ny_s * sdly + nz_s * sdlz
+                        num_s = d_s - (ny_s * oy_s + nz_s * oz_s)
+                        if tl.abs(den_s) > 1e-6:
+                            t_sp = num_s / den_s
+                            if den_s < 0.0:
+                                tmin_s = tl.maximum(tmin_s, t_sp)
+                            else:
+                                tmax_s = tl.minimum(tmax_s, t_sp)
+                        else:
+                            tmax_s = tl.where(num_s < 0.0, -1.0, tmax_s)
+                    orig_pid = tl.load(orig_pid_ptr + i)
+                    t_self = tl.where(cur_pid == orig_pid, 0.040, 0.005)
+                    occ = sub_cand & (tmax_s >= tl.maximum(tmin_s, t_self))
+                    vis = tl.where(occ, 0.0, vis)
+
+        tl.store(vis_ptr + offs, vis, mask=mask)
+
+    @triton.jit
+    def _triton_cyl_drum_raycast_kernel(
+        dx_ptr, dy_ptr, dz_ptr,
+        t_best_ptr, pid_ptr, hx_ptr, hy_ptr, hz_ptr, nlx_ptr, nly_ptr, nlz_ptr, is_cap_ptr,
+        cdata_ptr,    # (P, 22): R00..R22(9), oc0..2(3), sx,sy,sz(3), is_drum(1), param(1), mud_ph(1), u0,u1,v0,v1(4)
+        prim_id_ptr,  # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        dx = tl.load(dx_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+        dz = tl.load(dz_ptr + offs, mask=mask, other=0.0)
+        tb = tl.load(t_best_ptr + offs, mask=mask, other=1e5)
+        best_pid = tl.load(pid_ptr + offs, mask=mask, other=-1).to(tl.int32)
+        best_hx = tl.load(hx_ptr + offs, mask=mask, other=0.0)
+        best_hy = tl.load(hy_ptr + offs, mask=mask, other=0.0)
+        best_hz = tl.load(hz_ptr + offs, mask=mask, other=0.0)
+        best_nx = tl.load(nlx_ptr + offs, mask=mask, other=0.0)
+        best_ny = tl.load(nly_ptr + offs, mask=mask, other=0.0)
+        best_nz = tl.load(nlz_ptr + offs, mask=mask, other=1.0)
+        best_cap = tl.load(is_cap_ptr + offs, mask=mask, other=0) != 0
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 22
+            u0 = tl.load(cdata_ptr + base + 18)
+            u1 = tl.load(cdata_ptr + base + 19)
+            v0 = tl.load(cdata_ptr + base + 20)
+            v1 = tl.load(cdata_ptr + base + 21)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                in_roi = mask & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1)
+                r00 = tl.load(cdata_ptr + base + 0)
+                r01 = tl.load(cdata_ptr + base + 1)
+                r02 = tl.load(cdata_ptr + base + 2)
+                r10 = tl.load(cdata_ptr + base + 3)
+                r11 = tl.load(cdata_ptr + base + 4)
+                r12 = tl.load(cdata_ptr + base + 5)
+                r20 = tl.load(cdata_ptr + base + 6)
+                r21 = tl.load(cdata_ptr + base + 7)
+                r22 = tl.load(cdata_ptr + base + 8)
+                oc0 = tl.load(cdata_ptr + base + 9)
+                oc1 = tl.load(cdata_ptr + base + 10)
+                oc2 = tl.load(cdata_ptr + base + 11)
+                sx = tl.load(cdata_ptr + base + 12)
+                sy = tl.load(cdata_ptr + base + 13)
+                sz = tl.load(cdata_ptr + base + 14)
+                is_drum = tl.load(cdata_ptr + base + 15)
+                param = tl.load(cdata_ptr + base + 16)
+                mud_ph = tl.load(cdata_ptr + base + 17)
+
+                dlx = r00 * dx + r01 * dy + r02 * dz
+                dly = r10 * dx + r11 * dy + r12 * dz
+                dlz = r20 * dx + r21 * dy + r22 * dz
+
+                if is_drum < 0.5:
+                    # `_SHAPE_CYLINDER_X` with exact D_N radial aperture pass-through
+                    oy_n = oc1 / sy
+                    oz_n = oc2 / sz
+                    dy_n = dly / sy
+                    dz_n = dlz / sz
+                    qa = tl.maximum(dy_n * dy_n + dz_n * dz_n, 1e-6)
+                    qb = oy_n * dy_n + oz_n * dz_n
+                    qc = oy_n * oy_n + oz_n * oz_n - 1.0
+                    disc = qb * qb - qa * qc
+                    sq = tl.sqrt(tl.maximum(disc, 0.0))
+                    tc0 = (-qb - sq) / qa
+                    tc1 = (-qb + sq) / qa
+                    ix = tl.where(tl.abs(dlx) > 1e-6, 1.0 / dlx, tl.where(dlx >= 0.0, 1e6, -1e6))
+                    tx0 = (-sx - oc0) * ix
+                    tx1 = (sx - oc0) * ix
+                    t_min = tl.maximum(tl.where(disc >= 0.0, tc0, 1e6), tl.minimum(tx0, tx1))
+                    t_max = tl.minimum(tl.where(disc >= 0.0, tc1, -1e6), tl.maximum(tx0, tx1))
+                    t_hit = t_min
+                    base_ok = in_roi & (disc >= 0.0) & (t_min > 0.16) & (t_max >= t_min)
+                    if param >= 3.0:
+                        sec_w = 6.283185307179586 / param
+                        half_sec = 0.5 * sec_w
+                        r_ring = 0.45
+                        r_hole = tl.minimum(0.115, 0.56 * r_ring * tl.sin(half_sec))
+                        rh2 = r_hole * r_hole
+                        hx0 = oc0 + t_min * dlx
+                        hy0 = (oc1 + t_min * dly) / sy
+                        hz0 = (oc2 + t_min * dlz) / sz
+                        rr0 = tl.sqrt(hy0 * hy0 + hz0 * hz0)
+                        ang0 = tl.extra.cuda.libdevice.atan2(hz0, hy0) + mud_ph + half_sec
+                        th0 = (ang0 - tl.floor(ang0 / sec_w) * sec_w) - half_sec
+                        du0 = rr0 * tl.cos(th0) - r_ring
+                        dv0 = rr0 * tl.sin(th0)
+                        perf0 = (tl.abs(hx0) >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < rh2)
+                        hx1 = oc0 + t_max * dlx
+                        hy1 = (oc1 + t_max * dly) / sy
+                        hz1 = (oc2 + t_max * dlz) / sz
+                        rr1 = tl.sqrt(hy1 * hy1 + hz1 * hz1)
+                        ang1 = tl.extra.cuda.libdevice.atan2(hz1, hy1) + mud_ph + half_sec
+                        th1 = (ang1 - tl.floor(ang1 / sec_w) * sec_w) - half_sec
+                        du1 = rr1 * tl.cos(th1) - r_ring
+                        dv1 = rr1 * tl.sin(th1)
+                        perf1 = (tl.abs(hx1) >= sx * 0.92) & ((du1 * du1 + dv1 * dv1) < rh2)
+                        base_ok = base_ok & (~(perf0 & perf1))
+                        t_hit = tl.where(perf0 & (~perf1), t_max, t_hit)
+                    valid = base_ok & (t_hit < tb)
+                    if tl.sum(valid.to(tl.int32), axis=0) > 0:
+                        hx = oc0 + t_hit * dlx
+                        hy = oc1 + t_hit * dly
+                        hz = oc2 + t_hit * dlz
+                        is_cap = tl.abs(hx) >= sx * 0.95
+                        sx_h = tl.where(hx > 0.0, 1.0, tl.where(hx < 0.0, -1.0, 0.0))
+                        nx = tl.where(is_cap, sx_h, 0.0)
+                        ny = tl.where(is_cap, 0.0, hy / (sy * sy))
+                        nz = tl.where(is_cap, 0.0, hz / (sz * sz))
+                        dot_in = nx * dlx + ny * dly + nz * dlz
+                        flip_s = tl.where(dot_in > 0.0, -1.0, 1.0)
+                        nx = nx * flip_s
+                        ny = ny * flip_s
+                        nz = nz * flip_s
+                        n_len = tl.maximum(tl.sqrt(nx * nx + ny * ny + nz * nz), 1e-5)
+                        orig_pid = tl.load(prim_id_ptr + i)
+                        tb = tl.where(valid, t_hit, tb)
+                        best_pid = tl.where(valid, orig_pid, best_pid)
+                        best_hx = tl.where(valid, hx, best_hx)
+                        best_hy = tl.where(valid, hy, best_hy)
+                        best_hz = tl.where(valid, hz, best_hz)
+                        best_nx = tl.where(valid, nx / n_len, best_nx)
+                        best_ny = tl.where(valid, ny / n_len, best_ny)
+                        best_nz = tl.where(valid, nz / n_len, best_nz)
+                        best_cap = tl.where(valid, is_cap, best_cap)
+                else:
+                    # `_SHAPE_TAPER_DRUM_Y`: Exact piecewise truncated double-cone + end-caps
+                    taper = param
+                    ox_n = oc0 / sx
+                    oy_n = oc1 / sy
+                    oz_n = oc2 / sz
+                    dx_n = dlx / sx
+                    dy_n = dly / sy
+                    dz_n = dlz / sz
+                    t_hit = tl.full([256], 1e6, dtype=tl.float32)
+                    hkind = tl.zeros([256], dtype=tl.int32)
+                    # Upper half (+1)
+                    kc1 = taper
+                    qa1 = dx_n * dx_n + dz_n * dz_n - (kc1 * dy_n) * (kc1 * dy_n)
+                    qb1 = ox_n * dx_n + oz_n * dz_n + kc1 * dy_n * (1.0 - kc1 * oy_n)
+                    qc1 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc1 * oy_n) * (1.0 - kc1 * oy_n)
+                    d1 = qb1 * qb1 - qa1 * qc1
+                    sq1 = tl.sqrt(tl.maximum(d1, 0.0))
+                    qcit1 = -(qb1 + tl.where(qb1 >= 0.0, sq1, -sq1))
+                    tr1a = qc1 / tl.where(tl.abs(qcit1) > 1e-12, qcit1, tl.where(qcit1 >= 0.0, 1e-12, -1e-12))
+                    tr1b = qcit1 / tl.where(tl.abs(qa1) > 1e-12, qa1, tl.where(qa1 >= 0.0, 1e-12, -1e-12))
+                    yn1a = oy_n + tr1a * dy_n
+                    ok1a = (d1 >= 0.0) & (tl.abs(qcit1) > 1e-12) & (tr1a > 0.16) & (yn1a >= -1e-4) & (yn1a <= 1.0) & (tr1a < t_hit)
+                    t_hit = tl.where(ok1a, tr1a, t_hit)
+                    hkind = tl.where(ok1a, 1, hkind)
+                    yn1b = oy_n + tr1b * dy_n
+                    ok1b = (d1 >= 0.0) & (tl.abs(qa1) > 1e-12) & (tr1b > 0.16) & (yn1b >= -1e-4) & (yn1b <= 1.0) & (tr1b < t_hit)
+                    t_hit = tl.where(ok1b, tr1b, t_hit)
+                    hkind = tl.where(ok1b, 1, hkind)
+                    # Lower half (-1)
+                    kc2 = -taper
+                    qa2 = dx_n * dx_n + dz_n * dz_n - (kc2 * dy_n) * (kc2 * dy_n)
+                    qb2 = ox_n * dx_n + oz_n * dz_n + kc2 * dy_n * (1.0 - kc2 * oy_n)
+                    qc2 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc2 * oy_n) * (1.0 - kc2 * oy_n)
+                    d2 = qb2 * qb2 - qa2 * qc2
+                    sq2 = tl.sqrt(tl.maximum(d2, 0.0))
+                    qcit2 = -(qb2 + tl.where(qb2 >= 0.0, sq2, -sq2))
+                    tr2a = qc2 / tl.where(tl.abs(qcit2) > 1e-12, qcit2, tl.where(qcit2 >= 0.0, 1e-12, -1e-12))
+                    tr2b = qcit2 / tl.where(tl.abs(qa2) > 1e-12, qa2, tl.where(qa2 >= 0.0, 1e-12, -1e-12))
+                    yn2a = oy_n + tr2a * dy_n
+                    ok2a = (d2 >= 0.0) & (tl.abs(qcit2) > 1e-12) & (tr2a > 0.16) & (yn2a <= 1e-4) & (yn2a >= -1.0) & (tr2a < t_hit)
+                    t_hit = tl.where(ok2a, tr2a, t_hit)
+                    hkind = tl.where(ok2a, -1, hkind)
+                    yn2b = oy_n + tr2b * dy_n
+                    ok2b = (d2 >= 0.0) & (tl.abs(qa2) > 1e-12) & (tr2b > 0.16) & (yn2b <= 1e-4) & (yn2b >= -1.0) & (tr2b < t_hit)
+                    t_hit = tl.where(ok2b, tr2b, t_hit)
+                    hkind = tl.where(ok2b, -1, hkind)
+                    # End-caps (+2, -2)
+                    inv_y = tl.where(tl.abs(dy_n) > 1e-6, 1.0 / dy_n, tl.where(dy_n >= 0.0, 1e6, -1e6))
+                    r_cap2 = (1.0 - taper) * (1.0 - taper)
+                    tcp = (1.0 - oy_n) * inv_y
+                    xcp = ox_n + tcp * dx_n
+                    zcp = oz_n + tcp * dz_n
+                    okcp = (tcp > 0.16) & ((xcp * xcp + zcp * zcp) <= r_cap2) & (tcp < t_hit)
+                    t_hit = tl.where(okcp, tcp, t_hit)
+                    hkind = tl.where(okcp, 2, hkind)
+                    tcm = (-1.0 - oy_n) * inv_y
+                    xcm = ox_n + tcm * dx_n
+                    zcm = oz_n + tcm * dz_n
+                    okcm = (tcm > 0.16) & ((xcm * xcm + zcm * zcm) <= r_cap2) & (tcm < t_hit)
+                    t_hit = tl.where(okcm, tcm, t_hit)
+                    hkind = tl.where(okcm, -2, hkind)
+                    valid = in_roi & (hkind != 0) & (t_hit < tb)
+                    if tl.sum(valid.to(tl.int32), axis=0) > 0:
+                        hx = oc0 + t_hit * dlx
+                        hy = oc1 + t_hit * dly
+                        hz = oc2 + t_hit * dlz
+                        is_cap = (hkind == 2) | (hkind == -2)
+                        k_eff = tl.where(hkind == 1, taper, -taper)
+                        r_eff = tl.maximum(1.0 - k_eff * (hy / sy), 0.05)
+                        nx = tl.where(is_cap, 0.0, hx / (sx * sx))
+                        ny = tl.where(is_cap, tl.where(hkind > 0, 1.0, -1.0), (k_eff * r_eff) / sy)
+                        nz = tl.where(is_cap, 0.0, hz / (sz * sz))
+                        n_len = tl.maximum(tl.sqrt(nx * nx + ny * ny + nz * nz), 1e-5)
+                        orig_pid = tl.load(prim_id_ptr + i)
+                        tb = tl.where(valid, t_hit, tb)
+                        best_pid = tl.where(valid, orig_pid, best_pid)
+                        best_hx = tl.where(valid, hx, best_hx)
+                        best_hy = tl.where(valid, hy, best_hy)
+                        best_hz = tl.where(valid, hz, best_hz)
+                        best_nx = tl.where(valid, nx / n_len, best_nx)
+                        best_ny = tl.where(valid, ny / n_len, best_ny)
+                        best_nz = tl.where(valid, nz / n_len, best_nz)
+                        best_cap = tl.where(valid, is_cap, best_cap)
+
+        tl.store(t_best_ptr + offs, tb, mask=mask)
+        tl.store(pid_ptr + offs, best_pid.to(tl.int16), mask=mask)
+        tl.store(hx_ptr + offs, best_hx, mask=mask)
+        tl.store(hy_ptr + offs, best_hy, mask=mask)
+        tl.store(hz_ptr + offs, best_hz, mask=mask)
+        tl.store(nlx_ptr + offs, best_nx, mask=mask)
+        tl.store(nly_ptr + offs, best_ny, mask=mask)
+        tl.store(nlz_ptr + offs, best_nz, mask=mask)
+        tl.store(is_cap_ptr + offs, best_cap.to(tl.int8), mask=mask)
+
+    @triton.jit
+    def _triton_iso_cyl_drum_kernel(
+        dx_ptr, dy_ptr, dz_ptr,
+        t_best_ptr, veh_ptr,
+        cdata_ptr,     # (P, 22)
+        prim_veh_ptr,  # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        dx = tl.load(dx_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+        dz = tl.load(dz_ptr + offs, mask=mask, other=0.0)
+        tb = tl.load(t_best_ptr + offs, mask=mask, other=1e5)
+        best_v = tl.load(veh_ptr + offs, mask=mask, other=0).to(tl.int32)
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 22
+            u0 = tl.load(cdata_ptr + base + 18)
+            u1 = tl.load(cdata_ptr + base + 19)
+            v0 = tl.load(cdata_ptr + base + 20)
+            v1 = tl.load(cdata_ptr + base + 21)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                in_roi = mask & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1)
+                r00 = tl.load(cdata_ptr + base + 0)
+                r01 = tl.load(cdata_ptr + base + 1)
+                r02 = tl.load(cdata_ptr + base + 2)
+                r10 = tl.load(cdata_ptr + base + 3)
+                r11 = tl.load(cdata_ptr + base + 4)
+                r12 = tl.load(cdata_ptr + base + 5)
+                r20 = tl.load(cdata_ptr + base + 6)
+                r21 = tl.load(cdata_ptr + base + 7)
+                r22 = tl.load(cdata_ptr + base + 8)
+                oc0 = tl.load(cdata_ptr + base + 9)
+                oc1 = tl.load(cdata_ptr + base + 10)
+                oc2 = tl.load(cdata_ptr + base + 11)
+                sx = tl.load(cdata_ptr + base + 12)
+                sy = tl.load(cdata_ptr + base + 13)
+                sz = tl.load(cdata_ptr + base + 14)
+                is_drum = tl.load(cdata_ptr + base + 15)
+                param = tl.load(cdata_ptr + base + 16)
+                mud_ph = tl.load(cdata_ptr + base + 17)
+                dlx = r00 * dx + r01 * dy + r02 * dz
+                dly = r10 * dx + r11 * dy + r12 * dz
+                dlz = r20 * dx + r21 * dy + r22 * dz
+                if is_drum < 0.5:
+                    oy_n = oc1 / sy
+                    oz_n = oc2 / sz
+                    dy_n = dly / sy
+                    dz_n = dlz / sz
+                    qa = tl.maximum(dy_n * dy_n + dz_n * dz_n, 1e-6)
+                    qb = oy_n * dy_n + oz_n * dz_n
+                    qc = oy_n * oy_n + oz_n * oz_n - 1.0
+                    disc = qb * qb - qa * qc
+                    sq = tl.sqrt(tl.maximum(disc, 0.0))
+                    tc0 = (-qb - sq) / qa
+                    tc1 = (-qb + sq) / qa
+                    ix = tl.where(tl.abs(dlx) > 1e-6, 1.0 / dlx, tl.where(dlx >= 0.0, 1e6, -1e6))
+                    tx0 = (-sx - oc0) * ix
+                    tx1 = (sx - oc0) * ix
+                    t_min = tl.maximum(tl.where(disc >= 0.0, tc0, 1e6), tl.minimum(tx0, tx1))
+                    t_max = tl.minimum(tl.where(disc >= 0.0, tc1, -1e6), tl.maximum(tx0, tx1))
+                    t_hit = t_min
+                    base_ok = in_roi & (disc >= 0.0) & (t_min > 0.16) & (t_max >= t_min)
+                    if param >= 3.0:
+                        sec_w = 6.283185307179586 / param
+                        half_sec = 0.5 * sec_w
+                        r_ring = 0.45
+                        r_hole = tl.minimum(0.115, 0.56 * r_ring * tl.sin(half_sec))
+                        rh2 = r_hole * r_hole
+                        hx0 = oc0 + t_min * dlx
+                        hy0 = (oc1 + t_min * dly) / sy
+                        hz0 = (oc2 + t_min * dlz) / sz
+                        rr0 = tl.sqrt(hy0 * hy0 + hz0 * hz0)
+                        ang0 = tl.extra.cuda.libdevice.atan2(hz0, hy0) + mud_ph + half_sec
+                        th0 = (ang0 - tl.floor(ang0 / sec_w) * sec_w) - half_sec
+                        du0 = rr0 * tl.cos(th0) - r_ring
+                        dv0 = rr0 * tl.sin(th0)
+                        perf0 = (tl.abs(hx0) >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < rh2)
+                        hx1 = oc0 + t_max * dlx
+                        hy1 = (oc1 + t_max * dly) / sy
+                        hz1 = (oc2 + t_max * dlz) / sz
+                        rr1 = tl.sqrt(hy1 * hy1 + hz1 * hz1)
+                        ang1 = tl.extra.cuda.libdevice.atan2(hz1, hy1) + mud_ph + half_sec
+                        th1 = (ang1 - tl.floor(ang1 / sec_w) * sec_w) - half_sec
+                        du1 = rr1 * tl.cos(th1) - r_ring
+                        dv1 = rr1 * tl.sin(th1)
+                        perf1 = (tl.abs(hx1) >= sx * 0.92) & ((du1 * du1 + dv1 * dv1) < rh2)
+                        base_ok = base_ok & (~(perf0 & perf1))
+                        t_hit = tl.where(perf0 & (~perf1), t_max, t_hit)
+                    valid = base_ok & (t_hit < tb)
+                else:
+                    taper = param
+                    ox_n, oy_n, oz_n = oc0 / sx, oc1 / sy, oc2 / sz
+                    dx_n, dy_n, dz_n = dlx / sx, dly / sy, dlz / sz
+                    t_hit = tl.full([256], 1e6, dtype=tl.float32)
+                    hit_any = tl.zeros([256], dtype=tl.int1)
+                    kc1 = taper
+                    qa1 = dx_n * dx_n + dz_n * dz_n - (kc1 * dy_n) * (kc1 * dy_n)
+                    qb1 = ox_n * dx_n + oz_n * dz_n + kc1 * dy_n * (1.0 - kc1 * oy_n)
+                    qc1 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc1 * oy_n) * (1.0 - kc1 * oy_n)
+                    d1 = qb1 * qb1 - qa1 * qc1
+                    sq1 = tl.sqrt(tl.maximum(d1, 0.0))
+                    qcit1 = -(qb1 + tl.where(qb1 >= 0.0, sq1, -sq1))
+                    tr1a = qc1 / tl.where(tl.abs(qcit1) > 1e-12, qcit1, tl.where(qcit1 >= 0.0, 1e-12, -1e-12))
+                    tr1b = qcit1 / tl.where(tl.abs(qa1) > 1e-12, qa1, tl.where(qa1 >= 0.0, 1e-12, -1e-12))
+                    yn1a = oy_n + tr1a * dy_n
+                    ok1a = (d1 >= 0.0) & (tl.abs(qcit1) > 1e-12) & (tr1a > 0.16) & (yn1a >= -1e-4) & (yn1a <= 1.0) & (tr1a < t_hit)
+                    t_hit = tl.where(ok1a, tr1a, t_hit)
+                    hit_any = hit_any | ok1a
+                    yn1b = oy_n + tr1b * dy_n
+                    ok1b = (d1 >= 0.0) & (tl.abs(qa1) > 1e-12) & (tr1b > 0.16) & (yn1b >= -1e-4) & (yn1b <= 1.0) & (tr1b < t_hit)
+                    t_hit = tl.where(ok1b, tr1b, t_hit)
+                    hit_any = hit_any | ok1b
+                    kc2 = -taper
+                    qa2 = dx_n * dx_n + dz_n * dz_n - (kc2 * dy_n) * (kc2 * dy_n)
+                    qb2 = ox_n * dx_n + oz_n * dz_n + kc2 * dy_n * (1.0 - kc2 * oy_n)
+                    qc2 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc2 * oy_n) * (1.0 - kc2 * oy_n)
+                    d2 = qb2 * qb2 - qa2 * qc2
+                    sq2 = tl.sqrt(tl.maximum(d2, 0.0))
+                    qcit2 = -(qb2 + tl.where(qb2 >= 0.0, sq2, -sq2))
+                    tr2a = qc2 / tl.where(tl.abs(qcit2) > 1e-12, qcit2, tl.where(qcit2 >= 0.0, 1e-12, -1e-12))
+                    tr2b = qcit2 / tl.where(tl.abs(qa2) > 1e-12, qa2, tl.where(qa2 >= 0.0, 1e-12, -1e-12))
+                    yn2a = oy_n + tr2a * dy_n
+                    ok2a = (d2 >= 0.0) & (tl.abs(qcit2) > 1e-12) & (tr2a > 0.16) & (yn2a <= 1e-4) & (yn2a >= -1.0) & (tr2a < t_hit)
+                    t_hit = tl.where(ok2a, tr2a, t_hit)
+                    hit_any = hit_any | ok2a
+                    yn2b = oy_n + tr2b * dy_n
+                    ok2b = (d2 >= 0.0) & (tl.abs(qa2) > 1e-12) & (tr2b > 0.16) & (yn2b <= 1e-4) & (yn2b >= -1.0) & (tr2b < t_hit)
+                    t_hit = tl.where(ok2b, tr2b, t_hit)
+                    hit_any = hit_any | ok2b
+                    inv_y = tl.where(tl.abs(dy_n) > 1e-6, 1.0 / dy_n, tl.where(dy_n >= 0.0, 1e6, -1e6))
+                    r_cap2 = (1.0 - taper) * (1.0 - taper)
+                    tcp = (1.0 - oy_n) * inv_y
+                    okcp = (tcp > 0.16) & (((ox_n + tcp * dx_n) * (ox_n + tcp * dx_n) + (oz_n + tcp * dz_n) * (oz_n + tcp * dz_n)) <= r_cap2) & (tcp < t_hit)
+                    t_hit = tl.where(okcp, tcp, t_hit)
+                    hit_any = hit_any | okcp
+                    tcm = (-1.0 - oy_n) * inv_y
+                    okcm = (tcm > 0.16) & (((ox_n + tcm * dx_n) * (ox_n + tcm * dx_n) + (oz_n + tcm * dz_n) * (oz_n + tcm * dz_n)) <= r_cap2) & (tcm < t_hit)
+                    t_hit = tl.where(okcm, tcm, t_hit)
+                    hit_any = hit_any | okcm
+                    valid = in_roi & hit_any & (t_hit < tb)
+                orig_v = tl.load(prim_veh_ptr + i)
+                tb = tl.where(valid, t_hit, tb)
+                best_v = tl.where(valid, orig_v, best_v)
+
+        tl.store(t_best_ptr + offs, tb, mask=mask)
+        tl.store(veh_ptr + offs, best_v.to(tl.int16), mask=mask)
+
+    @triton.jit
+    def _triton_cyl_drum_shadow_kernel(
+        wx_ptr, wy_ptr, wz_ptr, lit_ptr, pid_ptr, vis_ptr,
+        scdata_ptr,    # (P, 26): R00..R22(9), cx,cy,cz(3), sx,sy,sz(3), sdlx,sdly,sdlz(3), is_drum(1), param(1), mud_ph(1), z_top(1), u0,u1,v0,v1(4)
+        orig_pid_ptr,  # (P,) int32
+        H, W, P,
+    ):
+        u0_blk = tl.program_id(0) * 16
+        v0_blk = tl.program_id(1) * 16
+        u_max_blk = u0_blk + 15
+        v_max_blk = v0_blk + 15
+        idx = tl.arange(0, 256)
+        dv = idx >> 4
+        du = idx & 15
+        u = u0_blk + du
+        v = v0_blk + dv
+        mask = (u < W) & (v < H)
+        offs = v * W + u
+
+        lit = (tl.load(lit_ptr + offs, mask=mask, other=0) != 0) & mask
+        vis = tl.load(vis_ptr + offs, mask=mask, other=1.0)
+        if tl.sum((lit & (vis > 0.0)).to(tl.int32), axis=0) == 0:
+            return
+        wx = tl.load(wx_ptr + offs, mask=mask, other=0.0)
+        wy = tl.load(wy_ptr + offs, mask=mask, other=0.0)
+        wz = tl.load(wz_ptr + offs, mask=mask, other=0.0)
+        cur_pid = tl.load(pid_ptr + offs, mask=mask, other=-1).to(tl.int32)
+        uf = u.to(tl.float32)
+        vf = v.to(tl.float32)
+
+        for i in range(P):
+            base = i * 26
+            u0 = tl.load(scdata_ptr + base + 22)
+            u1 = tl.load(scdata_ptr + base + 23)
+            v0 = tl.load(scdata_ptr + base + 24)
+            v1 = tl.load(scdata_ptr + base + 25)
+            if (u_max_blk >= u0) & (u0_blk < u1) & (v_max_blk >= v0) & (v0_blk < v1):
+                z_top = tl.load(scdata_ptr + base + 21)
+                sub_cand = lit & (vis > 0.0) & (uf >= u0) & (uf < u1) & (vf >= v0) & (vf < v1) & (wz <= z_top + 0.02)
+                if tl.sum(sub_cand.to(tl.int32), axis=0) > 0:
+                    r00 = tl.load(scdata_ptr + base + 0)
+                    r01 = tl.load(scdata_ptr + base + 1)
+                    r02 = tl.load(scdata_ptr + base + 2)
+                    r10 = tl.load(scdata_ptr + base + 3)
+                    r11 = tl.load(scdata_ptr + base + 4)
+                    r12 = tl.load(scdata_ptr + base + 5)
+                    r20 = tl.load(scdata_ptr + base + 6)
+                    r21 = tl.load(scdata_ptr + base + 7)
+                    r22 = tl.load(scdata_ptr + base + 8)
+                    cx = tl.load(scdata_ptr + base + 9)
+                    cy = tl.load(scdata_ptr + base + 10)
+                    cz = tl.load(scdata_ptr + base + 11)
+                    sx = tl.load(scdata_ptr + base + 12)
+                    sy = tl.load(scdata_ptr + base + 13)
+                    sz = tl.load(scdata_ptr + base + 14)
+                    sdlx = tl.load(scdata_ptr + base + 15)
+                    sdly = tl.load(scdata_ptr + base + 16)
+                    sdlz = tl.load(scdata_ptr + base + 17)
+                    is_drum = tl.load(scdata_ptr + base + 18)
+                    param = tl.load(scdata_ptr + base + 19)
+                    mud_ph = tl.load(scdata_ptr + base + 20)
+
+                    dx_p = wx - cx
+                    dy_p = wy - cy
+                    dz_p = wz - cz
+                    ox_s = r00 * dx_p + r01 * dy_p + r02 * dz_p
+                    oy_s = r10 * dx_p + r11 * dy_p + r12 * dz_p
+                    oz_s = r20 * dx_p + r21 * dy_p + r22 * dz_p
+                    orig_pid = tl.load(orig_pid_ptr + i)
+                    t_self = tl.where(cur_pid == orig_pid, 0.040, 0.005)
+
+                    if is_drum < 0.5:
+                        oy_n = oy_s / sy
+                        oz_n = oz_s / sz
+                        dy_n = sdly / sy
+                        dz_n = sdlz / sz
+                        qa = tl.maximum(dy_n * dy_n + dz_n * dz_n, 1e-6)
+                        qb = oy_n * dy_n + oz_n * dz_n
+                        qc = oy_n * oy_n + oz_n * oz_n - 1.0
+                        disc = qb * qb - qa * qc
+                        sq = tl.sqrt(tl.maximum(disc, 0.0))
+                        tc0 = (-qb - sq) / qa
+                        tc1 = (-qb + sq) / qa
+                        inv_sx = tl.where(tl.abs(sdlx) > 1e-6, 1.0 / sdlx, tl.where(sdlx >= 0.0, 1e6, -1e6))
+                        tx0 = (-sx - ox_s) * inv_sx
+                        tx1 = (sx - ox_s) * inv_sx
+                        tmin_s = tl.maximum(tl.where(disc >= 0.0, tc0, 1e6), tl.minimum(tx0, tx1))
+                        tmax_s = tl.minimum(tl.where(disc >= 0.0, tc1, -1e6), tl.maximum(tx0, tx1))
+                        hit_c = (disc >= 0.0) & (tmax_s >= tl.maximum(tmin_s, t_self))
+                        if param >= 3.0:
+                            sec_w = 6.283185307179586 / param
+                            half_sec = 0.5 * sec_w
+                            r_ring = 0.45
+                            r_hole = tl.minimum(0.115, 0.56 * r_ring * tl.sin(half_sec))
+                            rh2 = r_hole * r_hole
+                            hx0 = ox_s + tmin_s * sdlx
+                            hy0 = (oy_s + tmin_s * sdly) / sy
+                            hz0 = (oz_s + tmin_s * sdlz) / sz
+                            rr0 = tl.sqrt(hy0 * hy0 + hz0 * hz0)
+                            ang0 = tl.extra.cuda.libdevice.atan2(hz0, hy0) + mud_ph + half_sec
+                            th0 = (ang0 - tl.floor(ang0 / sec_w) * sec_w) - half_sec
+                            du0 = rr0 * tl.cos(th0) - r_ring
+                            dv0 = rr0 * tl.sin(th0)
+                            perf0 = (tl.abs(hx0) >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < rh2)
+                            hx1 = ox_s + tmax_s * sdlx
+                            hy1 = (oy_s + tmax_s * sdly) / sy
+                            hz1 = (oz_s + tmax_s * sdlz) / sz
+                            rr1 = tl.sqrt(hy1 * hy1 + hz1 * hz1)
+                            ang1 = tl.extra.cuda.libdevice.atan2(hz1, hy1) + mud_ph + half_sec
+                            th1 = (ang1 - tl.floor(ang1 / sec_w) * sec_w) - half_sec
+                            du1 = rr1 * tl.cos(th1) - r_ring
+                            dv1 = rr1 * tl.sin(th1)
+                            perf1 = (tl.abs(hx1) >= sx * 0.92) & ((du1 * du1 + dv1 * dv1) < rh2)
+                            hit_c = hit_c & (~(perf0 & perf1))
+                        occ = sub_cand & hit_c
+                    else:
+                        taper = param
+                        ox_n, oy_n, oz_n = ox_s / sx, oy_s / sy, oz_s / sz
+                        dx_n, dy_n, dz_n = sdlx / sx, sdly / sy, sdlz / sz
+                        occ_d = tl.zeros([256], dtype=tl.int1)
+                        kc1 = taper
+                        qa1 = dx_n * dx_n + dz_n * dz_n - (kc1 * dy_n) * (kc1 * dy_n)
+                        qb1 = ox_n * dx_n + oz_n * dz_n + kc1 * dy_n * (1.0 - kc1 * oy_n)
+                        qc1 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc1 * oy_n) * (1.0 - kc1 * oy_n)
+                        d1 = qb1 * qb1 - qa1 * qc1
+                        sq1 = tl.sqrt(tl.maximum(d1, 0.0))
+                        qcit1 = -(qb1 + tl.where(qb1 >= 0.0, sq1, -sq1))
+                        tr1a = qc1 / tl.where(tl.abs(qcit1) > 1e-12, qcit1, tl.where(qcit1 >= 0.0, 1e-12, -1e-12))
+                        tr1b = qcit1 / tl.where(tl.abs(qa1) > 1e-12, qa1, tl.where(qa1 >= 0.0, 1e-12, -1e-12))
+                        yn1a = oy_n + tr1a * dy_n
+                        yn1b = oy_n + tr1b * dy_n
+                        occ_d = occ_d | ((d1 >= 0.0) & (tl.abs(qcit1) > 1e-12) & (yn1a >= -1e-4) & (yn1a <= 1.0) & (tr1a >= t_self))
+                        occ_d = occ_d | ((d1 >= 0.0) & (tl.abs(qa1) > 1e-12) & (yn1b >= -1e-4) & (yn1b <= 1.0) & (tr1b >= t_self))
+                        kc2 = -taper
+                        qa2 = dx_n * dx_n + dz_n * dz_n - (kc2 * dy_n) * (kc2 * dy_n)
+                        qb2 = ox_n * dx_n + oz_n * dz_n + kc2 * dy_n * (1.0 - kc2 * oy_n)
+                        qc2 = ox_n * ox_n + oz_n * oz_n - (1.0 - kc2 * oy_n) * (1.0 - kc2 * oy_n)
+                        d2 = qb2 * qb2 - qa2 * qc2
+                        sq2 = tl.sqrt(tl.maximum(d2, 0.0))
+                        qcit2 = -(qb2 + tl.where(qb2 >= 0.0, sq2, -sq2))
+                        tr2a = qc2 / tl.where(tl.abs(qcit2) > 1e-12, qcit2, tl.where(qcit2 >= 0.0, 1e-12, -1e-12))
+                        tr2b = qcit2 / tl.where(tl.abs(qa2) > 1e-12, qa2, tl.where(qa2 >= 0.0, 1e-12, -1e-12))
+                        yn2a = oy_n + tr2a * dy_n
+                        yn2b = oy_n + tr2b * dy_n
+                        occ_d = occ_d | ((d2 >= 0.0) & (tl.abs(qcit2) > 1e-12) & (yn2a <= 1e-4) & (yn2a >= -1.0) & (tr2a >= t_self))
+                        occ_d = occ_d | ((d2 >= 0.0) & (tl.abs(qa2) > 1e-12) & (yn2b <= 1e-4) & (yn2b >= -1.0) & (tr2b >= t_self))
+                        if tl.abs(dy_n) > 1e-6:
+                            r_cap2 = (1.0 - taper) * (1.0 - taper)
+                            tcp = (1.0 - oy_n) / dy_n
+                            occ_d = occ_d | ((tcp >= t_self) & (((ox_n + tcp * dx_n) * (ox_n + tcp * dx_n) + (oz_n + tcp * dz_n) * (oz_n + tcp * dz_n)) <= r_cap2))
+                            tcm = (-1.0 - oy_n) / dy_n
+                            occ_d = occ_d | ((tcm >= t_self) & (((ox_n + tcm * dx_n) * (ox_n + tcm * dx_n) + (oz_n + tcm * dz_n) * (oz_n + tcm * dz_n)) <= r_cap2))
+                        occ = sub_cand & occ_d
+                    vis = tl.where(occ, 0.0, vis)
+
+        tl.store(vis_ptr + offs, vis, mask=mask)
+
 from vpocr_det.types import (
     CLS_PLATE,
     CLS_SIGNBOARD_HARDNEG,
@@ -186,6 +1101,12 @@ class _Prim3D:
     # (decal_idx, proj_face, u_center, v_center, u_half, v_half, relief_strength)
     decal_spec: tuple[int, int, float, float, float, float, float] | None = None
     nir_scale_override: float = 0.0
+    # Gen-7 procedural vehicle livery & organic surface modes:
+    # 0=none, 1=horizontal stripe (sides+rear), 2=two-tone lower skirt,
+    # 3=yellow-black diagonal hazard chevrons, 4=red-white reflective chevrons,
+    # 5=glossy crumpled plastic bag/tarp specular crinkle, 6=dappled sunlit green foliage canopy
+    livery_mode: int = 0
+    livery_rgb: tuple[float, float, float] = (0.04, 0.24, 0.78)
 
 
 @dataclass(slots=True)
@@ -1867,7 +2788,7 @@ def _resolve_torch_device(device: torch.device | str | None) -> torch.device:
 class _GPU3DTextureBank:
     """Cached multi-mipmap linear-HDR texture bank with paired front/rear registrations & domain-split isolation."""
 
-    _BANK_VERSION: int = 6
+    _BANK_VERSION: int = 7
     _CACHE: dict[tuple[int, str, int | None, int, int, str, str, int], _GPU3DTextureBank] = {}
 
     _LEGACY_SIGN_SPEC_COUNT: int = 10
@@ -1970,6 +2891,12 @@ class _GPU3DTextureBank:
         self.sticker_mips: list[tuple[Tensor, Tensor]] = []
         self.alpha_decal_mips: list[tuple[Tensor, Tensor]] = []
         self.decal_font_ids: list[str] = []
+        self.gen7_machinery_sticker_ids: list[int] = []
+        self.gen7_chevron_sticker_ids: list[int] = []
+        self.gen7_expressway_sign_ids: list[int] = []
+        self.gen7_mascot_sign_ids: list[int] = []
+        self.gen7_bag_sign_ids: list[int] = []
+        self.gen7_tv_badges_rgba: list[np.ndarray] = []
         self._build_all(self.seed, self.split, self.domain_split)
 
     @classmethod
@@ -2035,9 +2962,6 @@ class _GPU3DTextureBank:
                 a = (rs[:, : x1 - x0].astype(np.float32) / 255.0)[:, :, None]
                 roi = patch[oy : oy + th, x0:x1].astype(np.float32)
                 patch[oy : oy + th, x0:x1] = np.clip(roi * (1.0 - a) + fg_f * a, 0.0, 255.0).astype(np.uint8)
-        for bx in (int(w * 0.08), int(w * 0.92)):
-            for by in (int(h * 0.16), int(h * 0.84)):
-                cv2.circle(patch, (bx, by), max(2, h // 24), (96, 102, 108), -1, lineType=cv2.LINE_AA)
         return patch
 
     @classmethod
@@ -2256,6 +3180,179 @@ class _GPU3DTextureBank:
         return patch
 
     @staticmethod
+    def _render_chevron_strip_board(variant: int, w: int = 208, h: int = 64) -> np.ndarray:
+        """Render high-contrast yellow-black hazard chevrons or red-white truck reflector strips."""
+        yy, xx = np.meshgrid(
+            np.arange(h, dtype=np.float32),
+            np.arange(w, dtype=np.float32),
+            indexing="ij",
+        )
+        is_red_white = (variant % 2 == 1)
+        if variant >= 2:
+            # Symmetric V-chevron meeting at center
+            diag = np.abs(xx - 0.5 * float(w)) + yy * 1.15
+        else:
+            diag = xx + yy * (1.10 if variant == 0 else -1.10)
+        stripe = np.mod(diag / 26.0, 1.0) < 0.50
+        if is_red_white:
+            c_a = np.array([224, 28, 32], dtype=np.uint8)
+            c_b = np.array([248, 248, 250], dtype=np.uint8)
+        else:
+            c_a = np.array([250, 206, 18], dtype=np.uint8)
+            c_b = np.array([20, 22, 24], dtype=np.uint8)
+        img = np.where(stripe[:, :, None], c_a[None, None, :], c_b[None, None, :]).astype(np.uint8)
+        cv2.rectangle(img, (1, 1), (w - 2, h - 2), (38, 42, 48), 2)
+        return img
+
+    @classmethod
+    def _render_mascot_blob_board(
+        cls,
+        variant: int,
+        w: int = 192,
+        h: int = 96,
+        font_path: str | None = None,
+        cjk_fallback_path: str | None = None,
+    ) -> np.ndarray:
+        """Render colorful Japanese cartoon/mascot rounded decal (`CLS_SIGNBOARD_HARDNEG`)."""
+        specs = (
+            ((248, 246, 236), (246, 138, 174), (28, 92, 168), "ごみ収集車"),
+            ((242, 250, 246), (82, 206, 148), (22, 82, 54), "安全第一"),
+            ((252, 244, 214), (248, 186, 46), (176, 44, 34), "はたらく車"),
+            ((238, 246, 254), (72, 174, 242), (24, 56, 128), "エコ推進"),
+        )
+        bg_c, blob_c, txt_c, label = specs[variant % len(specs)]
+        img = np.empty((h, w, 3), dtype=np.uint8)
+        img[:] = bg_c
+        cv2.rectangle(img, (2, 2), (w - 3, h - 3), blob_c, 3)
+        # Cute rounded cartoon mascot blob on the left
+        cx_m, cy_m = int(w * 0.24), int(h * 0.50)
+        rx_m, ry_m = int(h * 0.34), int(h * 0.32)
+        cv2.ellipse(img, (cx_m, cy_m), (rx_m, ry_m), 0, 0, 360, blob_c, -1, lineType=cv2.LINE_AA)
+        cv2.ellipse(img, (cx_m, cy_m), (rx_m, ry_m), 0, 0, 360, (42, 44, 48), 2, lineType=cv2.LINE_AA)
+        # Ears / accent puffs
+        cv2.circle(img, (cx_m - rx_m // 2, cy_m - ry_m + 3), max(5, ry_m // 3), blob_c, -1, lineType=cv2.LINE_AA)
+        cv2.circle(img, (cx_m + rx_m // 2, cy_m - ry_m + 3), max(5, ry_m // 3), blob_c, -1, lineType=cv2.LINE_AA)
+        # Eyes, rosy cheeks, smile
+        cv2.circle(img, (cx_m - rx_m // 3, cy_m - 4), 4, (24, 26, 30), -1, lineType=cv2.LINE_AA)
+        cv2.circle(img, (cx_m + rx_m // 3, cy_m - 4), 4, (24, 26, 30), -1, lineType=cv2.LINE_AA)
+        cv2.circle(img, (cx_m - rx_m // 2, cy_m + 5), 5, (248, 124, 146), -1, lineType=cv2.LINE_AA)
+        cv2.circle(img, (cx_m + rx_m // 2, cy_m + 5), 5, (248, 124, 146), -1, lineType=cv2.LINE_AA)
+        cv2.ellipse(img, (cx_m, cy_m + 6), (8, 5), 0, 15, 165, (38, 32, 34), 2, lineType=cv2.LINE_AA)
+        # Bold Japanese label on right half
+        fp = font_path or FastPlatePatchRenderer._DEFAULT_BOLD_PATH
+        fb = cjk_fallback_path or FastPlatePatchRenderer._DEFAULT_BOLD_PATH
+        chars = list(label)
+        x_st = int(w * 0.44)
+        span_w = int(w * 0.50)
+        slot_w = span_w / float(max(1, len(chars)))
+        th = int(h * 0.48)
+        oy = (h - th) // 2
+        fg_f = np.array(txt_c, dtype=np.float32)
+        for ci, ch in enumerate(chars):
+            gm = cls._glyph_mask_for_char(ch, fp, fb)
+            tw = max(6, int(round(slot_w * 0.86)))
+            rs = cv2.resize(gm, (tw, th), interpolation=cv2.INTER_AREA)
+            ox = int(round(x_st + ci * slot_w + (slot_w - tw) * 0.5))
+            x0, x1 = max(0, ox), min(w, ox + tw)
+            if x1 > x0:
+                a = (rs[:, : x1 - x0].astype(np.float32) / 255.0)[:, :, None]
+                roi = img[oy : oy + th, x0:x1].astype(np.float32)
+                img[oy : oy + th, x0:x1] = np.clip(roi * (1.0 - a) + fg_f * a, 0.0, 255.0).astype(np.uint8)
+        return img
+
+    @staticmethod
+    def _render_crumpled_bag_tarp_board(variant: int, w: int = 192, h: int = 96) -> np.ndarray:
+        """Render crumpled glossy white/pink plastic bags & vivid blue tarp folds (`CLS_SIGNBOARD_HARDNEG`)."""
+        yy, xx = np.meshgrid(
+            np.linspace(0.0, 1.0, h, dtype=np.float32),
+            np.linspace(0.0, 1.0, w, dtype=np.float32),
+            indexing="ij",
+        )
+        ph = float(variant) * 1.73 + 0.5
+        f1 = np.sin(xx * 17.0 + yy * 13.0 + ph) * np.cos(xx * 11.0 - yy * 19.0 - ph * 0.7)
+        f2 = 0.55 * np.sin(xx * 34.0 - yy * 29.0 + ph * 2.1)
+        f3 = 0.30 * np.cos(xx * 53.0 + yy * 41.0 - ph * 1.3)
+        crinkle = f1 + f2 + f3
+        spec = np.clip((crinkle - 0.55) * 2.4, 0.0, 1.0) ** 2.0
+        shade = np.clip(0.70 + 0.28 * crinkle, 0.28, 1.05)
+        palettes = (
+            (238.0, 240.0, 244.0),  # Glossy crumpled white plastic bag
+            (246.0, 174.0, 202.0),  # Glossy pink plastic bag
+            (26.0, 108.0, 224.0),   # Vivid Japanese blue tarp
+            (234.0, 238.0, 226.0),  # Semi-translucent milky trash bag
+        )
+        base = np.array(palettes[variant % len(palettes)], dtype=np.float32)
+        col = base[None, None, :] * shade[:, :, None] + np.array([255.0, 255.0, 255.0], dtype=np.float32)[None, None, :] * (0.48 * spec[:, :, None])
+        return np.clip(col, 0.0, 255.0).astype(np.uint8)
+
+    @classmethod
+    def _render_tv_corner_badge_rgba(
+        cls,
+        top_tag: str,
+        main_text: str,
+        pill_rgb: tuple[int, int, int],
+        box_rgb: tuple[int, int, int],
+        text_rgb: tuple[int, int, int],
+        accent_rgb: tuple[int, int, int],
+        font_path: str,
+        cjk_fallback_path: str,
+        w: int = 176,
+        h: int = 56,
+    ) -> np.ndarray:
+        """Render crisp rounded Japanese TV broadcast corner badge/chyron as RGBA `(h, w, 4)` uint8."""
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rad = min(14, h // 3)
+        # Rounded rectangle alpha mask
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mask, (rad, 2), (w - rad - 1, h - 3), 255, -1)
+        cv2.rectangle(mask, (2, rad), (w - 3, h - rad - 1), 255, -1)
+        for cx_r in (rad, w - rad - 1):
+            for cy_r in (rad, h - rad - 1):
+                cv2.circle(mask, (cx_r, cy_r), rad - 2, 255, -1, lineType=cv2.LINE_AA)
+        bg = np.empty((h, w, 3), dtype=np.uint8)
+        bg[:] = box_rgb
+        # Top header bar / broadcast pill strip
+        bar_h = max(14, int(h * 0.36))
+        bg[:bar_h, :] = pill_rgb
+        # Outer colorful border
+        border_m = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(border_m, (rad, 2), (w - rad - 1, h - 3), 255, 2)
+        cv2.rectangle(border_m, (2, rad), (w - 3, h - rad - 1), 255, 2)
+        for cx_r in (rad, w - rad - 1):
+            for cy_r in (rad, h - rad - 1):
+                cv2.circle(border_m, (cx_r, cy_r), rad - 2, 255, 2, lineType=cv2.LINE_AA)
+        bg = np.where((border_m > 0)[:, :, None], np.array(accent_rgb, dtype=np.uint8)[None, None, :], bg)
+        # Circular live/mascot icon dot on left of top bar
+        cv2.circle(bg, (13, bar_h // 2), max(4, bar_h // 3), accent_rgb, -1, lineType=cv2.LINE_AA)
+
+        def _draw_row(txt: str, x_st: int, x_en: int, y0: int, rh: int, fg: tuple[int, int, int]) -> None:
+            chars = [c for c in txt if c != " "]
+            if not chars:
+                return
+            span = max(8, x_en - x_st)
+            slot_w = span / float(len(chars))
+            th = max(8, int(rh * 0.78))
+            oy = y0 + max(0, (rh - th) // 2)
+            fg_f = np.array(fg, dtype=np.float32)
+            for ci, ch in enumerate(chars):
+                gm = cls._glyph_mask_for_char(ch, font_path, cjk_fallback_path)
+                tw = max(5, int(round(slot_w * 0.84)))
+                rs = cv2.resize(gm, (tw, th), interpolation=cv2.INTER_AREA)
+                ox = int(round(x_st + ci * slot_w + (slot_w - tw) * 0.5))
+                xa, xb = max(0, ox), min(w, ox + tw)
+                ya, yb = max(0, oy), min(h, oy + th)
+                if xb > xa and yb > ya:
+                    a = (rs[: yb - ya, : xb - xa].astype(np.float32) / 255.0)[:, :, None]
+                    roi = bg[ya:yb, xa:xb].astype(np.float32)
+                    bg[ya:yb, xa:xb] = np.clip(roi * (1.0 - a) + fg_f * a, 0.0, 255.0).astype(np.uint8)
+
+        _draw_row(top_tag, 24, w - 10, 2, bar_h - 2, (252, 252, 254))
+        _draw_row(main_text, 10, w - 10, bar_h + 2, h - bar_h - 4, text_rgb)
+        rgba[:, :, :3] = bg
+        rgba[:, :, 3] = (mask.astype(np.float32) * 0.92).astype(np.uint8)
+        return rgba
+
+    @staticmethod
     def _apply_green_spectral_variant(patch_u8: np.ndarray, variant: int) -> np.ndarray:
         pf = patch_u8.astype(np.float32)
         g_dom = (pf[..., 1] > pf[..., 0] * 1.12) & (pf[..., 2] < 165.0)
@@ -2387,6 +3484,94 @@ class _GPU3DTextureBank:
                 t1_l = F.avg_pool2d(t0_l, kernel_size=2, stride=2, ceil_mode=False)
                 self.sticker_mips.append((t0_l, t1_l))
 
+            # Gen-7 Machinery/Truck Placards (`除雪車`, `清掃車`, `ハイブリッド`, `高圧ガス`, `UH20A-50`, `最大積載量 2000kg`)
+            for mp_i, (mp_txt, mp_bg, mp_fg, mp_bd) in enumerate((
+                ("除雪車", (250, 212, 24), (18, 20, 22), (18, 20, 22)),
+                ("清掃車", (244, 248, 252), (18, 96, 168), (22, 128, 72)),
+                ("最大積載量 2000kg", (248, 248, 246), (20, 22, 26), (20, 22, 26)),
+                ("ハイブリッド", (242, 248, 252), (16, 118, 178), (24, 152, 92)),
+                ("高圧ガス", (18, 20, 24), (250, 214, 28), (250, 214, 28)),
+                ("UH20A-50", (236, 240, 244), (22, 28, 38), (44, 52, 64)),
+                ("作業中注意", (246, 146, 24), (18, 20, 22), (18, 20, 22)),
+            )):
+                _, fp_m = self.font_subset[mp_i % n_fs]
+                u8_mp = self._render_text_board(
+                    mp_txt, 192, 64, mp_bg, mp_fg, mp_bd,
+                    font_path=fp_m, cjk_fallback_path=self.cjk_fallback_path,
+                )
+                t0_m = _srgb_u8_to_linear_tensor(u8_mp, self.device)
+                t1_m = F.avg_pool2d(t0_m, kernel_size=2, stride=2, ceil_mode=False)
+                self.gen7_machinery_sticker_ids.append(len(self.sticker_mips))
+                self.sticker_mips.append((t0_m, t1_m))
+
+            # Gen-7 Yellow-Black Hazard Chevrons & Red-White Reflector Strips
+            for cv_i in range(4):
+                u8_cv = self._render_chevron_strip_board(cv_i, 208, 64)
+                t0_cv = _srgb_u8_to_linear_tensor(u8_cv, self.device)
+                t1_cv = F.avg_pool2d(t0_cv, kernel_size=2, stride=2, ceil_mode=False)
+                self.gen7_chevron_sticker_ids.append(len(self.sticker_mips))
+                self.sticker_mips.append((t0_cv, t1_cv))
+
+            # Gen-7 Green Expressway Signs, Blue Route Shields, & Vibrant Japanese Storefronts (`sign_mips`)
+            for es_i, (es_txt, es_bg, es_fg, es_bd) in enumerate((
+                ("E1 東名 出口", (16, 114, 58), (248, 250, 252), (248, 250, 252)),
+                ("首都高 4号", (16, 114, 58), (248, 250, 252), (248, 250, 252)),
+                ("4", (14, 68, 168), (248, 250, 252), (248, 250, 252)),
+                ("246", (14, 68, 168), (248, 250, 252), (248, 250, 252)),
+                ("ラーメン 営業中", (212, 32, 36), (252, 248, 236), (248, 212, 42)),
+                ("24H ドラッグ", (250, 214, 34), (24, 48, 148), (208, 32, 36)),
+                ("コンビニ 24h", (22, 128, 196), (250, 252, 254), (236, 124, 28)),
+                ("除雪作業区間", (250, 210, 24), (18, 20, 22), (18, 20, 22)),
+            )):
+                _, fp_e = self.font_subset[es_i % n_fs]
+                w_es, h_es = (144, 96) if es_txt in ("4", "246") else (208, 80)
+                u8_es = self._render_text_board(
+                    es_txt, w_es, h_es, es_bg, es_fg, es_bd,
+                    font_path=fp_e, cjk_fallback_path=self.cjk_fallback_path,
+                )
+                t0_es = _srgb_u8_to_linear_tensor(u8_es, self.device)
+                t1_es = F.avg_pool2d(t0_es, kernel_size=2, stride=2, ceil_mode=False)
+                self.gen7_expressway_sign_ids.append(len(self.sign_mips))
+                self.sign_mips.append((t0_es, t1_es))
+
+            # Gen-7 Colorful Cartoon / Mascot Rounded Blobs (`sign_mips`)
+            for mc_i in range(4):
+                _, fp_mc = self.font_subset[mc_i % n_fs]
+                u8_mc = self._render_mascot_blob_board(
+                    mc_i, 192, 96, font_path=fp_mc, cjk_fallback_path=self.cjk_fallback_path
+                )
+                t0_mc = _srgb_u8_to_linear_tensor(u8_mc, self.device)
+                t1_mc = F.avg_pool2d(t0_mc, kernel_size=2, stride=2, ceil_mode=False)
+                self.gen7_mascot_sign_ids.append(len(self.sign_mips))
+                self.sign_mips.append((t0_mc, t1_mc))
+
+            # Gen-7 Crumpled Glossy Plastic Bag & Blue Tarp Distractor Panels (`sign_mips`)
+            for bg_i in range(4):
+                u8_bg = self._render_crumpled_bag_tarp_board(bg_i, 192, 96)
+                t0_bg = _srgb_u8_to_linear_tensor(u8_bg, self.device)
+                t1_bg = F.avg_pool2d(t0_bg, kernel_size=2, stride=2, ceil_mode=False)
+                self.gen7_bag_sign_ids.append(len(self.sign_mips))
+                self.sign_mips.append((t0_bg, t1_bg))
+
+            # Gen-7 2D Post-Render TV Broadcast Corner Badges (rounded Japanese text overlays!)
+            tv_badge_specs = (
+                ("LIVE 現場中継", "国道246号 ライブ", (212, 28, 36), (24, 32, 54), (248, 250, 252), (248, 208, 42)),
+                ("特集", "はたらくくるま大集合", (246, 146, 22), (254, 248, 224), (24, 42, 96), (236, 64, 96)),
+                ("密着24時", "除雪作業 現場レポート", (22, 112, 208), (246, 250, 254), (20, 44, 108), (52, 196, 242)),
+                ("NEWS 24", "交通・道路カメラ", (196, 24, 34), (244, 246, 250), (22, 28, 42), (196, 24, 34)),
+                ("4K ドライブ", "東京 街角スナップ", (232, 74, 134), (252, 244, 248), (44, 32, 68), (250, 196, 46)),
+                ("CH.04", "午前 10:25 晴れ", (24, 132, 78), (242, 250, 244), (20, 62, 42), (246, 196, 38)),
+                ("街の働く車", "清掃車・ダンプ特集", (38, 92, 182), (252, 246, 212), (24, 30, 46), (242, 124, 24)),
+                ("生放送", "高速道路 渋滞情報", (204, 36, 42), (28, 34, 46), (248, 248, 246), (72, 218, 128)),
+            )
+            for tv_i, (t_tag, t_main, p_c, b_c, tx_c, ac_c) in enumerate(tv_badge_specs):
+                _, fp_tv = self.font_subset[tv_i % n_fs]
+                self.gen7_tv_badges_rgba.append(
+                    self._render_tv_corner_badge_rgba(
+                        t_tag, t_main, p_c, b_c, tx_c, ac_c, fp_tv, self.cjk_fallback_path, w=176, h=54
+                    )
+                )
+
         # Build frameless 1..3-row RGBA alpha-paint & relief stencils exclusively with this domain_split's font subset!
         alpha_specs_use = self.ALPHA_STENCIL_SPECS if is_train_dom else self.ALPHA_STENCIL_SPECS[: self._LEGACY_ALPHA_STENCIL_COUNT]
         for dec_i, (rows_t, fg_col) in enumerate(alpha_specs_use):
@@ -2406,25 +3591,28 @@ class _GPU3DTextureBank:
         rng = random.Random(split_seed + 9191)
         rng_comm = random.Random(split_seed + 424291)
         if is_train_dom:
-            # ~42% (10 / 24 = 41.7%) STANDARD_COMMERCIAL + KEI_COMMERCIAL share in `train` strata
+            # Balanced Japanese fleet plate color distribution across standard private (white),
+            # standard commercial (green), kei private (yellow), kei commercial (black), and 8/9/0 special (mixed white/green).
             strata: list[tuple[str, PlateType, PlateSize, bool]] = (
-                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 4
-                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 2
+                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 3
+                + [("special_8_9", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 2
+                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 1
                 + [("med_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
                 + [("kei_comm", PlateType.KEI_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
-                + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 2
-                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 7
-                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 4
+                + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 3
+                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 8
+                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 5
                 + [("med_priv", PlateType.GRAPHIC, PlateSize.MEDIUM, False)] * 1
             )
         else:
             strata = (
-                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 6
+                [("heavy_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 4
                 + [("heavy_priv", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 3
-                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 2
+                + [("special_8_9", PlateType.STANDARD_PRIVATE, PlateSize.LARGE, False)] * 2
+                + [("special_8_9", PlateType.STANDARD_COMMERCIAL, PlateSize.LARGE, False)] * 1
                 + [("med_comm", PlateType.STANDARD_COMMERCIAL, PlateSize.MEDIUM, False)] * 3
-                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 5
-                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 3
+                + [("med_priv", PlateType.STANDARD_PRIVATE, PlateSize.MEDIUM, False)] * 6
+                + [("kei_priv", PlateType.KEI_PRIVATE, PlateSize.MEDIUM, False)] * 4
                 + [("kei_comm", PlateType.KEI_COMMERCIAL, PlateSize.MEDIUM, False)] * 2
                 + [("med_priv", PlateType.GRAPHIC, PlateSize.MEDIUM, False)] * 1
             )
@@ -2619,6 +3807,14 @@ class _VehiclePassSpec:
     cavity_sky_ao_rear: float = 1.0
     cavity_sky_ao_front: float = 1.0
     nir_paint_refl: float = 0.0
+    # Gen-7 (`v1.0.0`) livery, heavy machinery side/mid-hood plates, rear chevrons & hopper bags
+    livery_mode: int = 0
+    livery_rgb: tuple[float, float, float] = (0.04, 0.24, 0.78)
+    machinery_side_hood_plate: bool = False
+    machinery_placard_idx: int = -1
+    has_rear_chevron: bool = False
+    has_hopper_bags: bool = False
+    white_recess_pocket: bool = False
 
     def signed_speed_at(self, t: float) -> float:
         """Signed longitudinal speed `s(t)` along vehicle forward axis `+Y` (continuous piecewise-linear)."""
@@ -2775,20 +3971,20 @@ ARCHETYPE_CATALOG: tuple[tuple[str, int, float], ...] = (
 )
 
 TRAIN_V7_ARCHETYPE_CATALOG: tuple[tuple[str, int, float], ...] = (
-    # Everyday passenger = 48.0%
-    ("sedan", SUBTYPE_PASSENGER_KEI, 0.120),
-    ("hatchback_compact", SUBTYPE_PASSENGER_KEI, 0.080),
-    ("minivan_1box_jp", SUBTYPE_PASSENGER_KEI, 0.110),
-    ("kei_tall_wagon", SUBTYPE_PASSENGER_KEI, 0.060),
-    ("kei_crossover", SUBTYPE_PASSENGER_KEI, 0.050),
-    ("suv_4wd", SUBTYPE_PASSENGER_KEI, 0.060),
-    # Buses = 10.0% (unified single CLS_VEHICLE, subtype_unknown = NUM_VEHICLE_SUBTYPES)
-    ("city_route_bus", NUM_VEHICLE_SUBTYPES, 0.040),
-    ("highway_coach_bus", NUM_VEHICLE_SUBTYPES, 0.035),
-    ("microbus", NUM_VEHICLE_SUBTYPES, 0.025),
-    # Commercial vans / trucks / heavy machinery = 42.0%
-    ("hiace_van", SUBTYPE_VAN_KEITRUCK, 0.070),
-    ("kei_truck", SUBTYPE_VAN_KEITRUCK, 0.050),
+    # Everyday passenger = 44.0%
+    ("sedan", SUBTYPE_PASSENGER_KEI, 0.105),
+    ("hatchback_compact", SUBTYPE_PASSENGER_KEI, 0.070),
+    ("minivan_1box_jp", SUBTYPE_PASSENGER_KEI, 0.100),
+    ("kei_tall_wagon", SUBTYPE_PASSENGER_KEI, 0.085),
+    ("kei_crossover", SUBTYPE_PASSENGER_KEI, 0.065),
+    ("suv_4wd", SUBTYPE_PASSENGER_KEI, 0.050),
+    # Buses = 8.0% (unified single CLS_VEHICLE, subtype_unknown = NUM_VEHICLE_SUBTYPES)
+    ("city_route_bus", NUM_VEHICLE_SUBTYPES, 0.032),
+    ("highway_coach_bus", NUM_VEHICLE_SUBTYPES, 0.028),
+    ("microbus", NUM_VEHICLE_SUBTYPES, 0.020),
+    # Commercial vans / trucks / heavy machinery = 46.5%
+    ("hiace_van", SUBTYPE_VAN_KEITRUCK, 0.080),
+    ("kei_truck", SUBTYPE_VAN_KEITRUCK, 0.065),
     ("box_wing_truck", SUBTYPE_BOX_TRUCK, 0.070),
     ("flatbed_truck", SUBTYPE_FLATBED_CARGO, 0.040),
     ("concrete_mixer", SUBTYPE_CONCRETE_MIXER, 0.040),
@@ -2796,7 +3992,8 @@ TRAIN_V7_ARCHETYPE_CATALOG: tuple[tuple[str, int, float], ...] = (
     ("deep_dump", SUBTYPE_DUMP_TRUCK, 0.015),
     ("cargo_crane_truck", SUBTYPE_CRANE_HEAVY, 0.030),
     ("garbage_packer", SUBTYPE_TANKER_SPECIAL, 0.025),
-    ("wheel_loader", SUBTYPE_CRANE_HEAVY, 0.015),
+    ("wheel_loader", SUBTYPE_CRANE_HEAVY, 0.030),
+    ("rough_terrain_crane", SUBTYPE_CRANE_HEAVY, 0.015),
     ("semi_container_trailer", SUBTYPE_TRACTOR_TRAILER, 0.010),
     ("tractor_head", SUBTYPE_TRACTOR_TRAILER, 0.010),
     ("tanker_lorry", SUBTYPE_TANKER_SPECIAL, 0.005),
@@ -3529,6 +4726,8 @@ def _assemble_vehicle_3d(
                     clearcoat=max(0.55, spec.paint_clearcoat),
                     normal_undul_amp=0.014,
                     decal_spec=van_decal,
+                    livery_mode=int(spec.livery_mode),
+                    livery_rgb=spec.livery_rgb,
                 )
             )
 
@@ -3884,7 +5083,7 @@ def _assemble_vehicle_3d(
         rear_plate_local_z = chassis_z * 0.92
 
     elif is_wheel_loader:
-        # Articulated wheel loader (`ホイールローダー`): central ROPS cab + rear counterweight + front lift arms & bucket!
+        # Articulated wheel loader (`ホイールローダー`): central ROPS cab + rear counterweight/engine hood + lift arms & bucket!
         cw_hl = hl * 0.34
         cw_h = max(0.85, (spec.body_h_m - chassis_z) * 0.56)
         cw_c = _to_world(0.0, -hl + cw_hl, chassis_z + 0.18 + 0.5 * cw_h)
@@ -3897,14 +5096,32 @@ def _assemble_vehicle_3d(
                 veh_idx=veh_idx,
                 role=_ROLE_BODY,
                 albedo_rgb=spec.paint_lin,
-                roughness=0.38,
+                roughness=0.34,
                 rib_freq=8.0,
-                mud_level=max(0.18, spec.mud_level),
+                mud_level=max(0.14, spec.mud_level),
                 mud_phase=spec.mud_phase,
-                metallic=0.22,
-                decal_spec=((dec_i + 4) % n_dec_bank, 0, 0.0, 0.0, 0.45, 0.34, max(0.0, dec_rel)),
+                metallic=0.20,
+                clearcoat=0.42,
+                decal_spec=None if spec.machinery_side_hood_plate else ((dec_i + 4) % n_dec_bank, 0, 0.0, 0.0, 0.45, 0.34, max(0.0, dec_rel)),
             )
         )
+        # Yellow-black diagonal hazard chevron counterweight strip across lower rear of wheel loader
+        if spec.is_train_v7:
+            chv_c = _to_world(0.0, -hl + 0.08, chassis_z * 0.80)
+            prims.append(
+                _Prim3D(
+                    center=(float(chv_c[0]), float(chv_c[1]), float(chv_c[2])),
+                    rot_w2l=RT,
+                    half_ext=(hw * 0.85, 0.10, 0.14),
+                    shape=_SHAPE_OBB,
+                    veh_idx=veh_idx,
+                    role=_ROLE_BODY,
+                    albedo_rgb=(0.92, 0.72, 0.04),
+                    roughness=0.30,
+                    livery_mode=3,
+                    livery_rgb=(0.03, 0.03, 0.04),
+                )
+            )
         # Central elevated ROPS operator cab
         cab_wl_z0 = chassis_z + 0.32
         cab_wl_h = max(0.95, spec.cab_h_m - cab_wl_z0)
@@ -3937,7 +5154,7 @@ def _assemble_vehicle_3d(
                     veh_idx=veh_idx,
                     role=_ROLE_BODY,
                     albedo_rgb=spec.paint_lin,
-                    roughness=0.40,
+                    roughness=0.38,
                     metallic=0.28,
                 )
             )
@@ -3960,7 +5177,12 @@ def _assemble_vehicle_3d(
         front_plate_local_y = hl * 0.16
         front_plate_local_z = cab_wl_z0 + cab_wl_h - 0.16
         rear_plate_local_y = -hl - 0.032
-        rear_plate_local_z = chassis_z + 0.32
+        if spec.is_train_v7 and spec.machinery_side_hood_plate:
+            # Mid-height off-center rear counterweight plate beside large warning placard (`除雪車` etc.)
+            rear_plate_local_z = chassis_z + 0.36 + 0.40 * cw_h
+            rear_plate_local_x = (-1.0 if (spec.track_id % 2 == 0) else 1.0) * hw * 0.34
+        else:
+            rear_plate_local_z = chassis_z + 0.32
 
     else:
         # Cab-over-engine Japanese truck / medium-duty cab / kei-truck / sleeper tractor / right-offset crane cab
@@ -4180,6 +5402,33 @@ def _assemble_vehicle_3d(
                         phase=spec.mud_phase,
                     )
                 )
+            elif spec.is_train_v7 and spec.has_hopper_bags:
+                # Glossy crumpled white/pink plastic bags & blue tarp lobes inside open dump hopper (`_ROLE_BODY`)
+                for bg_i, (bx_off, by_off, b_rad, b_col) in enumerate(
+                    (
+                        (-hw * 0.42, bed_cy - bed_hl * 0.35, 0.34, (0.94, 0.95, 0.96)),
+                        (hw * 0.34, bed_cy - bed_hl * 0.10, 0.30, (0.96, 0.66, 0.78)),
+                        (-hw * 0.04, bed_cy + bed_hl * 0.28, 0.36, (0.04, 0.24, 0.76)),
+                    )
+                ):
+                    bg_c = _to_world(bx_off, by_off, chassis_z + 0.30 + bed_h + b_rad * 0.42)
+                    prims.append(
+                        _Prim3D(
+                            center=(float(bg_c[0]), float(bg_c[1]), float(bg_c[2])),
+                            rot_w2l=(R @ _rot_zyx(0.45 * bg_i + spec.mud_phase, 0.16, 0.22)).T.copy(),
+                            half_ext=(b_rad * 1.15, b_rad * 0.92, b_rad * 0.62),
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=veh_idx,
+                            role=_ROLE_BODY,
+                            albedo_rgb=b_col,
+                            roughness=0.14,
+                            slope_param=0.52,
+                            clearcoat=0.78,
+                            mud_phase=spec.mud_phase + float(bg_i) * 1.9,
+                            normal_undul_amp=0.11,
+                            livery_mode=5,
+                        )
+                    )
             # Side Z^2 ladder on left dump vessel flank
             lad_w = _to_world(-(hw * 0.99 + 0.025), bed_y1 - 0.52, bed_cz)
             prims.extend(
@@ -4210,6 +5459,7 @@ def _assemble_vehicle_3d(
                     roughness=rb_rough,
                     metallic=rb_met,
                     clearcoat=rb_coat,
+                    livery_mode=(3 if (spec.track_id % 2 == 0) else 4) if (spec.is_train_v7 and spec.has_rear_chevron) else 0,
                 )
             )
             rear_plate_local_y = -hl + 0.34   # Recessed 34cm underneath overhanging 3D dump tailgate!
@@ -4791,6 +6041,8 @@ def _assemble_vehicle_3d(
                     clearcoat=0.68 if spec.is_smooth_frp_box else 0.30,
                     normal_undul_amp=0.022,
                     decal_spec=box_decal,
+                    livery_mode=int(spec.livery_mode) if spec.is_smooth_frp_box else 0,
+                    livery_rgb=spec.livery_rgb,
                 )
             )
             box_top_z = chassis_z + 0.18 + box_h
@@ -4863,6 +6115,7 @@ def _assemble_vehicle_3d(
                         roughness=rb_rough,
                         metallic=rb_met,
                         clearcoat=rb_coat,
+                        livery_mode=(3 if (spec.track_id % 2 == 0) else 4) if (spec.is_train_v7 and spec.has_rear_chevron) else 0,
                     )
                 )
                 rear_plate_local_y = -hl + 0.24
@@ -4881,6 +6134,7 @@ def _assemble_vehicle_3d(
                         roughness=rb_rough,
                         metallic=rb_met,
                         clearcoat=rb_coat,
+                        livery_mode=(3 if (spec.track_id % 2 == 0) else 4) if (spec.is_train_v7 and spec.has_rear_chevron) else 0,
                     )
                 )
                 rear_plate_local_y = -hl + 0.20
@@ -4933,6 +6187,35 @@ def _assemble_vehicle_3d(
                     decal_spec=(hop_dec_i, 1, 0.0, 0.14, 0.46, 0.28, 0.0),
                 )
             )
+            # Crumpled glossy white/pink plastic bags & blue tarp peeking inside open garbage packer hopper!
+            if spec.is_train_v7 and spec.has_hopper_bags:
+                bag_cols = (
+                    (0.92, 0.93, 0.95),  # glossy white plastic bag
+                    (0.94, 0.52, 0.68),  # glossy pink plastic bag
+                    (0.03, 0.24, 0.80),  # vivid blue tarp
+                )
+                for bi_h, (bx_h, by_h, bz_h, bh_r) in enumerate((
+                    (-hw * 0.36, -hl + 0.16, chassis_z + 0.52, (0.28, 0.24, 0.24)),
+                    (hw * 0.32, -hl + 0.18, chassis_z + 0.56, (0.26, 0.22, 0.22)),
+                    (0.02, -hl + 0.20, chassis_z + 0.68, (0.30, 0.24, 0.25)),
+                )):
+                    bag_c = _to_world(bx_h, by_h, bz_h)
+                    prims.append(
+                        _Prim3D(
+                            center=(float(bag_c[0]), float(bag_c[1]), float(bag_c[2])),
+                            rot_w2l=RT,
+                            half_ext=bh_r,
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=veh_idx,
+                            role=_ROLE_BODY,
+                            albedo_rgb=bag_cols[(bi_h + spec.track_id) % len(bag_cols)],
+                            roughness=0.14,
+                            clearcoat=0.88,
+                            mud_phase=spec.mud_phase + 1.3 * bi_h,
+                            slope_param=0.42,
+                            livery_mode=5,
+                        )
+                    )
             rear_plate_local_y = -hl + 0.22
             rear_plate_local_z = chassis_z * 0.78
 
@@ -5031,7 +6314,7 @@ def _assemble_vehicle_3d(
                         )
                     )
                 rb_role, rb_alb, rb_rough, rb_met, rb_coat = _rear_bumper_style_props()
-                rb_c = _to_world(0.0, -hl + 0.30, chassis_z * 0.74)
+                rb_c = _to_world(0.0, -hl + 0.16, chassis_z * 0.74)
                 prims.append(
                     _Prim3D(
                         center=(float(rb_c[0]), float(rb_c[1]), float(rb_c[2])),
@@ -5044,6 +6327,7 @@ def _assemble_vehicle_3d(
                         roughness=rb_rough,
                         metallic=rb_met,
                         clearcoat=rb_coat,
+                        livery_mode=(3 if (spec.track_id % 2 == 0) else 4) if (spec.is_train_v7 and spec.has_rear_chevron) else 0,
                     )
                 )
             elif arch == "kei_truck" and (spec.has_flex_sheet or spec.veh_struct_prod == "flex_wave_sheet"):
@@ -5063,7 +6347,33 @@ def _assemble_vehicle_3d(
                         phase=spec.mud_phase,
                     )
                 )
-            rear_plate_local_y = -hl + (0.04 if arch == "kei_truck" else 0.16)
+            if spec.is_train_v7 and spec.has_hopper_bags:
+                for bg_i, (bx_off, by_off, b_rad, b_col) in enumerate(
+                    (
+                        (-hw * 0.36, bed_cy - bed_hl * 0.25, 0.24 if arch == "kei_truck" else 0.32, (0.95, 0.96, 0.97)),
+                        (hw * 0.32, bed_cy + bed_hl * 0.15, 0.22 if arch == "kei_truck" else 0.30, (0.96, 0.64, 0.76)),
+                        (0.0, bed_cy - bed_hl * 0.52, 0.22 if arch == "kei_truck" else 0.30, (0.04, 0.24, 0.78)),
+                    )
+                ):
+                    bg_c = _to_world(bx_off, by_off, chassis_z + 0.14 + gate_h + b_rad * 0.45)
+                    prims.append(
+                        _Prim3D(
+                            center=(float(bg_c[0]), float(bg_c[1]), float(bg_c[2])),
+                            rot_w2l=(R @ _rot_zyx(0.55 * bg_i + spec.mud_phase, 0.15, 0.20)).T.copy(),
+                            half_ext=(b_rad * 1.10, b_rad * 0.90, b_rad * 0.60),
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=veh_idx,
+                            role=_ROLE_BODY,
+                            albedo_rgb=b_col,
+                            roughness=0.14,
+                            slope_param=0.50,
+                            clearcoat=0.76,
+                            mud_phase=spec.mud_phase + float(bg_i) * 1.7,
+                            normal_undul_amp=0.11,
+                            livery_mode=5,
+                        )
+                    )
+            rear_plate_local_y = -hl + (0.04 if arch == "kei_truck" else 0.02)
             rear_plate_local_z = chassis_z * 0.80
 
         # Side cab-door company/fleet decal or bolted non-plate bracket (`CLS_SIGNBOARD_HARDNEG`, `SIDE_PURE_SIDE`)
@@ -5206,7 +6516,8 @@ def _assemble_vehicle_3d(
             (rp_x - rp_pw, rp_x + rp_pw, rear_plate_local_z - rp_ph, rear_plate_local_z + rp_ph)
         ]
         deep_recess_r = bool(spec.is_train_v7 and spec.cavity_sky_ao_rear < 0.5)
-        if is_heavy or spec.veh_struct_prod == "csg_recess_cavity" or deep_recess_r:
+        if is_heavy or spec.veh_struct_prod == "csg_recess_cavity" or deep_recess_r or spec.white_recess_pocket:
+            use_white_cav = bool(spec.is_train_v7 and spec.white_recess_pocket and is_pass_arch)
             prims.extend(
                 _prod_csg_recess_cavity(
                     pos_w=pos,
@@ -5215,14 +6526,16 @@ def _assemble_vehicle_3d(
                     half_w=rp_pw,
                     half_h=rp_ph,
                     outward_sign_y=-1.0,
-                    top_lip_out_m=0.074 if deep_recess_r else 0.017,
-                    cheek_out_m=0.032 if deep_recess_r else 0.006,
+                    top_lip_out_m=0.052 if use_white_cav else (0.074 if deep_recess_r else 0.017),
+                    cheek_out_m=0.024 if use_white_cav else (0.032 if deep_recess_r else 0.006),
                     inward_depth_m=0.095,
-                    top_clear_z_m=0.032 if deep_recess_r else 0.102,
+                    top_clear_z_m=0.036 if (deep_recess_r or use_white_cav) else 0.102,
                     cheek_clear_x_m=0.038,
                     veh_idx=veh_idx,
-                    role=_ROLE_DARK_CHASSIS,
-                    albedo_rgb=(0.045, 0.048, 0.052),
+                    role=_ROLE_BODY if use_white_cav else _ROLE_DARK_CHASSIS,
+                    albedo_rgb=spec.paint_lin if use_white_cav else (0.045, 0.048, 0.052),
+                    roughness=0.18 if use_white_cav else 0.48,
+                    clearcoat=0.62 if use_white_cav else 0.18,
                 )
             )
         rp_c = _to_world(rp_x, rear_plate_local_y, rear_plate_local_z)
@@ -5250,6 +6563,116 @@ def _assemble_vehicle_3d(
                 cavity_sky_ao=float(spec.cavity_sky_ao_rear),
             )
         )
+
+        # Gen-7 Heavy Construction Machinery Side-of-Rear-Engine-Hood Plate & Warning Placard (`除雪車`, etc.)!
+        _side_hood_archs = (
+            "wheel_loader", "rough_terrain_crane", "dump_10t", "deep_dump",
+            "garbage_packer", "cargo_crane_truck", "box_wing_truck", "flatbed_truck",
+        )
+        if spec.is_train_v7 and spec.machinery_side_hood_plate and (arch in _side_hood_archs):
+            side_sgn_m = -1.0 if (spec.track_id % 2 == 0) else 1.0
+            hood_hw_m = (hw * 0.86) if is_wheel_loader else ((hw * 0.98) if is_rt_crane else (hw * 0.99))
+            side_p_ly = -hl + (0.34 * hl * 0.34 if is_wheel_loader else 0.48)
+            side_p_lz = chassis_z + (0.72 if is_wheel_loader else (0.48 if is_rt_crane else 0.86))
+            sp_c = _to_world(side_sgn_m * (hood_hw_m + 0.022), side_p_ly, side_p_lz)
+            sp_n = R @ np.array([side_sgn_m, 0.0, -0.02], dtype=np.float32)
+            quads.append(
+                _make_planar_quad(
+                    sp_c,
+                    sp_n,
+                    rp_pw,
+                    rp_ph,
+                    ("plate_rear", spec.rear_plate_idx),
+                    CLS_PLATE,
+                    veh_idx,
+                    up_hint_w=up_body,
+                    plate_side=SIDE_PURE_SIDE,
+                    retro_gain=float(rp_meta["retro_gain"]),
+                    is_green_plate=bool(rp_meta["is_green"]),
+                    is_large_plate=bool(rp_meta["is_large"]),
+                    plate_text_str=str(rp_meta["plate_text_str"]),
+                    plate_type_str=str(rp_meta["plate_type_str"]),
+                    roughness=0.26,
+                    clearcoat=0.38,
+                    specular_f0=0.04,
+                    normal_undul_amp=0.022,
+                )
+            )
+            # Large warning placard (`除雪車`, `清掃車`, `作業中注意`, `高圧ガス`) mounted forward on side hood (`ly > side_p_ly + 0.65m`)!
+            if bank.gen7_machinery_sticker_ids:
+                mp_idx_s = bank.gen7_machinery_sticker_ids[int(spec.machinery_placard_idx) % len(bank.gen7_machinery_sticker_ids)]
+                pl_ly = side_p_ly + max(0.72, rp_pw + 0.44)
+                pl_c = _to_world(side_sgn_m * (hood_hw_m + 0.014), pl_ly, side_p_lz + 0.04)
+                pl_n = R @ np.array([side_sgn_m, 0.0, 0.0], dtype=np.float32)
+                quads.append(
+                    _make_planar_quad(
+                        pl_c,
+                        pl_n,
+                        0.32,
+                        0.11,
+                        ("sticker", mp_idx_s),
+                        CLS_SIGNBOARD_HARDNEG,
+                        veh_idx,
+                        up_hint_w=up_body,
+                        plate_side=SIDE_PURE_SIDE,
+                        retro_gain=0.95,
+                        roughness=0.28,
+                        clearcoat=0.35,
+                    )
+                )
+            # Also place a large machinery warning placard on the rear counterweight/door beside the rear plate!
+            if bank.gen7_machinery_sticker_ids:
+                mp_idx_r = bank.gen7_machinery_sticker_ids[(int(spec.machinery_placard_idx) + 1) % len(bank.gen7_machinery_sticker_ids)]
+                rmp_pw, rmp_ph = 0.28, 0.095
+                rmp_z = rear_plate_local_z + (0.02 if is_wheel_loader else 0.36)
+                rmp_cands = (-hw * 0.42, hw * 0.42, 0.0) if rp_x >= 0.0 else (hw * 0.42, -hw * 0.42, 0.0)
+                rmp_x_ok = _try_place_face_patch(rear_boxes_xz, rmp_cands, rmp_z, rmp_pw, rmp_ph, hw - 0.04)
+                if rmp_x_ok is not None:
+                    rmp_c = _to_world(rmp_x_ok, rear_plate_local_y + 0.024, rmp_z)
+                    rmp_n = R @ np.array([0.0, -1.0, 0.0], dtype=np.float32)
+                    quads.append(
+                        _make_planar_quad(
+                            rmp_c,
+                            rmp_n,
+                            rmp_pw,
+                            rmp_ph,
+                            ("sticker", mp_idx_r),
+                            CLS_SIGNBOARD_HARDNEG,
+                            veh_idx,
+                            up_hint_w=up_body,
+                            plate_side=SIDE_REAR,
+                            retro_gain=0.95,
+                            roughness=0.28,
+                            clearcoat=0.35,
+                        )
+                    )
+
+        # Gen-7 Yellow-Black Hazard Chevron / Red-White Reflector Strip on truck/machinery rear (`CLS_SIGNBOARD_HARDNEG`)
+        if spec.is_train_v7 and spec.has_rear_chevron and bank.gen7_chevron_sticker_ids and (not is_pass_arch):
+            chv_idx_r = bank.gen7_chevron_sticker_ids[int(spec.track_id) % len(bank.gen7_chevron_sticker_ids)]
+            chv_pw, chv_ph = min(0.36, hw * 0.32), 0.075
+            chv_z = rear_plate_local_z + (0.28 if is_wheel_loader else 0.24)
+            chv_cands = (-hw * 0.56, hw * 0.56, 0.0) if rp_x >= 0.0 else (hw * 0.56, -hw * 0.56, 0.0)
+            chv_x_ok = _try_place_face_patch(rear_boxes_xz, chv_cands, chv_z, chv_pw, chv_ph, hw - 0.03)
+            if chv_x_ok is not None:
+                chv_c_q = _to_world(chv_x_ok, rear_plate_local_y + 0.024, chv_z)
+                chv_n_q = R @ np.array([0.0, -1.0, 0.0], dtype=np.float32)
+                quads.append(
+                    _make_planar_quad(
+                        chv_c_q,
+                        chv_n_q,
+                        chv_pw,
+                        chv_ph,
+                        ("sticker", chv_idx_r),
+                        CLS_SIGNBOARD_HARDNEG,
+                        veh_idx,
+                        up_hint_w=up_body,
+                        plate_side=SIDE_REAR,
+                        retro_gain=1.25,
+                        roughness=0.24,
+                        clearcoat=0.40,
+                    )
+                )
 
         # Vehicle-mounted placards & bolted/framed blank non-plate brackets
         # (strictly disjoint in `(X, Z)` with `>= 6.5 cm` margin AND strictly recessed inward behind real plate planes!)
@@ -5398,12 +6821,14 @@ def _assemble_vehicle_3d(
 
         # Emit conformal frameless painted `_Prim3D.decal_spec` rectangles as `CLS_SIGNBOARD_HARDNEG` quads
         # (appended AFTER real `CLS_PLATE` & bolted sticker quads so real plates retain strict priority!)
-        if n_dec_bank > 0:
+        if n_dec_bank > 0 and (int(spec.track_id) % 2 == 0):
             for pr_v in prims:
                 if pr_v.veh_idx != veh_idx or pr_v.decal_spec is None:
                     continue
                 d_idx_q, proj_f_q, uc_q, vc_q, uhw_q, vhh_q, rel_q = pr_v.decal_spec
                 if float(rel_q) < 0.0:
+                    continue
+                if spec.machinery_side_hood_plate and proj_f_q in (0, 2):
                     continue
                 R_pr = pr_v.rot_w2l.T
                 c_pr = np.array(pr_v.center, dtype=np.float32)
@@ -5654,6 +7079,70 @@ class Scene3DGPUEngine:
         v = fy * (pts_c[:, 1] / pts_c[:, 2]) + cy
         return np.stack([u, v], axis=-1).astype(np.float32)
 
+    _CORNER_SIGNS_8: np.ndarray = np.array(
+        [
+            [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    @classmethod
+    def _batch_obb_rois_uv(
+        cls,
+        centers_np: np.ndarray,
+        rot_w2l_np: np.ndarray,
+        he_np: np.ndarray,
+        cam_o: np.ndarray,
+        R_cam: np.ndarray,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        w: int,
+        h: int,
+        z_near: float = 0.16,
+        pad: float = 2.0,
+    ) -> np.ndarray:
+        """Vectorized exact near-plane-clipped screen ROIs `(P, 4)` `[u0, u1, v0, v1]` for `P` 3D OBBs."""
+        n_p = centers_np.shape[0]
+        rois = np.zeros((n_p, 4), dtype=np.int32)
+        if n_p == 0:
+            return rois
+        offs_l = he_np[:, None, :] * cls._CORNER_SIGNS_8[None, :, :]  # (P, 8, 3)
+        pts_w = centers_np[:, None, :] + np.matmul(offs_l, rot_w2l_np)  # R_l2w.T == rot_w2l
+        rel = (pts_w - cam_o[None, None, :]) @ R_cam  # (P, 8, 3)
+        z = rel[:, :, 2]
+        all_behind = np.all(z < z_near, axis=1)
+        all_infront = np.all(z >= z_near, axis=1)
+        if np.any(all_infront):
+            rel_f = rel[all_infront]
+            zf = rel_f[:, :, 2]
+            uf = fx * (rel_f[:, :, 0] / zf) + cx
+            vf = fy * (rel_f[:, :, 1] / zf) + cy
+            u0 = np.clip(np.floor(uf.min(axis=1) - pad).astype(np.int32), 0, w)
+            u1 = np.clip(np.ceil(uf.max(axis=1) + pad).astype(np.int32), 0, w)
+            v0 = np.clip(np.floor(vf.min(axis=1) - pad).astype(np.int32), 0, h)
+            v1 = np.clip(np.ceil(vf.max(axis=1) + pad).astype(np.int32), 0, h)
+            rois[all_infront, 0] = u0
+            rois[all_infront, 1] = u1
+            rois[all_infront, 2] = v0
+            rois[all_infront, 3] = v1
+        straddle = (~all_behind) & (~all_infront)
+        if np.any(straddle):
+            for pi in np.flatnonzero(straddle):
+                uv_c = cls._clip_obb_to_near_plane_uv(
+                    centers_np[pi], rot_w2l_np[pi].T,
+                    (float(he_np[pi, 0]), float(he_np[pi, 1]), float(he_np[pi, 2])),
+                    cam_o, R_cam, fx, fy, cx, cy, z_near=z_near,
+                )
+                if uv_c.shape[0] > 0:
+                    rois[pi, 0] = max(0, int(math.floor(float(uv_c[:, 0].min()) - pad)))
+                    rois[pi, 1] = min(w, int(math.ceil(float(uv_c[:, 0].max()) + pad)))
+                    rois[pi, 2] = max(0, int(math.floor(float(uv_c[:, 1].min()) - pad)))
+                    rois[pi, 3] = min(h, int(math.ceil(float(uv_c[:, 1].max()) + pad)))
+        return rois
+
     @staticmethod
     def _clip_quad_to_near_plane_uv(
         qd: _PlanarQuad3D,
@@ -5715,9 +7204,19 @@ class Scene3DGPUEngine:
         force_comm_plate: bool = False,
         force_recessed_ao: bool = False,
         exclude_plate_indices: set[int] | None = None,
+        forced_white_livery_van: bool = False,
+        forced_machinery_side_plate: bool = False,
     ) -> _VehiclePassSpec:
         is_train = self.config.domain_split == "train"
         if is_train:
+            if forced_white_livery_van and forced_arch is None:
+                forced_arch = "hiace_van"
+            elif forced_machinery_side_plate and forced_arch is None:
+                forced_arch = rng.choices(
+                    ["wheel_loader", "rough_terrain_crane", "dump_10t", "cargo_crane_truck"],
+                    weights=[0.55, 0.20, 0.15, 0.10],
+                    k=1,
+                )[0]
             cat_use = TRAIN_V7_ARCHETYPE_CATALOG
             names = [a[0] for a in cat_use]
             subs = [a[1] for a in cat_use]
@@ -5748,13 +7247,13 @@ class Scene3DGPUEngine:
         is_lg = True
         if arch in ("dump_10t", "deep_dump"):
             L, W, cab_h, body_h = rng.uniform(7.4, 8.8), rng.uniform(2.44, 2.50), rng.uniform(2.85, 3.25), rng.uniform(3.1, 3.6)
-            p_bucket = "heavy_comm" if rng.random() < 0.76 else "heavy_priv"
+            p_bucket = "heavy_comm" if rng.random() < 0.52 else "heavy_priv"
         elif arch == "concrete_mixer":
             L, W, cab_h, body_h = rng.uniform(7.6, 8.4), 2.48, rng.uniform(2.85, 3.15), 3.65
-            p_bucket = "heavy_comm" if rng.random() < 0.65 else ("special_8_9" if rng.random() < 0.5 else "heavy_priv")
+            p_bucket = "heavy_comm" if rng.random() < 0.45 else ("special_8_9" if rng.random() < 0.55 else "heavy_priv")
         elif arch == "tanker_lorry":
             L, W, cab_h, body_h = rng.uniform(7.8, 9.4), 2.49, 2.92, 3.25
-            p_bucket = "heavy_comm" if rng.random() < 0.80 else "special_8_9"
+            p_bucket = "heavy_comm" if rng.random() < 0.62 else "special_8_9"
         elif arch == "rough_terrain_crane":
             L, W, cab_h, body_h = rng.uniform(8.2, 10.6), rng.uniform(2.48, 2.62), 2.95, 3.55
             p_bucket = "special_8_9"
@@ -5766,27 +7265,27 @@ class Scene3DGPUEngine:
             L = rng.uniform(6.0, 7.0) if is_lg else rng.uniform(5.2, 6.1)
             W = 2.26 if is_lg else 2.12
             cab_h, body_h = 2.58, 2.76
-            p_bucket = "special_8_9" if rng.random() < 0.68 else "med_comm"
+            p_bucket = "special_8_9" if rng.random() < 0.58 else ("med_priv" if rng.random() < 0.65 else "med_comm")
         elif arch == "city_route_bus":
             L, W, cab_h, body_h = rng.uniform(10.2, 11.0), 2.49, 3.12, 3.12
-            p_bucket = "heavy_comm" if rng.random() < 0.88 else "heavy_priv"
+            p_bucket = "heavy_comm" if rng.random() < 0.78 else "heavy_priv"
         elif arch == "highway_coach_bus":
             L, W, cab_h, body_h = rng.uniform(11.4, 12.0), 2.49, 3.52, 3.52
-            p_bucket = "heavy_comm" if rng.random() < 0.88 else "heavy_priv"
+            p_bucket = "heavy_comm" if rng.random() < 0.78 else "heavy_priv"
         elif arch == "microbus":
             is_lg = False
             L, W, cab_h, body_h = rng.uniform(6.25, 6.99), 2.08, 2.64, 2.64
-            p_bucket = "med_comm" if rng.random() < 0.66 else "med_priv"
+            p_bucket = "med_comm" if rng.random() < 0.45 else "med_priv"
         elif arch == "cargo_crane_truck":
             is_lg = rng.random() < 0.62
             L = rng.uniform(7.6, 9.2) if is_lg else rng.uniform(5.6, 6.8)
             W = 2.48 if is_lg else 2.18
             cab_h, body_h = (2.92 if is_lg else 2.52), (3.18 if is_lg else 2.78)
-            p_bucket = ("heavy_comm" if rng.random() < 0.72 else "special_8_9") if is_lg else ("med_comm" if rng.random() < 0.68 else "med_priv")
+            p_bucket = ("heavy_comm" if rng.random() < 0.48 else "special_8_9") if is_lg else ("med_priv" if rng.random() < 0.55 else "med_comm")
         elif arch == "tractor_head":
             L, W, cab_h = rng.uniform(5.8, 6.8), 2.49, rng.uniform(3.05, 3.42)
             body_h = cab_h
-            p_bucket = "heavy_comm" if rng.random() < 0.88 else "heavy_priv"
+            p_bucket = "heavy_comm" if rng.random() < 0.76 else "heavy_priv"
         elif arch == "skeletal_chassis_trailer":
             L, W, cab_h, body_h = rng.uniform(11.5, 13.8), 2.49, 3.22, 3.22
             p_bucket = "heavy_comm"
@@ -5798,21 +7297,21 @@ class Scene3DGPUEngine:
             L = rng.uniform(7.8, 9.6) if is_lg else rng.uniform(5.8, 6.8)
             W = 2.48 if is_lg else 2.18
             cab_h, body_h = (2.95 if is_lg else 2.55), (3.55 if is_lg else 3.05)
-            p_bucket = ("heavy_comm" if rng.random() < 0.78 else "heavy_priv") if is_lg else ("med_comm" if rng.random() < 0.70 else "med_priv")
+            p_bucket = ("heavy_comm" if rng.random() < 0.55 else "heavy_priv") if is_lg else ("med_priv" if rng.random() < 0.55 else "med_comm")
         elif arch == "flatbed_truck":
             is_lg = rng.random() < 0.42
             L = rng.uniform(7.2, 8.6) if is_lg else rng.uniform(4.7, 6.2)
             W = 2.45 if is_lg else 1.88
             cab_h, body_h = (2.75 if is_lg else 2.18), (2.75 if is_lg else 2.18)
-            p_bucket = ("heavy_comm" if rng.random() < 0.65 else "heavy_priv") if is_lg else ("med_priv" if rng.random() < 0.55 else "med_comm")
+            p_bucket = ("heavy_comm" if rng.random() < 0.48 else "heavy_priv") if is_lg else ("med_priv" if rng.random() < 0.65 else "med_comm")
         elif arch == "kei_truck":
             is_lg = False
             L, W, cab_h, body_h = 3.39, 1.48, 1.78, 1.78
-            p_bucket = ("kei_comm" if rng.random() < 0.48 else "kei_priv") if is_train else ("kei_priv" if rng.random() < 0.72 else "kei_comm")
+            p_bucket = ("kei_comm" if rng.random() < 0.30 else "kei_priv") if is_train else ("kei_priv" if rng.random() < 0.75 else "kei_comm")
         elif arch == "hiace_van":
             is_lg = False
             L, W, cab_h, body_h = rng.uniform(4.69, 5.38), rng.uniform(1.69, 1.88), 1.98, 2.08
-            p_bucket = ("med_comm" if rng.random() < 0.54 else "med_priv") if is_train else ("med_priv" if rng.random() < 0.68 else "med_comm")
+            p_bucket = ("med_comm" if rng.random() < 0.32 else "med_priv") if is_train else ("med_priv" if rng.random() < 0.72 else "med_comm")
         elif arch == "kei_crossover":
             is_lg = False
             L, W, cab_h, body_h = 3.39, 1.48, 1.66, 1.68
@@ -6000,16 +7499,16 @@ class Scene3DGPUEngine:
         mud_lvl_val = rng.uniform(0.08, 0.52) if is_heavy else (rng.uniform(0.0, 0.24) if rng.random() < 0.4 else 0.0)
         mud_ph_val = rng.uniform(0.0, 10.0)
         sticker_i_val = rng.randrange(1, min(7, len(self.bank.sticker_mips)))
-        has_st_val = is_heavy and rng.random() < 0.65
+        has_st_val = is_heavy and rng.random() < 0.30
         has_hz_val = arch == "tanker_lorry" or (is_heavy and rng.random() < 0.14)
         tr_yaw_d_val = math.radians(rng.uniform(-22.0, 22.0)) if is_articulated else 0.0
         bump_amp_val = rng.uniform(0.015, 0.075) if motion_mode != "stationary" and rng.random() < 0.55 else 0.0
         bump_freq_val = rng.uniform(1.6, 3.8)
         bump_ph_val = rng.uniform(0.0, 6.28)
         fcab_hn_i_val = rng.choice([7, 8, 9, 10, 11, 12, 15]) if len(self.bank.sticker_mips) >= 16 else 1
-        has_fcab_hn_val = (is_heavy or arch in ("box_wing_truck", "flatbed_truck", "kei_truck")) and rng.random() < 0.68
+        has_fcab_hn_val = (is_heavy or arch in ("box_wing_truck", "flatbed_truck", "kei_truck")) and rng.random() < 0.32
         fbmp_hn_i_val = rng.choice([13, 14]) if len(self.bank.sticker_mips) >= 15 else 1
-        has_fbmp_hn_val = (is_heavy or arch in ("box_wing_truck", "flatbed_truck")) and rng.random() < 0.58
+        has_fbmp_hn_val = (is_heavy or arch in ("box_wing_truck", "flatbed_truck")) and rng.random() < 0.25
         has_dload_val = arch in ("dump_10t", "deep_dump") and rng.random() < 0.62
         dload_lin_val = rng.choice(
             (
@@ -6037,7 +7536,7 @@ class Scene3DGPUEngine:
         n_st_avail = min(26, len(self.bank.sticker_mips)) if is_train else len(self.bank.sticker_mips)
         has_door_dec = bool(
             arch not in ("sedan", "hatchback_compact", "minivan_1box_jp", "kei_tall_wagon", "kei_crossover", "suv_4wd")
-            and rng_v5.random() < 0.55
+            and rng_v5.random() < 0.25
         )
         door_dec_idx = int(rng_v5.randrange(16, n_st_avail)) if n_st_avail > 16 else 1
         # Wider intersection / turning / oblique yard yaw angles (`0°..360°`)
@@ -6095,10 +7594,93 @@ class Scene3DGPUEngine:
                 cav_ao_r = rng_v5.uniform(0.55, 0.92)
             cav_ao_f = rng_v5.uniform(0.14, 0.32) if (is_heavy or v_prod_val == "csg_recess_cavity" or rng_v5.random() < 0.30) else 1.0
             nir_refl = rng_v5.uniform(0.04, 0.82)
+
+            # Gen-7 vibrant liveries, white-on-white recessed pockets, construction machinery side-hood plates, chevrons & bags
+            stripe_palettes: tuple[tuple[float, float, float], ...] = (
+                (0.04, 0.24, 0.78),  # Utility cobalt blue stripe
+                (0.06, 0.42, 0.86),  # Express sky-blue stripe
+                (0.78, 0.08, 0.06),  # Courier crimson red stripe
+                (0.05, 0.46, 0.24),  # Municipal emerald green stripe
+                (0.88, 0.42, 0.04),  # Road-service amber-orange stripe
+                (0.08, 0.36, 0.44),  # Logistics teal stripe
+            )
+            livery_mode_val = 0
+            livery_rgb_val: tuple[float, float, float] = (0.04, 0.24, 0.78)
+            white_recess_val = False
+            mach_side_plate_val = False
+            mach_placard_idx_val = int(rng_v5.randrange(0, 16))
+            has_rear_chv_val = False
+            has_hop_bags_val = False
+
+            if forced_white_livery_van:
+                paint_lin = (0.94, 0.95, 0.97)
+                sec_lin = paint_lin
+                livery_mode_val = 1
+                livery_rgb_val = rng_v5.choice(stripe_palettes[:3])
+                white_recess_val = True
+                cav_ao_r = rng_v5.uniform(0.42, 0.82)
+            elif forced_machinery_side_plate:
+                if forced_paint_lin is None and not force_dark_car and arch in ("wheel_loader", "rough_terrain_crane"):
+                    paint_lin = rng_v5.choice(((0.90, 0.68, 0.04), (0.86, 0.60, 0.03), (0.90, 0.36, 0.03)))
+                    sec_lin = (0.14, 0.15, 0.16) if arch == "wheel_loader" else paint_lin
+                mach_side_plate_val = True
+                has_rear_chv_val = True
+            else:
+                if forced_paint_lin is None and not force_dark_car and arch in ("wheel_loader", "rough_terrain_crane"):
+                    if rng_v5.random() < 0.78:
+                        paint_lin = rng_v5.choice(((0.90, 0.68, 0.04), (0.86, 0.60, 0.03), (0.90, 0.36, 0.03), (0.08, 0.42, 0.82)))
+                        sec_lin = (0.14, 0.15, 0.16) if arch == "wheel_loader" else paint_lin
+                elif forced_paint_lin is None and not force_dark_car and arch == "hiace_van" and rng_v5.random() < 0.58:
+                    paint_lin = rng_v5.choice(((0.94, 0.95, 0.97), (0.90, 0.91, 0.93), (0.84, 0.86, 0.89)))
+                    sec_lin = paint_lin
+
+                if arch == "hiace_van":
+                    r_liv = rng_v5.random()
+                    if r_liv < 0.54:
+                        livery_mode_val = 1
+                        livery_rgb_val = rng_v5.choice(stripe_palettes)
+                    elif r_liv < 0.72:
+                        livery_mode_val = 2
+                        livery_rgb_val = rng_v5.choice(stripe_palettes)
+                elif arch == "box_wing_truck" and smooth_frp and rng_v5.random() < 0.48:
+                    livery_mode_val = 1
+                    livery_rgb_val = rng_v5.choice(stripe_palettes)
+                elif arch in ("minivan_1box_jp", "kei_tall_wagon", "kei_crossover", "hatchback_compact", "suv_4wd") and rng_v5.random() < 0.24:
+                    livery_mode_val = rng_v5.choice([1, 2])
+                    livery_rgb_val = rng_v5.choice(stripe_palettes)
+
+                is_bright_body = min(paint_lin) > 0.70
+                white_recess_val = bool(
+                    arch in ("hiace_van", "minivan_1box_jp", "sedan", "hatchback_compact", "suv_4wd", "kei_tall_wagon", "kei_crossover")
+                    and is_bright_body
+                    and rng_v5.random() < 0.68
+                )
+                if arch == "wheel_loader":
+                    mach_side_plate_val = rng_v5.random() < 0.68
+                elif arch == "rough_terrain_crane":
+                    mach_side_plate_val = rng_v5.random() < 0.48
+                elif arch in ("dump_10t", "deep_dump", "garbage_packer", "cargo_crane_truck", "box_wing_truck", "flatbed_truck"):
+                    mach_side_plate_val = rng_v5.random() < 0.16
+
+                has_rear_chv_val = bool(
+                    (is_heavy or arch in ("box_wing_truck", "flatbed_truck", "garbage_packer", "wheel_loader", "rough_terrain_crane", "cargo_crane_truck"))
+                    and rng_v5.random() < 0.52
+                )
+                has_hop_bags_val = bool(
+                    (arch == "garbage_packer" and rng_v5.random() < 0.58)
+                    or (arch in ("dump_10t", "deep_dump", "flatbed_truck", "kei_truck") and rng_v5.random() < 0.25)
+                )
         else:
             cav_ao_r = 1.0
             cav_ao_f = 1.0
             nir_refl = 0.0
+            livery_mode_val = 0
+            livery_rgb_val = (0.04, 0.24, 0.78)
+            white_recess_val = False
+            mach_side_plate_val = False
+            mach_placard_idx_val = 0
+            has_rear_chv_val = False
+            has_hop_bags_val = False
 
         return _VehiclePassSpec(
             track_id=track_id,
@@ -6158,6 +7740,13 @@ class Scene3DGPUEngine:
             cavity_sky_ao_rear=float(cav_ao_r),
             cavity_sky_ao_front=float(cav_ao_f),
             nir_paint_refl=float(nir_refl),
+            livery_mode=int(livery_mode_val),
+            livery_rgb=livery_rgb_val,
+            machinery_side_hood_plate=bool(mach_side_plate_val),
+            machinery_placard_idx=int(mach_placard_idx_val),
+            has_rear_chevron=bool(has_rear_chv_val),
+            has_hopper_bags=bool(has_hop_bags_val),
+            white_recess_pocket=bool(white_recess_val),
         )
 
     @staticmethod
@@ -6296,27 +7885,252 @@ class Scene3DGPUEngine:
         veh_quads: list[_PlanarQuad3D] | None = None,
         veh_idx: int = 1,
     ) -> int:
-        """Count exact unoccluded in-frame silhouette pixels of an isolated vehicle (curved prims + attached quads)."""
+        """Count exact unoccluded in-frame silhouette pixels of an isolated vehicle (geometry-only fast rasterizer)."""
         q_list = veh_quads or []
         if not veh_prims and not q_list:
             return 0
-        z3 = torch.zeros(3, device=self.device, dtype=torch.float32)
-        sun = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=torch.float32)
-        _, iso_veh_buf, _, _, _ = self._render_substep_hdr(
-            h, w, cam_o, R_cam, fx, fy, cx, cy,
-            prims=veh_prims,
-            quads=q_list,
-            sun_dir=sun,
-            sky_zenith=z3,
-            sky_horizon=z3,
-            road_albedo_base=0.05,
-            is_night=False,
-            is_ir=True,
-            is_wet=False,
-            fence_cfg=None,
-            record_masks=False,
-        )
-        return int((iso_veh_buf == int(veh_idx)).sum().item())
+        dev = self.device
+        vv = torch.arange(h, device=dev, dtype=torch.float32)
+        uu = torch.arange(w, device=dev, dtype=torch.float32)
+        yn = (vv - cy) / fy
+        xn = (uu - cx) / fx
+
+        R_t = torch.from_numpy(R_cam).to(device=dev, dtype=torch.float32)
+        cam_o_t = torch.from_numpy(cam_o).to(device=dev, dtype=torch.float32)
+        dx_w = xn[None, :] * R_t[0, 0] + yn[:, None] * R_t[0, 1] + R_t[0, 2]
+        dy_w = xn[None, :] * R_t[1, 0] + yn[:, None] * R_t[1, 1] + R_t[1, 2]
+        dz_w = xn[None, :] * R_t[2, 0] + yn[:, None] * R_t[2, 1] + R_t[2, 2]
+
+        # Initialize Z-buffer with ground plane Z = 0.0 (exact parity with `_render_substep_hdr` Pass 1A)
+        t_best = torch.full((h, w), 1e5, device=dev, dtype=torch.float32)
+        hit_road = dz_w < -1e-4
+        lam_r = torch.where(hit_road, (-float(cam_o[2])) / dz_w.clamp_max(-1e-4), t_best)
+        valid_r = hit_road & (lam_r > 0.16) & (lam_r < 120.0)
+        t_best = torch.where(valid_r, lam_r, t_best)
+        veh_buf = torch.zeros((h, w), device=dev, dtype=torch.int16)
+
+        if veh_prims:
+            rot_np = np.stack([pr.rot_w2l for pr in veh_prims], axis=0).astype(np.float32)
+            cen_np = np.array([pr.center for pr in veh_prims], dtype=np.float32)
+            he_np = np.array([pr.half_ext for pr in veh_prims], dtype=np.float32)
+            rois_np = self._batch_obb_rois_uv(cen_np, rot_np, he_np, cam_o, R_cam, fx, fy, cx, cy, w, h, z_near=0.16, pad=2.0)
+            Rw2l_all = torch.from_numpy(rot_np).to(device=dev, dtype=torch.float32)
+            cen_all = torch.from_numpy(cen_np).to(device=dev, dtype=torch.float32)
+            oc_l_all = torch.bmm(Rw2l_all, (cam_o_t[None, :] - cen_all).unsqueeze(-1)).squeeze(-1)
+
+            use_triton_iso = _HAS_TRITON and dev.type == "cuda"
+            if use_triton_iso:
+                oc_l_np = np.einsum("pij,pj->pi", rot_np, cam_o[None, :] - cen_np).astype(np.float32)
+                obb_rows: list[np.ndarray] = []
+                obb_vehs: list[int] = []
+                cd_rows: list[np.ndarray] = []
+                cd_vehs: list[int] = []
+                other_indices: list[int] = []
+                for p_idx, pr in enumerate(veh_prims):
+                    u0, u1, v0, v1 = int(rois_np[p_idx, 0]), int(rois_np[p_idx, 1]), int(rois_np[p_idx, 2]), int(rois_np[p_idx, 3])
+                    if u1 <= u0 or v1 <= v0:
+                        continue
+                    if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
+                        row = np.empty((20,), dtype=np.float32)
+                        row[0:9] = rot_np[p_idx].reshape(9)
+                        row[9:12] = oc_l_np[p_idx]
+                        row[12:15] = he_np[p_idx]
+                        row[15] = float(pr.slope_param) if pr.shape == _SHAPE_SLOPED_CAB else 0.0
+                        row[16:20] = (float(u0), float(u1), float(v0), float(v1))
+                        obb_rows.append(row)
+                        obb_vehs.append(int(pr.veh_idx))
+                    elif pr.shape in (_SHAPE_CYLINDER_X, _SHAPE_TAPER_DRUM_Y):
+                        crow = np.empty((22,), dtype=np.float32)
+                        crow[0:9] = rot_np[p_idx].reshape(9)
+                        crow[9:12] = oc_l_np[p_idx]
+                        crow[12:15] = he_np[p_idx]
+                        is_d = pr.shape == _SHAPE_TAPER_DRUM_Y
+                        crow[15] = 1.0 if is_d else 0.0
+                        crow[16] = float(np.clip(pr.slope_param, 0.0, 0.65)) if is_d else float(pr.radial_n)
+                        crow[17] = float(pr.mud_phase)
+                        crow[18:22] = (float(u0), float(u1), float(v0), float(v1))
+                        cd_rows.append(crow)
+                        cd_vehs.append(int(pr.veh_idx))
+                    else:
+                        other_indices.append(p_idx)
+                dx_c = dy_c = dz_c = None
+                g2d = (triton.cdiv(w, 16), triton.cdiv(h, 16))
+                if obb_rows:
+                    dx_c, dy_c, dz_c = dx_w.contiguous(), dy_w.contiguous(), dz_w.contiguous()
+                    pdata_t = torch.from_numpy(np.stack(obb_rows, axis=0)).to(device=dev, dtype=torch.float32)
+                    pveh_t = torch.tensor(obb_vehs, device=dev, dtype=torch.int32)
+                    _triton_iso_obb_kernel[g2d](dx_c, dy_c, dz_c, t_best, veh_buf, pdata_t, pveh_t, h, w, len(obb_rows))
+                if cd_rows:
+                    if dx_c is None:
+                        dx_c, dy_c, dz_c = dx_w.contiguous(), dy_w.contiguous(), dz_w.contiguous()
+                    cdata_t = torch.from_numpy(np.stack(cd_rows, axis=0)).to(device=dev, dtype=torch.float32)
+                    cveh_t = torch.tensor(cd_vehs, device=dev, dtype=torch.int32)
+                    _triton_iso_cyl_drum_kernel[g2d](dx_c, dy_c, dz_c, t_best, veh_buf, cdata_t, cveh_t, h, w, len(cd_rows))
+                iter_prims = other_indices
+            else:
+                iter_prims = list(range(len(veh_prims)))
+
+            for p_idx in iter_prims:
+                pr = veh_prims[p_idx]
+                u0, u1, v0, v1 = int(rois_np[p_idx, 0]), int(rois_np[p_idx, 1]), int(rois_np[p_idx, 2]), int(rois_np[p_idx, 3])
+                if u1 <= u0 or v1 <= v0:
+                    continue
+                sx, sy, sz = pr.half_ext
+
+                sub_dx = dx_w[v0:v1, u0:u1]
+                sub_dy = dy_w[v0:v1, u0:u1]
+                sub_dz = dz_w[v0:v1, u0:u1]
+                Rw2l_t = Rw2l_all[p_idx]
+                oc_l = oc_l_all[p_idx]
+                dl_x = Rw2l_t[0, 0] * sub_dx + Rw2l_t[0, 1] * sub_dy + Rw2l_t[0, 2] * sub_dz
+                dl_y = Rw2l_t[1, 0] * sub_dx + Rw2l_t[1, 1] * sub_dy + Rw2l_t[1, 2] * sub_dz
+                dl_z = Rw2l_t[2, 0] * sub_dx + Rw2l_t[2, 1] * sub_dy + Rw2l_t[2, 2] * sub_dz
+                sub_t = t_best[v0:v1, u0:u1]
+
+                if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
+                    inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
+                    inv_y = torch.where(dl_y.abs() > 1e-6, 1.0 / dl_y, torch.copysign(torch.full_like(dl_y, 1e6), dl_y))
+                    inv_z = torch.where(dl_z.abs() > 1e-6, 1.0 / dl_z, torch.copysign(torch.full_like(dl_z, 1e6), dl_z))
+                    tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
+                    ty0, ty1 = (-sy - oc_l[1]) * inv_y, (sy - oc_l[1]) * inv_y
+                    tz0, tz1 = (-sz - oc_l[2]) * inv_z, (sz - oc_l[2]) * inv_z
+                    t_min = torch.maximum(torch.maximum(torch.minimum(tx0, tx1), torch.minimum(ty0, ty1)), torch.minimum(tz0, tz1))
+                    t_max = torch.minimum(torch.minimum(torch.maximum(tx0, tx1), torch.maximum(ty0, ty1)), torch.maximum(tz0, tz1))
+                    if pr.shape == _SHAPE_SLOPED_CAB:
+                        ny_s = float(pr.slope_param)
+                        nz_s = math.sqrt(max(0.1, 1.0 - ny_s * ny_s))
+                        d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
+                        den_s = ny_s * dl_y + nz_s * dl_z
+                        num_s = d_s - (ny_s * oc_l[1] + nz_s * oc_l[2])
+                        t_s = num_s / torch.where(den_s.abs() > 1e-6, den_s, torch.full_like(den_s, 1e-6))
+                        t_min = torch.where(den_s < -1e-6, torch.maximum(t_min, t_s), t_min)
+                        t_max = torch.where(den_s > 1e-6, torch.minimum(t_max, t_s), t_max)
+                        t_max = torch.where((den_s.abs() <= 1e-6) & (num_s < 0.0), torch.full_like(t_max, -1.0), t_max)
+                    t_hit = t_min
+                    valid_p = (t_min > 0.16) & (t_max >= t_min) & (t_hit < sub_t)
+                elif pr.shape == _SHAPE_CYLINDER_X:
+                    oy_n, oz_n = oc_l[1] / sy, oc_l[2] / sz
+                    dy_n, dz_n = dl_y / sy, dl_z / sz
+                    qa = (dy_n * dy_n + dz_n * dz_n).clamp_min(1e-6)
+                    qb = oy_n * dy_n + oz_n * dz_n
+                    qc = oy_n * oy_n + oz_n * oz_n - 1.0
+                    disc = qb * qb - qa * qc
+                    sq = torch.sqrt(disc.clamp_min(0.0))
+                    tc0, tc1 = (-qb - sq) / qa, (-qb + sq) / qa
+                    inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
+                    tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
+                    t_min = torch.maximum(torch.where(disc >= 0.0, tc0, torch.full_like(tc0, 1e6)), torch.minimum(tx0, tx1))
+                    t_max = torch.minimum(torch.where(disc >= 0.0, tc1, torch.full_like(tc1, -1e6)), torch.maximum(tx0, tx1))
+                    t_hit = t_min
+                    base_valid_c = (disc >= 0.0) & (t_min > 0.16) & (t_max >= t_min)
+                    if pr.radial_n >= 3 and base_valid_c.any():
+                        n_fold = float(pr.radial_n)
+                        sector_w = (2.0 * math.pi) / n_fold
+                        half_sec = 0.5 * sector_w
+                        r_ring = 0.45
+                        r_hole = min(0.115, 0.56 * r_ring * math.sin(half_sec))
+                        hx0 = oc_l[0] + t_min * dl_x
+                        hy0 = (oc_l[1] + t_min * dl_y) / sy
+                        hz0 = (oc_l[2] + t_min * dl_z) / sz
+                        rr0 = torch.sqrt(hy0 * hy0 + hz0 * hz0)
+                        th0 = torch.remainder(torch.atan2(hz0, hy0) + pr.mud_phase + half_sec, sector_w) - half_sec
+                        du0, dv0 = rr0 * torch.cos(th0) - r_ring, rr0 * torch.sin(th0)
+                        perf0 = (hx0.abs() >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < (r_hole * r_hole))
+                        if perf0.any():
+                            hx1 = oc_l[0] + t_max * dl_x
+                            hy1 = (oc_l[1] + t_max * dl_y) / sy
+                            hz1 = (oc_l[2] + t_max * dl_z) / sz
+                            rr1 = torch.sqrt(hy1 * hy1 + hz1 * hz1)
+                            th1 = torch.remainder(torch.atan2(hz1, hy1) + pr.mud_phase + half_sec, sector_w) - half_sec
+                            du1, dv1 = rr1 * torch.cos(th1) - r_ring, rr1 * torch.sin(th1)
+                            perf1 = (hx1.abs() >= sx * 0.92) & ((du1 * du1 + dv1 * dv1) < (r_hole * r_hole))
+                            base_valid_c = base_valid_c & (~(perf0 & perf1))
+                            t_hit = torch.where(perf0 & (~perf1), t_max, t_hit)
+                    valid_p = base_valid_c & (t_hit < sub_t)
+                elif pr.shape == _SHAPE_FLEX_SHEET:
+                    t_hit, hit_sh = self._intersect_flex_sheet_local(
+                        oc_l[0].expand_as(dl_x), oc_l[1].expand_as(dl_y), oc_l[2].expand_as(dl_z),
+                        dl_x, dl_y, dl_z, sx, sy, sz, pr.wave_amp, pr.wave_freq, pr.mud_phase, t_near=0.16,
+                    )
+                    valid_p = hit_sh & (t_hit < sub_t)
+                else:
+                    taper = float(np.clip(pr.slope_param, 0.0, 0.65))
+                    ox_n, oy_n, oz_n = oc_l[0] / sx, oc_l[1] / sy, oc_l[2] / sz
+                    dx_n, dy_n, dz_n = dl_x / sx, dl_y / sy, dl_z / sz
+                    t_hit = torch.full_like(dx_n, 1e6)
+                    hit_any = torch.zeros_like(dx_n, dtype=torch.bool)
+                    for s_h in (1.0, -1.0):
+                        k_c = taper * s_h
+                        qa = dx_n * dx_n + dz_n * dz_n - (k_c * dy_n) * (k_c * dy_n)
+                        qb = ox_n * dx_n + oz_n * dz_n + k_c * dy_n * (1.0 - k_c * oy_n)
+                        qc = ox_n * ox_n + oz_n * oz_n - (1.0 - k_c * oy_n) * (1.0 - k_c * oy_n)
+                        disc = qb * qb - qa * qc
+                        sq = torch.sqrt(disc.clamp_min(0.0))
+                        s_qb = torch.where(qb >= 0.0, torch.ones_like(qb), -torch.ones_like(qb))
+                        q_cit = -(qb + s_qb * sq)
+                        safe_q = torch.where(q_cit.abs() > 1e-12, q_cit, torch.copysign(torch.full_like(q_cit, 1e-12), q_cit))
+                        safe_a = torch.where(qa.abs() > 1e-12, qa, torch.copysign(torch.full_like(qa, 1e-12), qa))
+                        tr1, tr2 = qc / safe_q, q_cit / safe_a
+                        for tr, cond_den in ((tr1, q_cit.abs() > 1e-12), (tr2, qa.abs() > 1e-12)):
+                            yn_r = oy_n + tr * dy_n
+                            in_half = (yn_r >= -1e-4) & (yn_r <= 1.0) if s_h > 0.0 else (yn_r <= 1e-4) & (yn_r >= -1.0)
+                            ok_r = (disc >= 0.0) & cond_den & (tr > 0.16) & in_half & (tr < t_hit)
+                            t_hit = torch.where(ok_r, tr, t_hit)
+                            hit_any |= ok_r
+                    inv_y = torch.where(dy_n.abs() > 1e-6, 1.0 / dy_n, torch.copysign(torch.full_like(dy_n, 1e6), dy_n))
+                    r_cap2 = (1.0 - taper) * (1.0 - taper)
+                    for s_cap in (1.0, -1.0):
+                        tc_p = (s_cap - oy_n) * inv_y
+                        xc_p, zc_p = ox_n + tc_p * dx_n, oz_n + tc_p * dz_n
+                        ok_c = (tc_p > 0.16) & ((xc_p * xc_p + zc_p * zc_p) <= r_cap2) & (tc_p < t_hit)
+                        t_hit = torch.where(ok_c, tc_p, t_hit)
+                        hit_any |= ok_c
+                    valid_p = hit_any & (t_hit < sub_t)
+
+                t_best[v0:v1, u0:u1] = torch.where(valid_p, t_hit, sub_t)
+                veh_buf[v0:v1, u0:u1].masked_fill_(valid_p, int(pr.veh_idx))
+
+        for qd in q_list:
+            if not qd.has_backing_substrate:
+                continue
+            to_cam = cam_o - qd.center
+            dist_c = float(np.linalg.norm(to_cam))
+            if dist_c < 0.20 or float(np.dot(qd.normal, to_cam)) / dist_c <= 0.06:
+                continue
+            uv_q_clip = self._clip_quad_to_near_plane_uv(qd, cam_o, R_cam, fx, fy, cx, cy, z_near=0.16)
+            if uv_q_clip.shape[0] == 0:
+                continue
+            u0 = max(0, int(math.floor(float(uv_q_clip[:, 0].min()) - 2.0)))
+            u1 = min(w, int(math.ceil(float(uv_q_clip[:, 0].max()) + 2.0)))
+            v0 = max(0, int(math.floor(float(uv_q_clip[:, 1].min()) - 2.0)))
+            v1 = min(h, int(math.ceil(float(uv_q_clip[:, 1].max()) + 2.0)))
+            if u1 <= u0 or v1 <= v0:
+                continue
+            sub_dx = dx_w[v0:v1, u0:u1]
+            sub_dy = dy_w[v0:v1, u0:u1]
+            sub_dz = dz_w[v0:v1, u0:u1]
+            nx_q, ny_q, nz_q = float(qd.normal[0]), float(qd.normal[1]), float(qd.normal[2])
+            ux_q, uy_q, uz_q = float(qd.u_axis[0]), float(qd.u_axis[1]), float(qd.u_axis[2])
+            vx_q, vy_q, vz_q = float(qd.v_axis[0]), float(qd.v_axis[1]), float(qd.v_axis[2])
+            cx_q, cy_q, cz_q = float(qd.center[0]), float(qd.center[1]), float(qd.center[2])
+            denom = nx_q * sub_dx + ny_q * sub_dy + nz_q * sub_dz
+            num = nx_q * (cx_q - float(cam_o[0])) + ny_q * (cy_q - float(cam_o[1])) + nz_q * (cz_q - float(cam_o[2]))
+            lam_q = num / torch.where(denom.abs() > 1e-6, denom, torch.full_like(denom, -1e-6))
+            px_w = float(cam_o[0]) + lam_q * sub_dx - cx_q
+            py_w = float(cam_o[1]) + lam_q * sub_dy - cy_q
+            pz_w = float(cam_o[2]) + lam_q * sub_dz - cz_q
+            xi = (px_w * ux_q + py_w * uy_q + pz_w * uz_q) / max(1e-4, qd.half_w)
+            eta = (px_w * vx_q + py_w * vy_q + pz_w * vz_q) / max(1e-4, qd.half_h)
+            sub_t = t_best[v0:v1, u0:u1]
+            if qd.veh_idx > 0:
+                depth_tol = torch.where(veh_buf[v0:v1, u0:u1] == qd.veh_idx, 0.03, 0.0)
+            else:
+                depth_tol = 0.0
+            in_quad = (denom < -1e-5) & (lam_q > 0.16) & (xi.abs() <= 1.0) & (eta.abs() <= 1.0) & (lam_q <= sub_t + depth_tol)
+            t_best[v0:v1, u0:u1] = torch.where(in_quad, torch.minimum(lam_q, sub_t), sub_t)
+            veh_buf[v0:v1, u0:u1].masked_fill_(in_quad, int(qd.veh_idx))
+
+        return int((veh_buf == int(veh_idx)).sum().item())
 
     # Canonical 12-slot `(r0, r1, c0, c1, u_span, nyquist_ph_px)` ROIs on `(16, 32)` rectified plate plane:
     # Slots 0..3: region kanji | Slots 4..6: classification | Slot 7: kana | Slots 8..11: 4-digit serial
@@ -6520,6 +8334,8 @@ class Scene3DGPUEngine:
         # Broadcast each component independently: shadow rays have scalar directions,
         # camera rays have tensors, and mixed broadcastable components are also valid.
         dl_x, dl_y, dl_z = (torch.as_tensor(d, dtype=ox.dtype, device=ox.device) for d in (dl_x, dl_y, dl_z))
+        ox_b, oy_b, oz_b, dlx_b, dly_b, dlz_b = torch.broadcast_tensors(ox, oy, oz, dl_x, dl_y, dl_z)
+        out_shape = ox_b.shape
 
         def slab(origin: Tensor, direction: Tensor, half_extent: float) -> tuple[Tensor, Tensor]:
             parallel = direction == 0
@@ -6530,9 +8346,9 @@ class Scene3DGPUEngine:
             high = torch.where(parallel, torch.where(inside, torch.inf, -torch.inf), torch.maximum(a, b))
             return low, high
 
-        tx0, tx1 = slab(ox, dl_x, sx)
-        ty0, ty1 = slab(oy, dl_y, sy)
-        tz0, tz1 = slab(oz, dl_z, sz)
+        tx0, tx1 = slab(ox_b, dlx_b, sx)
+        ty0, ty1 = slab(oy_b, dly_b, sy)
+        tz0, tz1 = slab(oz_b, dlz_b, sz)
         t_bmin = torch.maximum(torch.maximum(tx0, ty0), tz0)
         t_bmax = torch.minimum(torch.minimum(tx1, ty1), tz1)
         box_ok = (t_bmax >= t_bmin) & (t_bmax > t_near) & torch.isfinite(t_bmax)
@@ -6547,37 +8363,88 @@ class Scene3DGPUEngine:
         t_a = torch.where(box_ok, t_bmin.clamp_min(t_near), torch.zeros_like(t_bmin))
         t_b = torch.where(box_ok, torch.maximum(t_a, t_bmax), t_a)
 
-        def shell_residual(t: Tensor) -> Tensor:
-            return ((ox + t * dl_x) - cls._flex_wave_eval(
-                oy + t * dl_y, oz + t * dl_z, amp_f, w_f, ph_f)).abs() - tau
-
-        initial = shell_residual(t_a)
+        initial = ((ox_b + t_a * dlx_b) - cls._flex_wave_eval(oy_b + t_a * dly_b, oz_b + t_a * dlz_b, amp_f, w_f, ph_f)).abs() - tau
         entry = box_ok & (initial <= 0) & (t_bmin > t_near)
         inside = (initial < 0) & ~entry
         direction = torch.where(inside, -1., 1.)
         # |df/dy| <= (0.62 + 0.26*2.3 + 0.12*4.1) A w = 1.71 A w
         # |df/dz| <= (0.62*0.35*2.1 + 0.26*1.7 + 0.12*3.3) A = 1.2937 A
-        lipschitz = (dl_x.abs() + abs(amp_f) * (1.71 * w_f * dl_y.abs() + 1.2937 * dl_z.abs())).clamp_min(1e-12)
-        t = t_a.clone()
-        found = entry.clone()
-        active = box_ok & ~found
-        while bool(active.any()):
-            residual = direction * shell_residual(t)
-            at_end = t >= t_b
-            contact = active & ((residual <= 1e-5) | (inside & at_end))
-            found |= contact
-            active &= ~contact & ~at_end
-            step = residual.clamp_min(0.) / lipschitz
-            next_t = torch.minimum(t + step, t_b)
-            # At large ray parameters float32 spacing can exceed the surface
-            # tolerance. Accept only arithmetic stagnation, never a fixed step cap.
-            stagnant = active & (next_t <= t)
-            found |= stagnant
-            active &= ~stagnant
-            t = torch.where(active, next_t, t)
+        lipschitz = (dlx_b.abs() + abs(amp_f) * (1.71 * w_f * dly_b.abs() + 1.2937 * dlz_b.abs())).clamp_min(1e-12)
 
-        t_hit = torch.where(found, t, torch.full_like(t, 1e6))
-        return t_hit, found & (t_hit > t_near)
+        t_flat = t_a.reshape(-1).clone()
+        found_flat = entry.reshape(-1).clone()
+        active_flat = (box_ok & ~entry).reshape(-1)
+        cur_idx = active_flat.nonzero(as_tuple=False).squeeze(-1)
+        if cur_idx.numel() > 0:
+            ox_a = ox_b.reshape(-1)[cur_idx].contiguous()
+            oy_a = oy_b.reshape(-1)[cur_idx].contiguous()
+            oz_a = oz_b.reshape(-1)[cur_idx].contiguous()
+            dx_a = dlx_b.reshape(-1)[cur_idx].contiguous()
+            dy_a = dly_b.reshape(-1)[cur_idx].contiguous()
+            dz_a = dlz_b.reshape(-1)[cur_idx].contiguous()
+            ta_1 = t_flat[cur_idx].contiguous()
+            tb_1 = t_b.reshape(-1)[cur_idx].contiguous()
+            dir_1 = direction.reshape(-1)[cur_idx].contiguous()
+            lip_1 = lipschitz.reshape(-1)[cur_idx].contiguous()
+            ins_1 = inside.reshape(-1)[cur_idx].contiguous()
+            if _HAS_TRITON and ox_a.is_cuda and ox_a.dtype == torch.float32:
+                n_act = int(cur_idx.numel())
+                t_out_k = torch.empty_like(ta_1)
+                f_out_k = torch.empty((n_act,), device=ox_a.device, dtype=torch.int8)
+                ins_i8 = ins_1.to(torch.int8).contiguous()
+                _triton_flex_march_kernel[(triton.cdiv(n_act, 256),)](
+                    ox_a, oy_a, oz_a, dx_a, dy_a, dz_a,
+                    ta_1, tb_1, dir_1, lip_1, ins_i8,
+                    t_out_k, f_out_k,
+                    n_act, float(tau), amp_f, w_f, ph_f,
+                    BLOCK=256,
+                )
+                t_flat[cur_idx] = t_out_k
+                found_flat[cur_idx] = f_out_k != 0
+            else:
+                fnd_1 = torch.zeros_like(ins_1)
+                alv_1 = torch.ones_like(ins_1)
+                blk_iter = 0
+                while bool(alv_1.any()):
+                    for _ in range(8):
+                        res_1 = dir_1 * (
+                            ((ox_a + ta_1 * dx_a) - cls._flex_wave_eval(oy_a + ta_1 * dy_a, oz_a + ta_1 * dz_a, amp_f, w_f, ph_f)).abs()
+                            - tau
+                        )
+                        at_end = ta_1 >= tb_1
+                        contact = alv_1 & ((res_1 <= 1e-5) | (ins_1 & at_end))
+                        fnd_1 |= contact
+                        alv_1 &= ~contact & ~at_end
+                        step_1 = res_1.clamp_min(0.) / lip_1
+                        next_t = torch.minimum(ta_1 + step_1, tb_1)
+                        stagnant = alv_1 & (next_t <= ta_1)
+                        fnd_1 |= stagnant
+                        alv_1 &= ~stagnant
+                        ta_1 = torch.where(alv_1, next_t, ta_1)
+                    blk_iter += 1
+                    if blk_iter % 3 == 0 and cur_idx.numel() > 512:
+                        done_m = ~alv_1
+                        done_idx = cur_idx[done_m]
+                        if done_idx.numel() > 0:
+                            t_flat[done_idx] = ta_1[done_m]
+                            found_flat[done_idx] = fnd_1[done_m]
+                            keep_m = alv_1
+                            cur_idx = cur_idx[keep_m]
+                            if cur_idx.numel() == 0:
+                                break
+                            ox_a, oy_a, oz_a = ox_a[keep_m], oy_a[keep_m], oz_a[keep_m]
+                            dx_a, dy_a, dz_a = dx_a[keep_m], dy_a[keep_m], dz_a[keep_m]
+                            ta_1, tb_1 = ta_1[keep_m], tb_1[keep_m]
+                            dir_1, lip_1 = dir_1[keep_m], lip_1[keep_m]
+                            ins_1, fnd_1, alv_1 = ins_1[keep_m], fnd_1[keep_m], alv_1[keep_m]
+                if cur_idx.numel() > 0:
+                    t_flat[cur_idx] = ta_1
+                    found_flat[cur_idx] = fnd_1
+
+        t_out = t_flat.reshape(out_shape)
+        found_out = found_flat.reshape(out_shape)
+        t_hit = torch.where(found_out, t_out, torch.full_like(t_out, 1e6))
+        return t_hit, found_out & (t_hit > t_near)
 
     @torch.no_grad()
     def _render_substep_hdr(
@@ -6609,6 +8476,19 @@ class Scene3DGPUEngine:
         ph_e = float(es["seed_ph"])
         g_type = int(es["ground_type"])
         sky_type = int(es["skyline_type"])
+        is_train_v7 = self.config.domain_split == "train"
+        sun_mult = float(es.get("sun_mult", 1.0))
+        sky_amb_mult = float(es.get("sky_amb_mult", 1.0))
+        cloud_cover = float(es.get("cloud_cover", 0.55 if (is_train_v7 and env_style is not None) else 0.0))
+        sun_tint_t = torch.tensor(
+            [
+                float(es.get("sun_tint_r", 1.0)),
+                float(es.get("sun_tint_g", 1.0)),
+                float(es.get("sun_tint_b", 1.0)),
+            ],
+            device=dev,
+            dtype=torch.float32,
+        )[:, None, None]
 
         vv = torch.arange(h, device=dev, dtype=torch.float32)
         uu = torch.arange(w, device=dev, dtype=torch.float32)
@@ -6668,14 +8548,35 @@ class Scene3DGPUEngine:
             hor_v = sky_horizon.view(3, *([1] * rz.ndim))
             up_rad = hor_v * (1.0 - sky_mix) + zen_v * sky_mix
             if not is_night:
-                cloud_f = (
-                    0.55 * torch.sin(az_ang * 5.2 + ph_e) * torch.cos(rz * 11.0 - ph_e * 0.7)
-                    + 0.45 * torch.sin(az_ang * 13.7 - rz * 19.0 + ph_e * 1.9)
-                ).clamp(0.0, 1.0) * (rz > 0.02).to(torch.float32)
-                c_tint = torch.tensor([0.22, 0.23, 0.25], device=dev, dtype=torch.float32).view(3, *([1] * rz.ndim))
-                up_rad = up_rad + cloud_f.unsqueeze(0) * c_tint * env_energy_gate
+                if cloud_cover > 0.01:
+                    rz_c = rz.clamp_min(0.055)
+                    cu = rx / rz_c
+                    cv = ry / rz_c
+                    n1 = _road_value_noise(cu * 0.34, cv * 0.34, ph_e)
+                    n2 = _road_value_noise(cu * 0.90, cv * 0.90, ph_e * 1.7 + 2.3)
+                    n3 = _road_value_noise(cu * 2.15, cv * 2.15, ph_e * 2.9 + 5.1)
+                    c_raw = 0.58 * n1 + 0.28 * n2 + 0.14 * n3
+                    c_thr = 0.72 - 0.42 * min(1.0, cloud_cover)
+                    c_fade = ((rz - 0.015) / 0.16).clamp(0.0, 1.0)
+                    c_alpha = ((c_raw - c_thr) / max(0.14, 1.0 - c_thr)).clamp(0.0, 1.0).pow(1.30) * c_fade
+                    c_lit = (0.76 + 0.30 * n2).clamp(0.68, 1.08)
+                    c_base = torch.tensor([1.06, 1.05, 1.02], device=dev, dtype=torch.float32).view(3, *([1] * rz.ndim))
+                    c_sh = torch.tensor([0.70, 0.76, 0.84], device=dev, dtype=torch.float32).view(3, *([1] * rz.ndim))
+                    cloud_rgb = (c_sh * (1.0 - n2.unsqueeze(0)) + c_base * n2.unsqueeze(0)) * c_lit.unsqueeze(0)
+                    blend_c = (0.88 * c_alpha).unsqueeze(0) * env_energy_gate
+                    up_rad = up_rad * (1.0 - blend_c) + cloud_rgb * blend_c
+                    sun_dot = (rx * sd_x + ry * sd_y + rz * sd_z).clamp(0.0, 1.0)
+                    halo_s = (0.42 * (1.0 - 0.65 * min(1.0, cloud_cover)) * sun_dot.pow(18.0) * (rz > 0.0).to(torch.float32)).unsqueeze(0)
+                    up_rad = up_rad + halo_s * torch.tensor([1.15, 1.02, 0.82], device=dev, dtype=torch.float32).view(3, *([1] * rz.ndim)) * env_energy_gate
+                else:
+                    cloud_f = (
+                        0.55 * torch.sin(az_ang * 5.2 + ph_e) * torch.cos(rz * 11.0 - ph_e * 0.7)
+                        + 0.45 * torch.sin(az_ang * 13.7 - rz * 19.0 + ph_e * 1.9)
+                    ).clamp(0.0, 1.0) * (rz > 0.02).to(torch.float32)
+                    c_tint = torch.tensor([0.22, 0.23, 0.25], device=dev, dtype=torch.float32).view(3, *([1] * rz.ndim))
+                    up_rad = up_rad + cloud_f.unsqueeze(0) * c_tint * env_energy_gate
 
-            gnd_irr = 0.045 if is_night else (0.34 + 0.62 * max(0.08, sd_z))
+            gnd_irr = 0.045 if is_night else (0.34 + 0.62 * max(0.08, sd_z)) * max(1.0, sun_mult * 0.85)
             gnd_col = torch.tensor(
                 [road_albedo_base * 1.02 * gnd_irr, road_albedo_base * 1.00 * gnd_irr, road_albedo_base * 0.96 * gnd_irr],
                 device=dev,
@@ -6686,32 +8587,80 @@ class Scene3DGPUEngine:
             env_rgb = torch.where((rz >= 0.0).unsqueeze(0), up_rad, down_rad)
 
             if sky_type == 0:
-                step_az = torch.floor(az_ang * 11.0 + ph_e)
-                bldg_h = 0.05 + 0.11 * (0.5 + 0.5 * torch.sin(step_az * 3.7 + ph_e))
-                in_bldg = (rz >= -0.01) & (rz < bldg_h)
-                win_u = ((az_ang * 140.0).remainder(1.0) > 0.42).to(torch.float32)
-                win_v = ((rz * 110.0).remainder(1.0) > 0.45).to(torch.float32)
-                cell_hash = torch.sin(torch.floor(az_ang * 140.0) * 12.9898 + torch.floor(rz * 110.0) * 78.233 + ph_e)
-                room_on = (cell_hash > 0.66).to(torch.float32) if is_night else (cell_hash > 0.15).to(torch.float32)
-                win_lit = win_u * win_v * room_on
-                b_base = 0.015 if is_night else 0.13
-                b_win = 0.22 if is_night else 0.05
-                b_col = torch.stack(
-                    [
-                        torch.full_like(rz, b_base) + b_win * win_lit,
-                        torch.full_like(rz, b_base * 1.02) + b_win * 0.92 * win_lit,
-                        torch.full_like(rz, b_base * 1.08) + b_win * 0.70 * win_lit,
-                    ],
-                    dim=0,
-                )
-                env_rgb = torch.where(in_bldg.unsqueeze(0), b_col * env_energy_gate, env_rgb)
+                if is_train_v7 and (not is_night) and (env_style is not None):
+                    step_az = torch.floor(az_ang * 13.0 + ph_e)
+                    bldg_h = 0.055 + 0.145 * (0.5 + 0.5 * torch.sin(step_az * 3.7 + ph_e))
+                    in_bldg = (rz >= -0.01) & (rz < bldg_h)
+                    bh_id = torch.remainder(step_az * 0.61803398 + ph_e * 0.19, 1.0)
+                    # Vibrant sunlit Japanese urban facades: cream/white, beige, steel-blue glass, terracotta, light gray
+                    b_r = torch.where(bh_id < 0.28, 0.78, torch.where(bh_id < 0.54, 0.66, torch.where(bh_id < 0.76, 0.44, torch.where(bh_id < 0.90, 0.68, 0.60))))
+                    b_g = torch.where(bh_id < 0.28, 0.77, torch.where(bh_id < 0.54, 0.62, torch.where(bh_id < 0.76, 0.56, torch.where(bh_id < 0.90, 0.48, 0.62))))
+                    b_b = torch.where(bh_id < 0.28, 0.72, torch.where(bh_id < 0.54, 0.54, torch.where(bh_id < 0.76, 0.70, torch.where(bh_id < 0.90, 0.38, 0.66))))
+                    shade_b = (0.78 + 0.26 * torch.sin(step_az * 1.9 + sd_x * 2.0)) * min(1.35, max(0.55, sun_mult * 0.82))
+                    win_u = ((az_ang * 165.0).remainder(1.0) > 0.36).to(torch.float32)
+                    win_v = ((rz * 125.0).remainder(1.0) > 0.40).to(torch.float32)
+                    is_win = win_u * win_v * (rz > 0.018).to(torch.float32)
+                    # Sparse realistic Japanese commercial signage accents on ~26% of lower skyline buildings
+                    in_sign_band = (rz >= 0.004) & (rz < 0.026) & (bh_id > 0.72) & (((az_ang * 38.0).remainder(1.0)) < 0.42)
+                    sb_h = torch.remainder(torch.floor(az_ang * 38.0) * 0.381966 + ph_e, 1.0)
+                    sb_r = torch.where(sb_h < 0.30, 0.72, torch.where(sb_h < 0.60, 0.14, torch.where(sb_h < 0.82, 0.78, 0.14)))
+                    sb_g = torch.where(sb_h < 0.30, 0.20, torch.where(sb_h < 0.60, 0.36, torch.where(sb_h < 0.82, 0.64, 0.48)))
+                    sb_b = torch.where(sb_h < 0.30, 0.18, torch.where(sb_h < 0.60, 0.68, torch.where(sb_h < 0.82, 0.18, 0.28)))
+                    c_r = b_r * shade_b * (1.0 - 0.55 * is_win) + 0.34 * is_win
+                    c_g = b_g * shade_b * (1.0 - 0.55 * is_win) + 0.48 * is_win
+                    c_b = b_b * shade_b * (1.0 - 0.55 * is_win) + 0.68 * is_win
+                    b_col = torch.stack(
+                        [
+                            torch.where(in_sign_band, sb_r, c_r),
+                            torch.where(in_sign_band, sb_g, c_g),
+                            torch.where(in_sign_band, sb_b, c_b),
+                        ],
+                        dim=0,
+                    )
+                    env_rgb = torch.where(in_bldg.unsqueeze(0), b_col * env_energy_gate, env_rgb)
+                else:
+                    step_az = torch.floor(az_ang * 11.0 + ph_e)
+                    bldg_h = 0.05 + 0.11 * (0.5 + 0.5 * torch.sin(step_az * 3.7 + ph_e))
+                    in_bldg = (rz >= -0.01) & (rz < bldg_h)
+                    win_u = ((az_ang * 140.0).remainder(1.0) > 0.42).to(torch.float32)
+                    win_v = ((rz * 110.0).remainder(1.0) > 0.45).to(torch.float32)
+                    cell_hash = torch.sin(torch.floor(az_ang * 140.0) * 12.9898 + torch.floor(rz * 110.0) * 78.233 + ph_e)
+                    room_on = (cell_hash > 0.62).to(torch.float32) if is_night else (cell_hash > 0.15).to(torch.float32)
+                    win_lit = win_u * win_v * room_on
+                    b_base = 0.018 if is_night else 0.16
+                    b_win = (0.34 if is_train_v7 else 0.22) if is_night else 0.06
+                    b_col = torch.stack(
+                        [
+                            torch.full_like(rz, b_base) + b_win * win_lit,
+                            torch.full_like(rz, b_base * 1.02) + b_win * 0.90 * win_lit,
+                            torch.full_like(rz, b_base * 1.08) + b_win * 0.68 * win_lit,
+                        ],
+                        dim=0,
+                    )
+                    env_rgb = torch.where(in_bldg.unsqueeze(0), b_col * env_energy_gate, env_rgb)
             elif sky_type == 1:
-                tree_h = 0.04 + 0.07 * (0.5 + 0.5 * torch.sin(az_ang * 9.3 + ph_e) * torch.cos(az_ang * 23.1 - ph_e))
-                in_tree = (rz >= -0.01) & (rz < tree_h)
-                leaf = 0.75 + 0.25 * torch.sin(az_ang * 61.0 + rz * 83.0)
-                t_scale = 0.018 if is_night else 0.095
-                t_col = torch.stack([leaf * t_scale * 0.65, leaf * t_scale * 1.15, leaf * t_scale * 0.58], dim=0)
-                env_rgb = torch.where(in_tree.unsqueeze(0), t_col * env_energy_gate, env_rgb)
+                if is_train_v7 and (not is_night) and (env_style is not None):
+                    tree_h = 0.05 + 0.10 * (0.5 + 0.5 * torch.sin(az_ang * 9.3 + ph_e) * torch.cos(az_ang * 23.1 - ph_e))
+                    in_tree = (rz >= -0.01) & (rz < tree_h)
+                    leaf = 0.58 + 0.42 * torch.sin(az_ang * 61.0 + rz * 83.0) * torch.cos(az_ang * 37.0 - rz * 51.0)
+                    sun_top = (rz / tree_h.clamp_min(0.04)).clamp(0.0, 1.0)
+                    t_sc = (0.20 + 0.22 * sun_top) * min(1.35, max(0.55, sun_mult * 0.85))
+                    t_col = torch.stack([leaf * t_sc * 0.58, leaf * t_sc * 1.28, leaf * t_sc * 0.34], dim=0)
+                    env_rgb = torch.where(in_tree.unsqueeze(0), t_col * env_energy_gate, env_rgb)
+                else:
+                    tree_h = 0.04 + 0.07 * (0.5 + 0.5 * torch.sin(az_ang * 9.3 + ph_e) * torch.cos(az_ang * 23.1 - ph_e))
+                    in_tree = (rz >= -0.01) & (rz < tree_h)
+                    leaf = 0.75 + 0.25 * torch.sin(az_ang * 61.0 + rz * 83.0)
+                    t_scale = 0.018 if is_night else 0.095
+                    t_col = torch.stack([leaf * t_scale * 0.65, leaf * t_scale * 1.15, leaf * t_scale * 0.58], dim=0)
+                    env_rgb = torch.where(in_tree.unsqueeze(0), t_col * env_energy_gate, env_rgb)
+            elif is_train_v7 and (not is_night) and (env_style is not None):
+                # Soft distant Japanese mountain ridge silhouette on open horizon (preserves night constant-white test!)
+                mtn_h = 0.03 + 0.055 * (0.5 + 0.5 * torch.sin(az_ang * 3.1 + ph_e) + 0.3 * torch.cos(az_ang * 7.4 - ph_e))
+                in_mtn = (rz >= -0.005) & (rz < mtn_h)
+                haze_m = (0.55 + 0.45 * (rz / mtn_h.clamp_min(0.03))).clamp(0.0, 1.0)
+                m_col = torch.stack([0.30 + 0.22 * haze_m, 0.42 + 0.20 * haze_m, 0.48 + 0.24 * haze_m], dim=0)
+                env_rgb = torch.where(in_mtn.unsqueeze(0), m_col * env_energy_gate, env_rgb)
             return env_rgb
 
         # Background sky / distant skyline radiance
@@ -6772,18 +8721,36 @@ class Scene3DGPUEngine:
                     base_l = (road_albedo_base * 1.45 * (1.0 + 0.24 * gran) * (1.0 - rut)).clamp(0.025, 0.42)
                     road_rgb = torch.stack([base_l * 1.24, base_l * 0.98, base_l * 0.72], dim=0)
                 else:
-                    lane_mark = (((torch.abs(wx - 3.1) < 0.07) | (torch.abs(wx + 3.1) < 0.07)) & (ph_e < 4.2)).to(torch.float32)
-                    stop_bar = ((wy > 5.8) & (wy < 6.15) & (wx.abs() < 2.9) & (ph_e > 2.5)).to(torch.float32) * 0.75
-                    mark = torch.maximum(lane_mark, stop_bar)
-                    road_lum = (road_albedo_base * (1.0 + 0.18 * gran) * (1.0 - tar_patch)).clamp(0.02, 0.44)
-                    road_rgb = torch.stack(
-                        [
-                            road_lum * 1.01 + 0.38 * mark,
-                            road_lum * 1.00 + 0.38 * mark,
-                            road_lum * 0.97 + 0.36 * mark,
-                        ],
-                        dim=0,
-                    )
+                    lane_mark = (((torch.abs(wx - 3.1) < 0.075) | (torch.abs(wx + 3.1) < 0.075)) & (ph_e < 4.8)).to(torch.float32)
+                    stop_bar = ((wy > 5.8) & (wy < 6.18) & (wx.abs() < 2.9) & (ph_e > 2.5)).to(torch.float32) * 0.80
+                    if is_train_v7 and (not is_night) and (env_style is not None):
+                        dash_c = ((wx.abs() < 0.068) & ((wy.remainder(5.2) < 2.3) | (ph_e > 3.6))).to(torch.float32)
+                        is_yellow_c = (ph_e > 3.6)
+                        mark = torch.maximum(lane_mark, stop_bar)
+                        road_lum = (road_albedo_base * (1.0 + 0.18 * gran) * (1.0 - tar_patch)).clamp(0.02, 0.48)
+                        r_ch = road_lum * 1.01 + 0.56 * mark + (0.76 if is_yellow_c else 0.54) * dash_c
+                        g_ch = road_lum * 1.00 + 0.56 * mark + (0.58 if is_yellow_c else 0.54) * dash_c
+                        b_ch = road_lum * 0.98 + 0.54 * mark + (0.04 if is_yellow_c else 0.52) * dash_c
+                        # Bright concrete curbs & tiled Japanese sidewalks outside `|wx| > 4.25m`
+                        in_sw = wx.abs() > 4.25
+                        curb_groove = (wx.abs() > 4.18) & (wx.abs() <= 4.28)
+                        sw_seam = ((wx.remainder(1.15).abs() < 0.028) | (wy.remainder(1.25).abs() < 0.028)).to(torch.float32)
+                        sw_lum = (0.42 * (1.0 + 0.08 * gran) * (1.0 - 0.34 * sw_seam)).clamp(0.10, 0.62)
+                        r_ch = torch.where(curb_groove, road_lum * 0.45, torch.where(in_sw, sw_lum * 1.01, r_ch))
+                        g_ch = torch.where(curb_groove, road_lum * 0.45, torch.where(in_sw, sw_lum * 1.00, g_ch))
+                        b_ch = torch.where(curb_groove, road_lum * 0.46, torch.where(in_sw, sw_lum * 0.98, b_ch))
+                        road_rgb = torch.stack([r_ch, g_ch, b_ch], dim=0)
+                    else:
+                        mark = torch.maximum(lane_mark, stop_bar)
+                        road_lum = (road_albedo_base * (1.0 + 0.18 * gran) * (1.0 - tar_patch)).clamp(0.02, 0.44)
+                        road_rgb = torch.stack(
+                            [
+                                road_lum * 1.01 + 0.38 * mark,
+                                road_lum * 1.00 + 0.38 * mark,
+                                road_lum * 0.97 + 0.36 * mark,
+                            ],
+                            dim=0,
+                        )
                 road_rgb = road_rgb * dapple[None, :, :]
                 if float(es.get("has_zebra", 0.0)) > 0.5:
                     zy0 = float(es.get("zebra_y0", 6.2))
@@ -6828,529 +8795,714 @@ class Scene3DGPUEngine:
                 t_best = torch.where(valid_r, lam_r, t_best)
                 t_geom = torch.where(valid_r, lam_r, t_geom)
 
-        # Pass 1B: 3D Volumetric, D_N Perforated, & Flexural Wave Sheet Primitives
-        for p_idx, pr in enumerate(prims):
-            sx, sy, sz = pr.half_ext
-            rad_bound = math.sqrt(sx * sx + sy * sy + sz * sz)
-            rel_c = (np.array(pr.center, dtype=np.float32) - cam_o) @ R_cam
-            if rel_c[2] + rad_bound < 0.20:
-                continue
-            uv_clip = self._clip_obb_to_near_plane_uv(
-                np.array(pr.center, dtype=np.float32), pr.rot_w2l.T, pr.half_ext,
-                cam_o, R_cam, fx, fy, cx, cy, z_near=0.16,
-            )
-            if uv_clip.shape[0] == 0:
-                continue
-            u0 = max(0, int(math.floor(float(uv_clip[:, 0].min()) - 2.0)))
-            u1 = min(w, int(math.ceil(float(uv_clip[:, 0].max()) + 2.0)))
-            v0 = max(0, int(math.floor(float(uv_clip[:, 1].min()) - 2.0)))
-            v1 = min(h, int(math.ceil(float(uv_clip[:, 1].max()) + 2.0)))
-            if u1 <= u0 or v1 <= v0:
-                continue
-            px_span_pr = max(4.0, float(max(u1 - u0, v1 - v0)))
+        # Pass 1B: 2-Stage Zero-Sync Geometry + Single-Pass Deferred Material Shader for 3D Primitives
+        n_prims = len(prims)
+        if n_prims > 0:
+            rot_np = np.stack([pr.rot_w2l for pr in prims], axis=0).astype(np.float32)
+            cen_np = np.array([pr.center for pr in prims], dtype=np.float32)
+            he_np = np.array([pr.half_ext for pr in prims], dtype=np.float32)
+            mat_np = np.empty((n_prims, 16), dtype=np.float32)
+            int_np = np.empty((n_prims, 5), dtype=np.int32)
+            for pi_k, pr in enumerate(prims):
+                mat_np[pi_k, 0:3] = pr.albedo_rgb
+                mat_np[pi_k, 3:6] = pr.livery_rgb
+                mat_np[pi_k, 6] = pr.roughness
+                mat_np[pi_k, 7] = pr.metallic
+                mat_np[pi_k, 8] = pr.specular_f0
+                mat_np[pi_k, 9] = pr.clearcoat
+                mat_np[pi_k, 10] = pr.retro_gain
+                mat_np[pi_k, 11] = pr.rib_freq
+                mat_np[pi_k, 12] = pr.mud_level
+                mat_np[pi_k, 13] = pr.mud_phase
+                mat_np[pi_k, 14] = pr.normal_undul_amp
+                mat_np[pi_k, 15] = pr.nir_scale_override
+                int_np[pi_k, 0] = pr.veh_idx
+                int_np[pi_k, 1] = pr.role
+                int_np[pi_k, 2] = pr.shape
+                int_np[pi_k, 3] = pr.radial_n
+                int_np[pi_k, 4] = pr.livery_mode
 
-            sub_dx = dx_w[v0:v1, u0:u1]
-            sub_dy = dy_w[v0:v1, u0:u1]
-            sub_dz = dz_w[v0:v1, u0:u1]
+            Rw2l_all = torch.from_numpy(rot_np).to(device=dev, dtype=torch.float32)
+            cen_all = torch.from_numpy(cen_np).to(device=dev, dtype=torch.float32)
+            he_all = torch.from_numpy(he_np).to(device=dev, dtype=torch.float32)
+            mat_all = torch.from_numpy(mat_np).to(device=dev, dtype=torch.float32)
+            int_all = torch.from_numpy(int_np).to(device=dev, dtype=torch.int32)
+            oc_l_all = torch.bmm(Rw2l_all, (cam_o_t[None, :] - cen_all).unsqueeze(-1)).squeeze(-1)
 
-            Rw2l_t = torch.from_numpy(pr.rot_w2l).to(device=dev, dtype=torch.float32)
-            oc_w = cam_o_t - torch.tensor(pr.center, device=dev, dtype=torch.float32)
-            oc_l = Rw2l_t @ oc_w
-            dl_x = Rw2l_t[0, 0] * sub_dx + Rw2l_t[0, 1] * sub_dy + Rw2l_t[0, 2] * sub_dz
-            dl_y = Rw2l_t[1, 0] * sub_dx + Rw2l_t[1, 1] * sub_dy + Rw2l_t[1, 2] * sub_dz
-            dl_z = Rw2l_t[2, 0] * sub_dx + Rw2l_t[2, 1] * sub_dy + Rw2l_t[2, 2] * sub_dz
+            hit_lx = torch.zeros((h, w), device=dev, dtype=torch.float32)
+            hit_ly = torch.zeros((h, w), device=dev, dtype=torch.float32)
+            hit_lz = torch.zeros((h, w), device=dev, dtype=torch.float32)
+            nl_x_buf = torch.zeros((h, w), device=dev, dtype=torch.float32)
+            nl_y_buf = torch.zeros((h, w), device=dev, dtype=torch.float32)
+            nl_z_buf = torch.ones((h, w), device=dev, dtype=torch.float32)
+            is_cap_buf = torch.zeros((h, w), device=dev, dtype=torch.bool)
+            decal_rois: list[tuple[int, int, int, int, int, float]] = []
 
-            is_cap = torch.zeros_like(dl_x, dtype=torch.bool)
-            if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
-                inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
-                inv_y = torch.where(dl_y.abs() > 1e-6, 1.0 / dl_y, torch.copysign(torch.full_like(dl_y, 1e6), dl_y))
-                inv_z = torch.where(dl_z.abs() > 1e-6, 1.0 / dl_z, torch.copysign(torch.full_like(dl_z, 1e6), dl_z))
+            # Stage 1B-1: Geometry-Only Z-Buffer (Fused Triton 2D-Tile OBB Kernel on CUDA + exact PyTorch fallback)
+            rois_np = self._batch_obb_rois_uv(cen_np, rot_np, he_np, cam_o, R_cam, fx, fy, cx, cy, w, h, z_near=0.16, pad=2.0)
+            use_triton_cuda = _HAS_TRITON and dev.type == "cuda"
+            if use_triton_cuda:
+                oc_l_np = np.einsum("pij,pj->pi", rot_np, cam_o[None, :] - cen_np).astype(np.float32)
+                obb_rows_1b: list[np.ndarray] = []
+                obb_pids_1b: list[int] = []
+                cd_rows_1b: list[np.ndarray] = []
+                cd_pids_1b: list[int] = []
+                curved_indices_1b: list[int] = []
+                for p_idx, pr in enumerate(prims):
+                    u0, u1, v0, v1 = int(rois_np[p_idx, 0]), int(rois_np[p_idx, 1]), int(rois_np[p_idx, 2]), int(rois_np[p_idx, 3])
+                    if u1 <= u0 or v1 <= v0:
+                        continue
+                    if pr.decal_spec is not None and len(self.bank.alpha_decal_mips) > 0:
+                        decal_rois.append((p_idx, u0, u1, v0, v1, max(4.0, float(max(u1 - u0, v1 - v0)))))
+                    if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
+                        row = np.empty((20,), dtype=np.float32)
+                        row[0:9] = rot_np[p_idx].reshape(9)
+                        row[9:12] = oc_l_np[p_idx]
+                        row[12:15] = he_np[p_idx]
+                        row[15] = float(pr.slope_param) if pr.shape == _SHAPE_SLOPED_CAB else 0.0
+                        row[16:20] = (float(u0), float(u1), float(v0), float(v1))
+                        obb_rows_1b.append(row)
+                        obb_pids_1b.append(p_idx)
+                    elif pr.shape in (_SHAPE_CYLINDER_X, _SHAPE_TAPER_DRUM_Y):
+                        crow = np.empty((22,), dtype=np.float32)
+                        crow[0:9] = rot_np[p_idx].reshape(9)
+                        crow[9:12] = oc_l_np[p_idx]
+                        crow[12:15] = he_np[p_idx]
+                        is_d = pr.shape == _SHAPE_TAPER_DRUM_Y
+                        crow[15] = 1.0 if is_d else 0.0
+                        crow[16] = float(np.clip(pr.slope_param, 0.0, 0.65)) if is_d else float(pr.radial_n)
+                        crow[17] = float(pr.mud_phase)
+                        crow[18:22] = (float(u0), float(u1), float(v0), float(v1))
+                        cd_rows_1b.append(crow)
+                        cd_pids_1b.append(p_idx)
+                    else:
+                        curved_indices_1b.append(p_idx)
+                dx_c = dy_c = dz_c = None
+                g2d = (triton.cdiv(w, 16), triton.cdiv(h, 16))
+                if obb_rows_1b:
+                    dx_c, dy_c, dz_c = dx_w.contiguous(), dy_w.contiguous(), dz_w.contiguous()
+                    pdata_t = torch.from_numpy(np.stack(obb_rows_1b, axis=0)).to(device=dev, dtype=torch.float32)
+                    ppid_t = torch.tensor(obb_pids_1b, device=dev, dtype=torch.int32)
+                    _triton_obb_raycast_kernel[g2d](
+                        dx_c, dy_c, dz_c,
+                        t_best, prim_id_buf, hit_lx, hit_ly, hit_lz, nl_x_buf, nl_y_buf, nl_z_buf,
+                        pdata_t, ppid_t, h, w, len(obb_rows_1b),
+                    )
+                if cd_rows_1b:
+                    if dx_c is None:
+                        dx_c, dy_c, dz_c = dx_w.contiguous(), dy_w.contiguous(), dz_w.contiguous()
+                    cdata_t = torch.from_numpy(np.stack(cd_rows_1b, axis=0)).to(device=dev, dtype=torch.float32)
+                    cpid_t = torch.tensor(cd_pids_1b, device=dev, dtype=torch.int32)
+                    is_cap_i8 = is_cap_buf.to(torch.int8).contiguous()
+                    _triton_cyl_drum_raycast_kernel[g2d](
+                        dx_c, dy_c, dz_c,
+                        t_best, prim_id_buf, hit_lx, hit_ly, hit_lz, nl_x_buf, nl_y_buf, nl_z_buf, is_cap_i8,
+                        cdata_t, cpid_t, h, w, len(cd_rows_1b),
+                    )
+                    is_cap_buf = is_cap_i8 != 0
+                iter_prims_1b = curved_indices_1b
+            else:
+                iter_prims_1b = list(range(n_prims))
 
-                tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
-                ty0, ty1 = (-sy - oc_l[1]) * inv_y, (sy - oc_l[1]) * inv_y
-                tz0, tz1 = (-sz - oc_l[2]) * inv_z, (sz - oc_l[2]) * inv_z
-
-                t_min = torch.maximum(torch.maximum(torch.minimum(tx0, tx1), torch.minimum(ty0, ty1)), torch.minimum(tz0, tz1))
-                t_max = torch.minimum(torch.minimum(torch.maximum(tx0, tx1), torch.maximum(ty0, ty1)), torch.maximum(tz0, tz1))
-
-                sloped_hit = torch.zeros_like(t_min, dtype=torch.bool)
-                if pr.shape == _SHAPE_SLOPED_CAB:
-                    ny_s = float(pr.slope_param)
-                    nz_s = math.sqrt(max(0.1, 1.0 - ny_s * ny_s))
-                    d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
-                    den_s = ny_s * dl_y + nz_s * dl_z
-                    num_s = d_s - (ny_s * oc_l[1] + nz_s * oc_l[2])
-                    t_s = num_s / torch.where(den_s.abs() > 1e-6, den_s, torch.full_like(den_s, 1e-6))
-                    enter_slope = (den_s < -1e-6) & (t_s >= t_min)
-                    sloped_hit = enter_slope
-                    t_min = torch.where(den_s < -1e-6, torch.maximum(t_min, t_s), t_min)
-                    t_max = torch.where(den_s > 1e-6, torch.minimum(t_max, t_s), t_max)
-                    t_max = torch.where((den_s.abs() <= 1e-6) & (num_s < 0.0), torch.full_like(t_max, -1.0), t_max)
-
-                t_hit = t_min
-                valid_p = (t_min > 0.16) & (t_max >= t_min) & (t_hit < t_best[v0:v1, u0:u1])
-                if not valid_p.any():
+            for p_idx in iter_prims_1b:
+                pr = prims[p_idx]
+                u0, u1, v0, v1 = int(rois_np[p_idx, 0]), int(rois_np[p_idx, 1]), int(rois_np[p_idx, 2]), int(rois_np[p_idx, 3])
+                if u1 <= u0 or v1 <= v0:
                     continue
-                hx = oc_l[0] + t_hit * dl_x
-                hy = oc_l[1] + t_hit * dl_y
-                hz = oc_l[2] + t_hit * dl_z
-                ax = (hx / max(1e-4, sx)).abs()
-                ay = (hy / max(1e-4, sy)).abs()
-                az = (hz / max(1e-4, sz)).abs()
-                is_x = (ax >= ay) & (ax >= az)
-                is_y = (~is_x) & (ay >= az)
-                nl_x = torch.where(is_x, torch.sign(hx), torch.zeros_like(hx))
-                nl_y = torch.where(is_y, torch.sign(hy), torch.zeros_like(hy))
-                nl_z = torch.where((~is_x) & (~is_y), torch.sign(hz), torch.zeros_like(hz))
-                if pr.shape == _SHAPE_SLOPED_CAB:
-                    ny_s = float(pr.slope_param)
-                    nz_s = math.sqrt(max(0.1, 1.0 - ny_s * ny_s))
-                    nl_x = torch.where(sloped_hit, torch.zeros_like(nl_x), nl_x)
-                    nl_y = torch.where(sloped_hit, torch.full_like(nl_y, ny_s), nl_y)
-                    nl_z = torch.where(sloped_hit, torch.full_like(nl_z, nz_s), nl_z)
+                sx, sy, sz = pr.half_ext
+                if (not use_triton_cuda) and pr.decal_spec is not None and len(self.bank.alpha_decal_mips) > 0:
+                    px_span_pr = max(4.0, float(max(u1 - u0, v1 - v0)))
+                    decal_rois.append((p_idx, u0, u1, v0, v1, px_span_pr))
 
-            elif pr.shape == _SHAPE_CYLINDER_X:
-                oy_n, oz_n = oc_l[1] / sy, oc_l[2] / sz
-                dy_n, dz_n = dl_y / sy, dl_z / sz
-                qa = (dy_n * dy_n + dz_n * dz_n).clamp_min(1e-6)
-                qb = oy_n * dy_n + oz_n * dz_n
-                qc = oy_n * oy_n + oz_n * oz_n - 1.0
-                disc = qb * qb - qa * qc
-                sq = torch.sqrt(disc.clamp_min(0.0))
-                tc0 = (-qb - sq) / qa
-                tc1 = (-qb + sq) / qa
-                inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
-                tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
-                t_min = torch.maximum(torch.where(disc >= 0.0, tc0, torch.full_like(tc0, 1e6)), torch.minimum(tx0, tx1))
-                t_max = torch.minimum(torch.where(disc >= 0.0, tc1, torch.full_like(tc1, -1e6)), torch.maximum(tx0, tx1))
-                t_hit = t_min
-                base_valid_c = (disc >= 0.0) & (t_min > 0.16) & (t_max >= t_min)
+                sub_dx = dx_w[v0:v1, u0:u1]
+                sub_dy = dy_w[v0:v1, u0:u1]
+                sub_dz = dz_w[v0:v1, u0:u1]
+                Rw2l_t = Rw2l_all[p_idx]
+                oc_l = oc_l_all[p_idx]
+                dl_x = Rw2l_t[0, 0] * sub_dx + Rw2l_t[0, 1] * sub_dy + Rw2l_t[0, 2] * sub_dz
+                dl_y = Rw2l_t[1, 0] * sub_dx + Rw2l_t[1, 1] * sub_dy + Rw2l_t[1, 2] * sub_dz
+                dl_z = Rw2l_t[2, 0] * sub_dx + Rw2l_t[2, 1] * sub_dy + Rw2l_t[2, 2] * sub_dz
+                sub_t = t_best[v0:v1, u0:u1]
 
-                # D_N dihedral radial aperture pass-through (N in {3..12}): genuine 3D ray perforation!
-                if pr.radial_n >= 3 and base_valid_c.any():
-                    n_fold = float(pr.radial_n)
-                    sector_w = (2.0 * math.pi) / n_fold
-                    half_sec = 0.5 * sector_w
-                    r_ring = 0.45
-                    r_hole = min(0.115, 0.56 * r_ring * math.sin(half_sec))
-                    hx0 = oc_l[0] + t_min * dl_x
-                    hy0 = (oc_l[1] + t_min * dl_y) / sy
-                    hz0 = (oc_l[2] + t_min * dl_z) / sz
-                    rr0 = torch.sqrt(hy0 * hy0 + hz0 * hz0)
-                    th0 = torch.remainder(torch.atan2(hz0, hy0) + pr.mud_phase + half_sec, sector_w) - half_sec
-                    du0 = rr0 * torch.cos(th0) - r_ring
-                    dv0 = rr0 * torch.sin(th0)
-                    perf0 = (hx0.abs() >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < (r_hole * r_hole))
-                    if perf0.any():
+                is_cap_roi: Tensor | None = None
+                if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
+                    inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
+                    inv_y = torch.where(dl_y.abs() > 1e-6, 1.0 / dl_y, torch.copysign(torch.full_like(dl_y, 1e6), dl_y))
+                    inv_z = torch.where(dl_z.abs() > 1e-6, 1.0 / dl_z, torch.copysign(torch.full_like(dl_z, 1e6), dl_z))
+                    tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
+                    ty0, ty1 = (-sy - oc_l[1]) * inv_y, (sy - oc_l[1]) * inv_y
+                    tz0, tz1 = (-sz - oc_l[2]) * inv_z, (sz - oc_l[2]) * inv_z
+                    t_min = torch.maximum(torch.maximum(torch.minimum(tx0, tx1), torch.minimum(ty0, ty1)), torch.minimum(tz0, tz1))
+                    t_max = torch.minimum(torch.minimum(torch.maximum(tx0, tx1), torch.maximum(ty0, ty1)), torch.maximum(tz0, tz1))
+                    sloped_hit: Tensor | None = None
+                    if pr.shape == _SHAPE_SLOPED_CAB:
+                        ny_s = float(pr.slope_param)
+                        nz_s = math.sqrt(max(0.1, 1.0 - ny_s * ny_s))
+                        d_s = ny_s * (sy * 0.72) + nz_s * (sz * 0.78)
+                        den_s = ny_s * dl_y + nz_s * dl_z
+                        num_s = d_s - (ny_s * oc_l[1] + nz_s * oc_l[2])
+                        t_s = num_s / torch.where(den_s.abs() > 1e-6, den_s, torch.full_like(den_s, 1e-6))
+                        sloped_hit = (den_s < -1e-6) & (t_s >= t_min)
+                        t_min = torch.where(den_s < -1e-6, torch.maximum(t_min, t_s), t_min)
+                        t_max = torch.where(den_s > 1e-6, torch.minimum(t_max, t_s), t_max)
+                        t_max = torch.where((den_s.abs() <= 1e-6) & (num_s < 0.0), torch.full_like(t_max, -1.0), t_max)
+                    t_hit = t_min
+                    valid_p = (t_min > 0.16) & (t_max >= t_min) & (t_hit < sub_t)
+                    hx = oc_l[0] + t_hit * dl_x
+                    hy = oc_l[1] + t_hit * dl_y
+                    hz = oc_l[2] + t_hit * dl_z
+                    ax = (hx / max(1e-4, sx)).abs()
+                    ay = (hy / max(1e-4, sy)).abs()
+                    az = (hz / max(1e-4, sz)).abs()
+                    is_x = (ax >= ay) & (ax >= az)
+                    is_y = (~is_x) & (ay >= az)
+                    nl_x = torch.where(is_x, torch.sign(hx), torch.zeros_like(hx))
+                    nl_y = torch.where(is_y, torch.sign(hy), torch.zeros_like(hy))
+                    nl_z = torch.where((~is_x) & (~is_y), torch.sign(hz), torch.zeros_like(hz))
+                    if sloped_hit is not None:
+                        ny_s = float(pr.slope_param)
+                        nz_s = math.sqrt(max(0.1, 1.0 - ny_s * ny_s))
+                        nl_x = torch.where(sloped_hit, torch.zeros_like(nl_x), nl_x)
+                        nl_y = torch.where(sloped_hit, torch.full_like(nl_y, ny_s), nl_y)
+                        nl_z = torch.where(sloped_hit, torch.full_like(nl_z, nz_s), nl_z)
+
+                elif pr.shape == _SHAPE_CYLINDER_X:
+                    oy_n, oz_n = oc_l[1] / sy, oc_l[2] / sz
+                    dy_n, dz_n = dl_y / sy, dl_z / sz
+                    qa = (dy_n * dy_n + dz_n * dz_n).clamp_min(1e-6)
+                    qb = oy_n * dy_n + oz_n * dz_n
+                    qc = oy_n * oy_n + oz_n * oz_n - 1.0
+                    disc = qb * qb - qa * qc
+                    sq = torch.sqrt(disc.clamp_min(0.0))
+                    tc0, tc1 = (-qb - sq) / qa, (-qb + sq) / qa
+                    inv_x = torch.where(dl_x.abs() > 1e-6, 1.0 / dl_x, torch.copysign(torch.full_like(dl_x, 1e6), dl_x))
+                    tx0, tx1 = (-sx - oc_l[0]) * inv_x, (sx - oc_l[0]) * inv_x
+                    t_min = torch.maximum(torch.where(disc >= 0.0, tc0, torch.full_like(tc0, 1e6)), torch.minimum(tx0, tx1))
+                    t_max = torch.minimum(torch.where(disc >= 0.0, tc1, torch.full_like(tc1, -1e6)), torch.maximum(tx0, tx1))
+                    t_hit = t_min
+                    base_valid_c = (disc >= 0.0) & (t_min > 0.16) & (t_max >= t_min)
+                    if pr.radial_n >= 3:
+                        n_fold = float(pr.radial_n)
+                        sector_w = (2.0 * math.pi) / n_fold
+                        half_sec = 0.5 * sector_w
+                        r_ring = 0.45
+                        r_hole = min(0.115, 0.56 * r_ring * math.sin(half_sec))
+                        hx0 = oc_l[0] + t_min * dl_x
+                        hy0 = (oc_l[1] + t_min * dl_y) / sy
+                        hz0 = (oc_l[2] + t_min * dl_z) / sz
+                        rr0 = torch.sqrt(hy0 * hy0 + hz0 * hz0)
+                        th0 = torch.remainder(torch.atan2(hz0, hy0) + pr.mud_phase + half_sec, sector_w) - half_sec
+                        du0, dv0 = rr0 * torch.cos(th0) - r_ring, rr0 * torch.sin(th0)
+                        perf0 = (hx0.abs() >= sx * 0.92) & ((du0 * du0 + dv0 * dv0) < (r_hole * r_hole))
                         hx1 = oc_l[0] + t_max * dl_x
                         hy1 = (oc_l[1] + t_max * dl_y) / sy
                         hz1 = (oc_l[2] + t_max * dl_z) / sz
                         rr1 = torch.sqrt(hy1 * hy1 + hz1 * hz1)
                         th1 = torch.remainder(torch.atan2(hz1, hy1) + pr.mud_phase + half_sec, sector_w) - half_sec
-                        du1 = rr1 * torch.cos(th1) - r_ring
-                        dv1 = rr1 * torch.sin(th1)
+                        du1, dv1 = rr1 * torch.cos(th1) - r_ring, rr1 * torch.sin(th1)
                         perf1 = (hx1.abs() >= sx * 0.92) & ((du1 * du1 + dv1 * dv1) < (r_hole * r_hole))
-                        # Rays piercing aligned D_N apertures exit cleanly into the scene behind; oblique rays hit inner bore at t_max
                         base_valid_c = base_valid_c & (~(perf0 & perf1))
                         t_hit = torch.where(perf0 & (~perf1), t_max, t_hit)
+                    valid_p = base_valid_c & (t_hit < sub_t)
+                    hx = oc_l[0] + t_hit * dl_x
+                    hy = oc_l[1] + t_hit * dl_y
+                    hz = oc_l[2] + t_hit * dl_z
+                    is_cap_roi = hx.abs() >= sx * 0.95
+                    nl_x = torch.where(is_cap_roi, torch.sign(hx), torch.zeros_like(hx))
+                    nl_y = torch.where(is_cap_roi, torch.zeros_like(hy), hy / (sy * sy))
+                    nl_z = torch.where(is_cap_roi, torch.zeros_like(hz), hz / (sz * sz))
+                    dot_in = nl_x * dl_x + nl_y * dl_y + nl_z * dl_z
+                    flip_s = torch.where(dot_in > 0.0, -torch.ones_like(dot_in), torch.ones_like(dot_in))
+                    nl_x, nl_y, nl_z = nl_x * flip_s, nl_y * flip_s, nl_z * flip_s
+                    n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
+                    nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
 
-                valid_p = base_valid_c & (t_hit < t_best[v0:v1, u0:u1])
-                if not valid_p.any():
-                    continue
-                hx = oc_l[0] + t_hit * dl_x
-                hy = oc_l[1] + t_hit * dl_y
-                hz = oc_l[2] + t_hit * dl_z
-                is_cap = hx.abs() >= sx * 0.95
-                nl_x = torch.where(is_cap, torch.sign(hx), torch.zeros_like(hx))
-                nl_y = torch.where(is_cap, torch.zeros_like(hy), hy / (sy * sy))
-                nl_z = torch.where(is_cap, torch.zeros_like(hz), hz / (sz * sz))
-                # Flip normal toward incoming ray if interior wall of D_N bore was struck at t_max
-                dot_in = nl_x * dl_x + nl_y * dl_y + nl_z * dl_z
-                flip_s = torch.where(dot_in > 0.0, -torch.ones_like(dot_in), torch.ones_like(dot_in))
-                nl_x, nl_y, nl_z = nl_x * flip_s, nl_y * flip_s, nl_z * flip_s
-                n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
-                nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
-
-            elif pr.shape == _SHAPE_FLEX_SHEET:
-                ox_t = oc_l[0].expand_as(dl_x)
-                oy_t = oc_l[1].expand_as(dl_y)
-                oz_t = oc_l[2].expand_as(dl_z)
-                t_hit, hit_sh = self._intersect_flex_sheet_local(
-                    ox_t, oy_t, oz_t, dl_x, dl_y, dl_z,
-                    sx, sy, sz, pr.wave_amp, pr.wave_freq, pr.mud_phase, t_near=0.16,
-                )
-                valid_p = hit_sh & (t_hit < t_best[v0:v1, u0:u1])
-                if not valid_p.any():
-                    continue
-                hx = oc_l[0] + t_hit * dl_x
-                hy = oc_l[1] + t_hit * dl_y
-                hz = oc_l[2] + t_hit * dl_z
-                w_f = max(0.5, float(pr.wave_freq))
-                amp_f = float(pr.wave_amp)
-                ph_f = float(pr.mud_phase)
-                a1 = w_f * hy + ph_f + 0.35 * torch.sin(2.1 * hz)
-                a2 = 2.3 * w_f * hy - 1.7 * hz + 1.9 * ph_f
-                a3 = 4.1 * w_f * hy + 3.3 * hz
-                df_dy = amp_f * (0.62 * w_f * torch.cos(a1) + 0.26 * 2.3 * w_f * torch.cos(a2) - 0.12 * 4.1 * w_f * torch.sin(a3))
-                df_dz = amp_f * (
-                    0.62 * 0.35 * 2.1 * torch.cos(2.1 * hz) * torch.cos(a1)
-                    - 0.26 * 1.7 * torch.cos(a2)
-                    - 0.12 * 3.3 * torch.sin(a3)
-                )
-                raw_nx = torch.ones_like(df_dy)
-                raw_ny = -df_dy
-                raw_nz = -df_dz
-                dot_sh = raw_nx * dl_x + raw_ny * dl_y + raw_nz * dl_z
-                s_sh = torch.where(dot_sh > 0.0, -torch.ones_like(dot_sh), torch.ones_like(dot_sh))
-                nl_x = raw_nx * s_sh
-                nl_y = raw_ny * s_sh
-                nl_z = raw_nz * s_sh
-                n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
-                nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
-
-            else:
-                # `_SHAPE_TAPER_DRUM_Y`: Exact watertight piecewise truncated double-cone + end-caps!
-                taper = float(np.clip(pr.slope_param, 0.0, 0.65))
-                ox_n, oy_n, oz_n = oc_l[0] / sx, oc_l[1] / sy, oc_l[2] / sz
-                dx_n, dy_n, dz_n = dl_x / sx, dl_y / sy, dl_z / sz
-                inf_t = torch.full_like(dx_n, 1e6)
-                t_hit = inf_t.clone()
-                hit_kind = torch.zeros_like(dx_n, dtype=torch.int8)
-
-                for s_h, kind_id in ((1.0, 1), (-1.0, -1)):
-                    k_c = taper * s_h
-                    qa = dx_n * dx_n + dz_n * dz_n - (k_c * dy_n) * (k_c * dy_n)
-                    qb = ox_n * dx_n + oz_n * dz_n + k_c * dy_n * (1.0 - k_c * oy_n)
-                    qc = ox_n * ox_n + oz_n * oz_n - (1.0 - k_c * oy_n) * (1.0 - k_c * oy_n)
-                    disc = qb * qb - qa * qc
-                    sq = torch.sqrt(disc.clamp_min(0.0))
-                    s_qb = torch.where(qb >= 0.0, torch.ones_like(qb), -torch.ones_like(qb))
-                    q_cit = -(qb + s_qb * sq)
-                    safe_q = torch.where(q_cit.abs() > 1e-12, q_cit, torch.copysign(torch.full_like(q_cit, 1e-12), q_cit))
-                    safe_a = torch.where(qa.abs() > 1e-12, qa, torch.copysign(torch.full_like(qa, 1e-12), qa))
-                    tr1 = qc / safe_q
-                    tr2 = q_cit / safe_a
-                    for tr, cond_den in ((tr1, q_cit.abs() > 1e-12), (tr2, qa.abs() > 1e-12)):
-                        yn_r = oy_n + tr * dy_n
-                        in_half = (yn_r >= -1e-4) & (yn_r <= 1.0) if s_h > 0.0 else (yn_r <= 1e-4) & (yn_r >= -1.0)
-                        ok_r = (disc >= 0.0) & cond_den & (tr > 0.16) & in_half & (tr < t_hit)
-                        t_hit = torch.where(ok_r, tr, t_hit)
-                        hit_kind = torch.where(ok_r, torch.full_like(hit_kind, kind_id), hit_kind)
-
-                inv_y = torch.where(dy_n.abs() > 1e-6, 1.0 / dy_n, torch.copysign(torch.full_like(dy_n, 1e6), dy_n))
-                r_cap2 = (1.0 - taper) * (1.0 - taper)
-                for s_cap, kind_id in ((1.0, 2), (-1.0, -2)):
-                    tc_p = (s_cap - oy_n) * inv_y
-                    xc_p = ox_n + tc_p * dx_n
-                    zc_p = oz_n + tc_p * dz_n
-                    ok_c = (tc_p > 0.16) & ((xc_p * xc_p + zc_p * zc_p) <= r_cap2) & (tc_p < t_hit)
-                    t_hit = torch.where(ok_c, tc_p, t_hit)
-                    hit_kind = torch.where(ok_c, torch.full_like(hit_kind, kind_id), hit_kind)
-
-                valid_p = (hit_kind != 0) & (t_hit < t_best[v0:v1, u0:u1])
-                if not valid_p.any():
-                    continue
-                hx = oc_l[0] + t_hit * dl_x
-                hy = oc_l[1] + t_hit * dl_y
-                hz = oc_l[2] + t_hit * dl_z
-                is_cap = hit_kind.abs() == 2
-                s_cone = torch.where(hit_kind == 1, torch.ones_like(hy), -torch.ones_like(hy))
-                k_eff = taper * s_cone
-                r_eff = (1.0 - k_eff * (hy / sy)).clamp_min(0.05)
-                nl_x = torch.where(is_cap, torch.zeros_like(hx), hx / (sx * sx))
-                nl_y = torch.where(is_cap, torch.sign(hit_kind.to(torch.float32)), (k_eff * r_eff) / sy)
-                nl_z = torch.where(is_cap, torch.zeros_like(hz), hz / (sz * sz))
-                n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
-                nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
-
-            # Unperturbed geometric world normal for shadow-ray origin offset (immune to bump/rib terminator acne!)
-            ng_x_p = Rw2l_t[0, 0] * nl_x + Rw2l_t[1, 0] * nl_y + Rw2l_t[2, 0] * nl_z
-            ng_y_p = Rw2l_t[0, 1] * nl_x + Rw2l_t[1, 1] * nl_y + Rw2l_t[2, 1] * nl_z
-            ng_z_p = Rw2l_t[0, 2] * nl_x + Rw2l_t[1, 2] * nl_y + Rw2l_t[2, 2] * nl_z
-
-            if pr.rib_freq > 0.0:
-                rib = 0.22 * torch.cos(hy * pr.rib_freq * math.pi)
-                nl_y = nl_y + rib * (1.0 - nl_y.abs())
-
-            if pr.normal_undul_amp > 0.0:
-                u_amp = float(pr.normal_undul_amp)
-                und1 = torch.sin(hx * 6.3 + hy * 4.7 + pr.mud_phase) * torch.cos(hz * 5.9 - hy * 3.8)
-                und2 = 0.45 * torch.sin(hx * 14.9 - hz * 13.1 + 1.7 * pr.mud_phase)
-                und = u_amp * (und1 + und2)
-                nl_x = nl_x + und * (1.0 - nl_x.abs())
-                nl_y = nl_y - 0.8 * und * (1.0 - nl_y.abs())
-
-            alb = torch.tensor(pr.albedo_rgb, device=dev, dtype=torch.float32)[:, None, None].expand(3, v1 - v0, u1 - u0).clone()
-            p_rough = torch.full((v1 - v0, u1 - u0), float(pr.roughness), device=dev, dtype=torch.float32)
-            p_metal = torch.full((v1 - v0, u1 - u0), float(pr.metallic), device=dev, dtype=torch.float32)
-            p_f0 = torch.full((v1 - v0, u1 - u0), float(pr.specular_f0), device=dev, dtype=torch.float32)
-            p_coat = torch.full((v1 - v0, u1 - u0), float(pr.clearcoat), device=dev, dtype=torch.float32)
-            p_retro = torch.full((v1 - v0, u1 - u0), float(pr.retro_gain), device=dev, dtype=torch.float32)
-            xn_l = (hx / max(1e-4, sx)).clamp(-1.0, 1.0)
-            yn_l = (hy / max(1e-4, sy)).clamp(-1.0, 1.0)
-            zn_l = (hz / max(1e-4, sz)).clamp(-1.0, 1.0)
-
-            if pr.veh_idx > 0 and pr.role == _ROLE_BODY:
-                in_grille = (nl_y > 0.72) & (xn_l.abs() < 0.74) & (zn_l > -0.68) & (zn_l < 0.42)
-                if in_grille.any():
-                    slat = (torch.sin(zn_l * 28.0) > 0.42).to(torch.float32)
-                    g_col = (0.025 + 0.34 * slat)[None, :, :].expand(3, -1, -1)
-                    alb = torch.where(in_grille[None, :, :], g_col, alb)
-                    p_rough = torch.where(in_grille, 0.55 - 0.30 * slat, p_rough)
-                    p_metal = torch.where(in_grille, 0.65 * slat, p_metal)
-                seam = ((xn_l.abs() > 0.88) & (xn_l.abs() < 0.91)) | ((zn_l.abs() > 0.86) & (zn_l.abs() < 0.89))
-                alb = torch.where(seam[None, :, :], alb * 0.55, alb)
-                in_refl = (nl_y < -0.72) & (zn_l < -0.72) & (xn_l.abs() > 0.25)
-                if in_refl.any():
-                    stripe_rw = ((hx * 10.0).remainder(1.0) > 0.5).to(torch.float32)
-                    refl_col = torch.stack([0.75 + 0.15 * stripe_rw, 0.06 + 0.68 * stripe_rw, 0.06 + 0.68 * stripe_rw], dim=0)
-                    alb = torch.where(in_refl[None, :, :], refl_col, alb)
-                    p_retro = torch.where(in_refl, torch.full_like(p_retro, 0.85), p_retro)
-
-            elif pr.veh_idx > 0 and pr.role == _ROLE_CABIN_GLASS:
-                on_pillar = (xn_l.abs() > 0.84) | (zn_l > 0.80) | (zn_l < -0.82) | ((yn_l.abs() < 0.08) & (nl_x.abs() > 0.6))
-                wiper = (nl_y > 0.35) & (zn_l < -0.45) & (((xn_l + 0.32 + 0.35 * (zn_l + 0.8)).abs() < 0.03) | ((xn_l - 0.28 + 0.35 * (zn_l + 0.8)).abs() < 0.03))
-                frame_col = torch.tensor([0.09, 0.10, 0.11], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
-                int_var = (0.04 + 0.035 * torch.cos(xn_l * 4.5) * (0.5 - 0.5 * zn_l))[None, :, :].expand_as(alb)
-                frame_m = on_pillar | wiper
-                alb = torch.where(frame_m[None, :, :], frame_col, alb + int_var)
-                p_rough = torch.where(frame_m, torch.full_like(p_rough, 0.45), p_rough)
-                p_coat = torch.where(frame_m, torch.full_like(p_coat, 0.10), p_coat)
-
-            elif pr.shape == _SHAPE_CYLINDER_X and (pr.role == _ROLE_TIRE or pr.radial_n >= 3):
-                r_rad = torch.sqrt(yn_l * yn_l + zn_l * zn_l)
-                rim_limit = 0.64 if pr.role == _ROLE_TIRE else 0.98
-                is_outer_cap = (hx.abs() >= sx * 0.90) & (r_rad < rim_limit)
-                if is_outer_cap.any():
-                    n_sym = float(pr.radial_n if pr.radial_n >= 3 else 6)
-                    ang_w = torch.atan2(zn_l, yn_l) + pr.mud_phase
-                    sec_w = (2.0 * math.pi) / n_sym
-                    th_s = torch.remainder(ang_w + 0.5 * sec_w, sec_w) - 0.5 * sec_w
-                    du_st = r_rad * torch.cos(th_s) - 0.28
-                    dv_st = r_rad * torch.sin(th_s)
-                    r_st2 = du_st * du_st + dv_st * dv_st
-                    on_stud = r_st2 < (0.038 * 0.038)
-                    hub = (r_rad < 0.17).to(torch.float32)
-                    if pr.role == _ROLE_TIRE:
-                        rim_l = 0.38 - 0.22 * on_stud.to(torch.float32) - 0.20 * hub
-                        rim_col = torch.stack([rim_l, rim_l * 1.02, rim_l * 1.05], dim=0)
-                        alb = torch.where(is_outer_cap[None, :, :], rim_col, alb)
-                        p_rough = torch.where(is_outer_cap, torch.full_like(p_rough, 0.28), p_rough)
-                        p_metal = torch.where(is_outer_cap, torch.full_like(p_metal, 0.68), p_metal)
-                    # 3D normal bevel on D_N stud/bolt ring
-                    stud_m = is_outer_cap & on_stud
-                    if stud_m.any():
-                        bev_y = (du_st * torch.cos(ang_w) - dv_st * torch.sin(ang_w)) * 8.5
-                        bev_z = (du_st * torch.sin(ang_w) + dv_st * torch.cos(ang_w)) * 8.5
-                        nl_y = torch.where(stud_m, nl_y + bev_y, nl_y)
-                        nl_z = torch.where(stud_m, nl_z + bev_z, nl_z)
-
-            elif pr.veh_idx > 0 and pr.role == _ROLE_CHROME_METAL and sy < 0.30:
-                in_slot = (nl_y.abs() > 0.7) & (zn_l.abs() < 0.36) & (xn_l.abs() > 0.34) & (xn_l.abs() < 0.76)
-                slot_col = torch.tensor([0.035, 0.038, 0.042], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
-                alb = torch.where(in_slot[None, :, :], slot_col, alb)
-                p_rough = torch.where(in_slot, torch.full_like(p_rough, 0.78), p_rough)
-                p_metal = torch.where(in_slot, torch.zeros_like(p_metal), p_metal)
-
-            elif pr.veh_idx > 0 and pr.role == _ROLE_CARGO_MATTE and pr.shape == _SHAPE_TAPER_DRUM_Y:
-                gran = (
-                    torch.sin(hx * 16.7 + pr.mud_phase) * torch.cos(hy * 14.3 - hz * 18.1 + 0.5 * pr.mud_phase)
-                    + 0.5 * torch.sin(hx * 31.1 - hy * 27.9 + pr.mud_phase)
-                )
-                alb = (alb * (1.0 + 0.11 * gran[None, :, :])).clamp(0.02, 0.99)
-                nl_x = nl_x + 0.14 * gran
-                nl_z = nl_z + 0.10 * gran.abs()
-
-            elif pr.veh_idx == 0 and pr.role == _ROLE_ENV_SOLID and sy > 3.0 and pr.mud_phase > 0.5:
-                w_style = int(round(float(pr.mud_phase)))
-                if w_style == 1:
-                    rib_w = 0.5 + 0.5 * torch.cos(hy * 26.0)
-                    seam_y = ((hy.remainder(1.85)).abs() < 0.035) | ((hz.remainder(0.92)).abs() < 0.028)
-                    mod = (0.76 + 0.30 * rib_w) * torch.where(seam_y, torch.full_like(rib_w, 0.42), torch.ones_like(rib_w))
-                    alb = (alb * mod[None, :, :]).clamp(0.02, 0.96)
-                elif w_style == 2:
-                    rail_h = (hz.remainder(0.42)).abs() < 0.055
-                    grate_v = (hy.remainder(0.16)).abs() < 0.042
-                    on_bar = rail_h | grate_v
-                    bar_col = (alb * 1.18).clamp(0.05, 0.92)
-                    gap_col = (alb * 0.24).clamp(0.015, 0.35)
-                    alb = torch.where(on_bar[None, :, :], bar_col, gap_col)
-                elif w_style == 3:
-                    plank_id = torch.floor((hz + sz) / 0.22)
-                    plank_gap = ((hz + sz).remainder(0.22)) < 0.024
-                    post_v = (hy.remainder(2.10)).abs() < 0.065
-                    wood_var = 0.85 + 0.22 * torch.sin(plank_id * 3.7 + hy * 0.4)
-                    wood_base = torch.stack(
-                        [
-                            (0.36 * wood_var).clamp(0.05, 0.72),
-                            (0.23 * wood_var).clamp(0.04, 0.52),
-                            (0.12 * wood_var).clamp(0.02, 0.32),
-                        ],
-                        dim=0,
+                elif pr.shape == _SHAPE_FLEX_SHEET:
+                    t_hit, hit_sh = self._intersect_flex_sheet_local(
+                        oc_l[0].expand_as(dl_x), oc_l[1].expand_as(dl_y), oc_l[2].expand_as(dl_z),
+                        dl_x, dl_y, dl_z, sx, sy, sz, pr.wave_amp, pr.wave_freq, pr.mud_phase, t_near=0.16,
                     )
-                    dark_gap = wood_base * 0.22
-                    alb = torch.where(plank_gap[None, :, :] & (~post_v[None, :, :]), dark_gap, wood_base)
-                elif w_style == 4:
-                    cell_y = (hy + sy).remainder(1.10)
-                    cell_z = (hz + sz).remainder(0.62)
-                    in_pane = (cell_y > 0.16) & (cell_y < 0.94) & (cell_z > 0.12) & (cell_z < 0.50)
-                    pane_col = torch.tensor([0.05, 0.08, 0.12], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
-                    mull_col = (alb * 1.12).clamp(0.08, 0.88)
-                    alb = torch.where(in_pane[None, :, :], pane_col, mull_col)
-                    p_rough = torch.where(in_pane, torch.full_like(p_rough, 0.08), p_rough)
-                    p_coat = torch.where(in_pane, torch.full_like(p_coat, 0.80), p_coat)
-            p_emit_map: Tensor | None = None
-            if pr.veh_idx == 0 and pr.role == _ROLE_ENV_SOLID and sy > 1.2 and int(round(float(pr.mud_phase))) == 5:
-                # Lit night storefront / commercial building multi-pane window grid (`veh_idx == 0`)
-                cell_y = (hy + sy).remainder(0.92)
-                cell_z = (hz + sz).remainder(0.64)
-                in_pane = (cell_y > 0.10) & (cell_y < 0.82) & (cell_z > 0.10) & (cell_z < 0.54)
-                cid_y = torch.floor((hy + sy) / 0.92)
-                cid_z = torch.floor((hz + sz) / 0.64)
-                chash = torch.sin(cid_y * 12.9898 + cid_z * 78.233 + ph_e)
-                pane_lit = in_pane & (chash > (-0.42 if is_night else 0.22))
-                warm_w = (0.5 + 0.5 * torch.cos(cid_y * 3.1 + cid_z * 1.7)).clamp(0.0, 1.0)
-                lit_col = torch.stack(
+                    valid_p = hit_sh & (t_hit < sub_t)
+                    if not valid_p.any():
+                        continue
+                    hx = oc_l[0] + t_hit * dl_x
+                    hy = oc_l[1] + t_hit * dl_y
+                    hz = oc_l[2] + t_hit * dl_z
+                    w_f = max(0.5, float(pr.wave_freq))
+                    amp_f = float(pr.wave_amp)
+                    ph_f = float(pr.mud_phase)
+                    a1 = w_f * hy + ph_f + 0.35 * torch.sin(2.1 * hz)
+                    a2 = 2.3 * w_f * hy - 1.7 * hz + 1.9 * ph_f
+                    a3 = 4.1 * w_f * hy + 3.3 * hz
+                    df_dy = amp_f * (0.62 * w_f * torch.cos(a1) + 0.26 * 2.3 * w_f * torch.cos(a2) - 0.12 * 4.1 * w_f * torch.sin(a3))
+                    df_dz = amp_f * (
+                        0.62 * 0.35 * 2.1 * torch.cos(2.1 * hz) * torch.cos(a1)
+                        - 0.26 * 1.7 * torch.cos(a2)
+                        - 0.12 * 3.3 * torch.sin(a3)
+                    )
+                    raw_nx = torch.ones_like(df_dy)
+                    raw_ny = -df_dy
+                    raw_nz = -df_dz
+                    dot_sh = raw_nx * dl_x + raw_ny * dl_y + raw_nz * dl_z
+                    s_sh = torch.where(dot_sh > 0.0, -torch.ones_like(dot_sh), torch.ones_like(dot_sh))
+                    nl_x, nl_y, nl_z = raw_nx * s_sh, raw_ny * s_sh, raw_nz * s_sh
+                    n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
+                    nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
+
+                else:
+                    taper = float(np.clip(pr.slope_param, 0.0, 0.65))
+                    ox_n, oy_n, oz_n = oc_l[0] / sx, oc_l[1] / sy, oc_l[2] / sz
+                    dx_n, dy_n, dz_n = dl_x / sx, dl_y / sy, dl_z / sz
+                    t_hit = torch.full_like(dx_n, 1e6)
+                    hit_kind = torch.zeros_like(dx_n, dtype=torch.int8)
+                    for s_h, kind_id in ((1.0, 1), (-1.0, -1)):
+                        k_c = taper * s_h
+                        qa = dx_n * dx_n + dz_n * dz_n - (k_c * dy_n) * (k_c * dy_n)
+                        qb = ox_n * dx_n + oz_n * dz_n + k_c * dy_n * (1.0 - k_c * oy_n)
+                        qc = ox_n * ox_n + oz_n * oz_n - (1.0 - k_c * oy_n) * (1.0 - k_c * oy_n)
+                        disc = qb * qb - qa * qc
+                        sq = torch.sqrt(disc.clamp_min(0.0))
+                        s_qb = torch.where(qb >= 0.0, torch.ones_like(qb), -torch.ones_like(qb))
+                        q_cit = -(qb + s_qb * sq)
+                        safe_q = torch.where(q_cit.abs() > 1e-12, q_cit, torch.copysign(torch.full_like(q_cit, 1e-12), q_cit))
+                        safe_a = torch.where(qa.abs() > 1e-12, qa, torch.copysign(torch.full_like(qa, 1e-12), qa))
+                        tr1, tr2 = qc / safe_q, q_cit / safe_a
+                        for tr, cond_den in ((tr1, q_cit.abs() > 1e-12), (tr2, qa.abs() > 1e-12)):
+                            yn_r = oy_n + tr * dy_n
+                            in_half = (yn_r >= -1e-4) & (yn_r <= 1.0) if s_h > 0.0 else (yn_r <= 1e-4) & (yn_r >= -1.0)
+                            ok_r = (disc >= 0.0) & cond_den & (tr > 0.16) & in_half & (tr < t_hit)
+                            t_hit = torch.where(ok_r, tr, t_hit)
+                            hit_kind.masked_fill_(ok_r, kind_id)
+                    inv_y = torch.where(dy_n.abs() > 1e-6, 1.0 / dy_n, torch.copysign(torch.full_like(dy_n, 1e6), dy_n))
+                    r_cap2 = (1.0 - taper) * (1.0 - taper)
+                    for s_cap, kind_id in ((1.0, 2), (-1.0, -2)):
+                        tc_p = (s_cap - oy_n) * inv_y
+                        xc_p, zc_p = ox_n + tc_p * dx_n, oz_n + tc_p * dz_n
+                        ok_c = (tc_p > 0.16) & ((xc_p * xc_p + zc_p * zc_p) <= r_cap2) & (tc_p < t_hit)
+                        t_hit = torch.where(ok_c, tc_p, t_hit)
+                        hit_kind.masked_fill_(ok_c, kind_id)
+                    valid_p = (hit_kind != 0) & (t_hit < sub_t)
+                    hx = oc_l[0] + t_hit * dl_x
+                    hy = oc_l[1] + t_hit * dl_y
+                    hz = oc_l[2] + t_hit * dl_z
+                    is_cap_roi = hit_kind.abs() == 2
+                    s_cone = torch.where(hit_kind == 1, torch.ones_like(hy), -torch.ones_like(hy))
+                    k_eff = taper * s_cone
+                    r_eff = (1.0 - k_eff * (hy / sy)).clamp_min(0.05)
+                    nl_x = torch.where(is_cap_roi, torch.zeros_like(hx), hx / (sx * sx))
+                    nl_y = torch.where(is_cap_roi, torch.sign(hit_kind.to(torch.float32)), (k_eff * r_eff) / sy)
+                    nl_z = torch.where(is_cap_roi, torch.zeros_like(hz), hz / (sz * sz))
+                    n_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
+                    nl_x, nl_y, nl_z = nl_x / n_len, nl_y / n_len, nl_z / n_len
+
+                t_best[v0:v1, u0:u1] = torch.where(valid_p, t_hit, sub_t)
+                prim_id_buf[v0:v1, u0:u1].masked_fill_(valid_p, p_idx)
+                hit_lx[v0:v1, u0:u1] = torch.where(valid_p, hx, hit_lx[v0:v1, u0:u1])
+                hit_ly[v0:v1, u0:u1] = torch.where(valid_p, hy, hit_ly[v0:v1, u0:u1])
+                hit_lz[v0:v1, u0:u1] = torch.where(valid_p, hz, hit_lz[v0:v1, u0:u1])
+                nl_x_buf[v0:v1, u0:u1] = torch.where(valid_p, nl_x, nl_x_buf[v0:v1, u0:u1])
+                nl_y_buf[v0:v1, u0:u1] = torch.where(valid_p, nl_y, nl_y_buf[v0:v1, u0:u1])
+                nl_z_buf[v0:v1, u0:u1] = torch.where(valid_p, nl_z, nl_z_buf[v0:v1, u0:u1])
+                if is_cap_roi is not None:
+                    is_cap_buf[v0:v1, u0:u1] = torch.where(valid_p, is_cap_roi, is_cap_buf[v0:v1, u0:u1])
+                else:
+                    is_cap_buf[v0:v1, u0:u1].masked_fill_(valid_p, False)
+
+            # Stage 1B-2: Single-Pass Vectorized Deferred Material Shading across winning `(H, W)` pixels!
+            has_prim = prim_id_buf >= 0
+            if has_prim.any():
+                t_geom = torch.where(has_prim, t_best, t_geom)
+                pid = prim_id_buf.clamp_min(0).long()
+                Rw = Rw2l_all[pid]
+                he_p = he_all[pid]
+                mat_p = mat_all[pid]
+                ipr_p = int_all[pid]
+
+                sx_m = he_p[..., 0].clamp_min(1e-4)
+                sy_m = he_p[..., 1].clamp_min(1e-4)
+                sz_m = he_p[..., 2].clamp_min(1e-4)
+                alb_p = mat_p[..., 0:3].permute(2, 0, 1).contiguous()
+                liv_rgb_p = mat_p[..., 3:6].permute(2, 0, 1).contiguous()
+                p_rough = mat_p[..., 6].clone()
+                p_metal = mat_p[..., 7].clone()
+                p_f0 = mat_p[..., 8].clone()
+                p_coat = mat_p[..., 9].clone()
+                p_retro = mat_p[..., 10].clone()
+                rib_f = mat_p[..., 11]
+                mud_l = mat_p[..., 12]
+                mud_p = mat_p[..., 13]
+                und_a = mat_p[..., 14]
+                nir_ov = mat_p[..., 15]
+
+                p_veh = ipr_p[..., 0]
+                p_role = ipr_p[..., 1]
+                p_shape = ipr_p[..., 2]
+                p_radn = ipr_p[..., 3]
+                p_liv = ipr_p[..., 4]
+
+                nlx = nl_x_buf
+                nly = nl_y_buf
+                nlz = nl_z_buf
+                ng_x_p = Rw[..., 0, 0] * nlx + Rw[..., 1, 0] * nly + Rw[..., 2, 0] * nlz
+                ng_y_p = Rw[..., 0, 1] * nlx + Rw[..., 1, 1] * nly + Rw[..., 2, 1] * nlz
+                ng_z_p = Rw[..., 0, 2] * nlx + Rw[..., 1, 2] * nly + Rw[..., 2, 2] * nlz
+
+                has_rib = rib_f > 0.0
+                nly = torch.where(has_rib, nly + 0.22 * torch.cos(hit_ly * rib_f * math.pi) * (1.0 - nly.abs()), nly)
+                has_und = und_a > 0.0
+                und_val = und_a * (
+                    torch.sin(hit_lx * 6.3 + hit_ly * 4.7 + mud_p) * torch.cos(hit_lz * 5.9 - hit_ly * 3.8)
+                    + 0.45 * torch.sin(hit_lx * 14.9 - hit_lz * 13.1 + 1.7 * mud_p)
+                )
+                nlx = torch.where(has_und, nlx + und_val * (1.0 - nlx.abs()), nlx)
+                nly = torch.where(has_und, nly - 0.8 * und_val * (1.0 - nly.abs()), nly)
+
+                xn_l = (hit_lx / sx_m).clamp(-1.0, 1.0)
+                yn_l = (hit_ly / sy_m).clamp(-1.0, 1.0)
+                zn_l = (hit_lz / sz_m).clamp(-1.0, 1.0)
+
+                m_body = has_prim & (p_veh > 0) & (p_role == _ROLE_BODY)
+                m_glass = has_prim & (~m_body) & (p_veh > 0) & (p_role == _ROLE_CABIN_GLASS)
+                m_cyl_dn = has_prim & (~m_body) & (~m_glass) & (p_shape == _SHAPE_CYLINDER_X) & ((p_role == _ROLE_TIRE) | (p_radn >= 3))
+                m_chrome = has_prim & (~m_body) & (~m_glass) & (~m_cyl_dn) & (p_veh > 0) & (p_role == _ROLE_CHROME_METAL) & (sy_m < 0.30)
+                m_cargo = has_prim & (~m_body) & (~m_glass) & (~m_cyl_dn) & (~m_chrome) & (p_veh > 0) & (p_role == _ROLE_CARGO_MATTE) & (p_shape == _SHAPE_TAPER_DRUM_Y)
+                m_env_w = has_prim & (p_veh == 0) & (p_role == _ROLE_ENV_SOLID)
+
+                # 1) Vehicle Body (grille, panel seams, rear reflector strip, Gen-7 horizontal stripe & two-tone liveries)
+                in_grille = m_body & (nly > 0.72) & (xn_l.abs() < 0.74) & (zn_l > -0.68) & (zn_l < 0.42)
+                slat_g = (torch.sin(zn_l * 28.0) > 0.42).to(torch.float32)
+                g_col = (0.025 + 0.34 * slat_g)[None, :, :].expand(3, h, w)
+                alb_p = torch.where(in_grille[None], g_col, alb_p)
+                p_rough = torch.where(in_grille, 0.55 - 0.30 * slat_g, p_rough)
+                p_metal = torch.where(in_grille, 0.65 * slat_g, p_metal)
+
+                seam_b = m_body & (((xn_l.abs() > 0.88) & (xn_l.abs() < 0.91)) | ((zn_l.abs() > 0.86) & (zn_l.abs() < 0.89)))
+                alb_p = torch.where(seam_b[None], alb_p * 0.55, alb_p)
+
+                # Gen-7 horizontal utility stripe (`livery_mode == 1`) wrapping sides & rear & front fascia
+                m_liv1 = m_body & (p_liv == 1) & (~in_grille) & ((nlx.abs() > 0.50) | (nly.abs() > 0.50))
+                in_stripe1 = m_liv1 & (((zn_l > -0.16) & (zn_l < 0.22)) | ((zn_l > 0.27) & (zn_l < 0.33)))
+                alb_p = torch.where(in_stripe1[None], liv_rgb_p, alb_p)
+                # Gen-7 two-tone lower skirt (`livery_mode == 2`)
+                m_liv2 = m_body & (p_liv == 2) & (~in_grille) & ((nlx.abs() > 0.50) | (nly.abs() > 0.50))
+                in_skirt2 = m_liv2 & (zn_l < -0.22)
+                in_trim2 = m_liv2 & (zn_l >= -0.22) & (zn_l < -0.15)
+                alb_p = torch.where(in_skirt2[None], liv_rgb_p, torch.where(in_trim2[None], torch.full_like(alb_p, 0.72), alb_p))
+
+                in_refl = m_body & (nly < -0.72) & (zn_l < -0.72) & (xn_l.abs() > 0.25) & (p_liv != 3) & (p_liv != 4)
+                stripe_rw = ((hit_lx * 10.0).remainder(1.0) > 0.5).to(torch.float32)
+                refl_col = torch.stack([0.75 + 0.15 * stripe_rw, 0.06 + 0.68 * stripe_rw, 0.06 + 0.68 * stripe_rw], dim=0)
+                alb_p = torch.where(in_refl[None], refl_col, alb_p)
+                p_retro = torch.where(in_refl, torch.full_like(p_retro, 0.85), p_retro)
+
+                # Gen-7 Hazard Chevrons (`livery_mode == 3`: yellow-black diagonal; `4`: red-white reflective diagonal)
+                m_chv3 = has_prim & (p_liv == 3)
+                m_chv4 = has_prim & (p_liv == 4)
+                diag_u = torch.where(nlx.abs() > 0.55, hit_ly, hit_lx)
+                diag_band = ((diag_u + hit_lz * 0.92) * 4.6).remainder(1.0) > 0.48
+                chv3_col = torch.stack(
                     [
-                        0.88 + 0.10 * warm_w,
-                        0.84 + 0.06 * warm_w,
-                        0.92 - 0.34 * warm_w,
+                        torch.where(diag_band, 0.94, 0.030),
+                        torch.where(diag_band, 0.74, 0.030),
+                        torch.where(diag_band, 0.03, 0.035),
                     ],
                     dim=0,
                 )
-                dark_pane = torch.tensor([0.05, 0.08, 0.12], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
-                mull_col = torch.tensor([0.16, 0.18, 0.21], device=dev, dtype=torch.float32)[:, None, None].expand_as(alb)
-                alb = torch.where(pane_lit[None, :, :], lit_col, torch.where(in_pane[None, :, :], dark_pane, mull_col))
-                p_rough = torch.where(in_pane, torch.full_like(p_rough, 0.07), p_rough)
-                p_coat = torch.where(in_pane, torch.full_like(p_coat, 0.82), p_coat)
-                p_emit_map = torch.where(
-                    pane_lit,
-                    torch.full_like(p_rough, 2.55 if is_night else 0.50),
-                    torch.zeros_like(p_rough),
+                chv4_col = torch.stack(
+                    [
+                        torch.where(diag_band, 0.90, 0.94),
+                        torch.where(diag_band, 0.05, 0.95),
+                        torch.where(diag_band, 0.04, 0.96),
+                    ],
+                    dim=0,
                 )
+                alb_p = torch.where(m_chv3[None], chv3_col, torch.where(m_chv4[None], chv4_col, alb_p))
+                p_retro = torch.where(m_chv3, torch.where(diag_band, 1.15, 0.05), torch.where(m_chv4, 1.35, p_retro))
+                p_rough = torch.where(m_chv3 | m_chv4, torch.full_like(p_rough, 0.24), p_rough)
 
-            # Substrate-decoupled conformal RGBA alpha-paint & 3D normal-relief typography (ZERO rectangular border!)
-            if pr.decal_spec is not None and len(self.bank.alpha_decal_mips) > 0:
-                d_idx, proj_face, u_c, v_c, u_hw, v_hh, rel_str = pr.decal_spec
-                mips_dec = self.bank.alpha_decal_mips[int(d_idx) % len(self.bank.alpha_decal_mips)]
-                uh_s = max(1e-3, float(u_hw))
-                vh_s = max(1e-3, float(v_hh))
-                if proj_face == 2:
-                    # Cylindrical / conical wrap around drum/tank circumference
-                    s_side = torch.where(hx >= 0.0, torch.ones_like(hx), -torch.ones_like(hx))
-                    ang_cyl = torch.atan2(zn_l, xn_l.abs().clamp_min(1e-3))
-                    u_dec = (s_side * yn_l - float(u_c)) / uh_s
-                    v_dec = -((ang_cyl / 0.88) - float(v_c)) / vh_s
-                    face_ok = (~is_cap) & (xn_l.abs() > 0.12) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
-                    tu_lx, tu_ly, tu_lz = torch.zeros_like(hx), s_side, torch.zeros_like(hx)
-                    tv_lx = s_side * torch.sin(ang_cyl)
-                    tv_ly = torch.zeros_like(hx)
-                    tv_lz = -torch.cos(ang_cyl)
-                elif proj_face == 1:
-                    s_y = torch.where(hy >= 0.0, -torch.ones_like(hy), torch.ones_like(hy))
-                    u_dec = (s_y * xn_l - float(u_c)) / uh_s
-                    v_dec = -(zn_l - float(v_c)) / vh_s
-                    face_ok = (nl_y.abs() > 0.60) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
-                    tu_lx, tu_ly, tu_lz = s_y, torch.zeros_like(hy), torch.zeros_like(hy)
-                    tv_lx, tv_ly, tv_lz = torch.zeros_like(hy), torch.zeros_like(hy), -torch.ones_like(hy)
-                else:
-                    s_x = torch.where(hx >= 0.0, torch.ones_like(hx), -torch.ones_like(hx))
-                    u_dec = (s_x * yn_l - float(u_c)) / uh_s
-                    v_dec = -(zn_l - float(v_c)) / vh_s
-                    face_ok = (nl_x.abs() > 0.58) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
-                    tu_lx, tu_ly, tu_lz = torch.zeros_like(hx), s_x, torch.zeros_like(hx)
-                    tv_lx, tv_ly, tv_lz = torch.zeros_like(hx), torch.zeros_like(hx), -torch.ones_like(hx)
+                # Gen-7 Glossy Crumpled Plastic Bags & Blue Tarps (`livery_mode == 5`)
+                m_bag5 = has_prim & (p_liv == 5)
+                cr1 = torch.sin(hit_lx * 24.0 + hit_ly * 19.0 + mud_p) * torch.cos(hit_lz * 27.0 - hit_lx * 15.0)
+                cr2 = torch.sin(hit_lx * 47.0 - hit_lz * 41.0 + 1.9 * mud_p)
+                bag_cr = 0.65 * cr1 + 0.35 * cr2
+                alb_p = torch.where(m_bag5[None], (alb_p * (0.92 + 0.16 * bag_cr[None])).clamp(0.02, 0.99), alb_p)
+                nlx = torch.where(m_bag5, nlx + 0.26 * cr1, nlx)
+                nly = torch.where(m_bag5, nly + 0.24 * cr2, nly)
+                nlz = torch.where(m_bag5, nlz + 0.16 * bag_cr, nlz)
+                p_rough = torch.where(m_bag5, torch.full_like(p_rough, 0.12), p_rough)
+                p_coat = torch.where(m_bag5, torch.full_like(p_coat, 0.84), p_coat)
 
-                if (valid_p & face_ok).any():
-                    grid_d = torch.stack([u_dec.clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
-                    dec_rgba = self._sample_mip_trilinear(mips_dec, grid_d, px_span_pr * min(uh_s, vh_s))
-                    alpha_d = torch.where(face_ok, dec_rgba[3].clamp(0.0, 1.0), torch.zeros_like(u_dec))
-                    if float(rel_str) != 0.0:
-                        mip_g = mips_dec[min(1, len(mips_dec) - 1)][:, 3:4]
-                        eps_uv = 0.014
-                        g_pu = torch.stack([(u_dec + eps_uv).clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
-                        g_mu = torch.stack([(u_dec - eps_uv).clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
-                        g_pv = torch.stack([u_dec.clamp(-1.0, 1.0), (v_dec + eps_uv).clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
-                        g_mv = torch.stack([u_dec.clamp(-1.0, 1.0), (v_dec - eps_uv).clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
-                        da_du = (
-                            F.grid_sample(mip_g, g_pu, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
-                            - F.grid_sample(mip_g, g_mu, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
-                        )
-                        da_dv = (
-                            F.grid_sample(mip_g, g_pv, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
-                            - F.grid_sample(mip_g, g_mv, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
-                        )
-                        rel_amp = abs(float(rel_str)) * 1.15 * face_ok.to(torch.float32)
-                        nl_x = nl_x - rel_amp * (da_du * tu_lx + da_dv * tv_lx)
-                        nl_y = nl_y - rel_amp * (da_du * tu_ly + da_dv * tv_ly)
-                        nl_z = nl_z - rel_amp * (da_du * tu_lz + da_dv * tv_lz)
-                    # Negative `rel_str` denotes unpainted substrate-colored 3D stamped/embossed relief lettering!
-                    if float(rel_str) >= 0.0:
-                        alb = alb * (1.0 - alpha_d[None]) + dec_rgba[:3] * alpha_d[None]
-                        p_rough = p_rough * (1.0 - alpha_d) + 0.30 * alpha_d
+                # Gen-7 3D Sunlit Green Tree Foliage Canopy (`livery_mode == 6`)
+                m_tree6 = has_prim & (p_liv == 6)
+                lf1 = torch.sin(hit_lx * 9.5 + mud_p) * torch.cos(hit_ly * 10.3 - hit_lz * 8.7 + mud_p)
+                lf2 = torch.sin(hit_lx * 21.0 - hit_ly * 18.5 + hit_lz * 23.0)
+                lf_mix = (0.5 + 0.34 * lf1 + 0.20 * lf2).clamp(0.0, 1.0)
+                top_sun = (0.5 + 0.5 * zn_l).clamp(0.0, 1.0)
+                tree_col = torch.stack(
+                    [
+                        (0.05 + 0.24 * lf_mix * (0.65 + 0.55 * top_sun)).clamp(0.02, 0.55),
+                        (0.14 + 0.40 * lf_mix * (0.65 + 0.55 * top_sun)).clamp(0.05, 0.78),
+                        (0.03 + 0.13 * lf_mix * (0.65 + 0.40 * top_sun)).clamp(0.01, 0.32),
+                    ],
+                    dim=0,
+                )
+                alb_p = torch.where(m_tree6[None], tree_col, alb_p)
+                nlx = torch.where(m_tree6, nlx + 0.34 * lf1, nlx)
+                nly = torch.where(m_tree6, nly + 0.34 * lf2, nly)
+                nlz = torch.where(m_tree6, nlz + 0.22 * (lf1 - lf2), nlz)
+                p_rough = torch.where(m_tree6, torch.full_like(p_rough, 0.78), p_rough)
+                p_coat = torch.where(m_tree6, torch.zeros_like(p_coat), p_coat)
 
-            if pr.mud_level > 0.01:
-                h_frac = ((hz + sz) / max(0.1, 2.0 * sz)).clamp(0.0, 1.0)
-                splat = 0.5 + 0.5 * torch.sin(hx * 11.3 + pr.mud_phase) * torch.cos(hy * 9.7 - hz * 7.1 + pr.mud_phase)
-                mud_a = (pr.mud_level * (1.0 - 0.68 * h_frac) * (0.45 + 0.75 * splat)).clamp(0.0, 0.88)
+                # 2) Cabin Glass (pillars, wipers, dark frame, interior tint)
+                on_pillar = (xn_l.abs() > 0.84) | (zn_l > 0.80) | (zn_l < -0.82) | ((yn_l.abs() < 0.08) & (nlx.abs() > 0.6))
+                wiper = (nly > 0.35) & (zn_l < -0.45) & (
+                    ((xn_l + 0.32 + 0.35 * (zn_l + 0.8)).abs() < 0.03)
+                    | ((xn_l - 0.28 + 0.35 * (zn_l + 0.8)).abs() < 0.03)
+                )
+                frame_m = m_glass & (on_pillar | wiper)
+                glass_only = m_glass & (~frame_m)
+                frame_col = torch.tensor([0.09, 0.10, 0.11], device=dev, dtype=torch.float32)[:, None, None]
+                int_var = (0.04 + 0.035 * torch.cos(xn_l * 4.5) * (0.5 - 0.5 * zn_l))[None]
+                alb_p = torch.where(frame_m[None], frame_col, torch.where(glass_only[None], alb_p + int_var, alb_p))
+                p_rough = torch.where(frame_m, torch.full_like(p_rough, 0.45), p_rough)
+                p_coat = torch.where(frame_m, torch.full_like(p_coat, 0.10), p_coat)
+
+                # 3) Tire & D_N Radial Rims / Stud Bevels
+                r_rad = torch.sqrt(yn_l * yn_l + zn_l * zn_l)
+                rim_limit = torch.where(p_role == _ROLE_TIRE, 0.64, 0.98)
+                is_outer_cap = m_cyl_dn & (hit_lx.abs() >= sx_m * 0.90) & (r_rad < rim_limit)
+                n_sym = torch.where(p_radn >= 3, p_radn.to(torch.float32), torch.full_like(p_rough, 6.0))
+                ang_w = torch.atan2(zn_l, yn_l) + mud_p
+                sec_w = (2.0 * math.pi) / n_sym
+                th_s = torch.remainder(ang_w + 0.5 * sec_w, sec_w) - 0.5 * sec_w
+                du_st = r_rad * torch.cos(th_s) - 0.28
+                dv_st = r_rad * torch.sin(th_s)
+                on_stud = (du_st * du_st + dv_st * dv_st) < (0.038 * 0.038)
+                hub_f = (r_rad < 0.17).to(torch.float32)
+                is_tire_cap = is_outer_cap & (p_role == _ROLE_TIRE)
+                rim_l = 0.38 - 0.22 * on_stud.to(torch.float32) - 0.20 * hub_f
+                rim_col = torch.stack([rim_l, rim_l * 1.02, rim_l * 1.05], dim=0)
+                alb_p = torch.where(is_tire_cap[None], rim_col, alb_p)
+                p_rough = torch.where(is_tire_cap, torch.full_like(p_rough, 0.28), p_rough)
+                p_metal = torch.where(is_tire_cap, torch.full_like(p_metal, 0.68), p_metal)
+                stud_m = is_outer_cap & on_stud
+                bev_y = (du_st * torch.cos(ang_w) - dv_st * torch.sin(ang_w)) * 8.5
+                bev_z = (du_st * torch.sin(ang_w) + dv_st * torch.cos(ang_w)) * 8.5
+                nly = torch.where(stud_m, nly + bev_y, nly)
+                nlz = torch.where(stud_m, nlz + bev_z, nlz)
+
+                # 4) Chrome Bumper Intake Slots
+                in_slot = m_chrome & (nly.abs() > 0.7) & (zn_l.abs() < 0.36) & (xn_l.abs() > 0.34) & (xn_l.abs() < 0.76)
+                slot_col = torch.tensor([0.035, 0.038, 0.042], device=dev, dtype=torch.float32)[:, None, None]
+                alb_p = torch.where(in_slot[None], slot_col, alb_p)
+                p_rough = torch.where(in_slot, torch.full_like(p_rough, 0.78), p_rough)
+                p_metal = torch.where(in_slot, torch.zeros_like(p_metal), p_metal)
+
+                # 5) Granular Cargo Heap (snow / gravel / sand)
+                gran_c = (
+                    torch.sin(hit_lx * 16.7 + mud_p) * torch.cos(hit_ly * 14.3 - hit_lz * 18.1 + 0.5 * mud_p)
+                    + 0.5 * torch.sin(hit_lx * 31.1 - hit_ly * 27.9 + mud_p)
+                )
+                alb_p = torch.where(m_cargo[None], (alb_p * (1.0 + 0.11 * gran_c[None])).clamp(0.02, 0.99), alb_p)
+                nlx = torch.where(m_cargo, nlx + 0.14 * gran_c, nlx)
+                nlz = torch.where(m_cargo, nlz + 0.10 * gran_c.abs(), nlz)
+
+                # 6) Environment Architectural Walls, Storefronts & Urban Buildings (`veh_idx == 0`)
+                w_style = torch.round(mud_p).to(torch.int32)
+                m_ew14 = m_env_w & (sy_m > 3.0) & (mud_p > 0.5) & (p_liv == 0)
+                m_ew1 = m_ew14 & (w_style == 1)
+                rib_w = 0.5 + 0.5 * torch.cos(hit_ly * 26.0)
+                seam_y1 = ((hit_ly.remainder(1.85)).abs() < 0.035) | ((hit_lz.remainder(0.92)).abs() < 0.028)
+                mod1 = (0.76 + 0.30 * rib_w) * torch.where(seam_y1, torch.full_like(rib_w, 0.42), torch.ones_like(rib_w))
+                alb_p = torch.where(m_ew1[None], (alb_p * mod1[None]).clamp(0.02, 0.96), alb_p)
+
+                m_ew2 = m_ew14 & (w_style == 2)
+                on_bar2 = ((hit_lz.remainder(0.42)).abs() < 0.055) | ((hit_ly.remainder(0.16)).abs() < 0.042)
+                alb_p = torch.where(m_ew2[None], torch.where(on_bar2[None], (alb_p * 1.18).clamp(0.05, 0.92), (alb_p * 0.24).clamp(0.015, 0.35)), alb_p)
+
+                m_ew3 = m_ew14 & (w_style == 3)
+                plank_id = torch.floor((hit_lz + sz_m) / 0.22)
+                plank_gap = ((hit_lz + sz_m).remainder(0.22)) < 0.024
+                post_v = (hit_ly.remainder(2.10)).abs() < 0.065
+                wood_var = 0.85 + 0.22 * torch.sin(plank_id * 3.7 + hit_ly * 0.4)
+                wood_base = torch.stack(
+                    [(0.36 * wood_var).clamp(0.05, 0.72), (0.23 * wood_var).clamp(0.04, 0.52), (0.12 * wood_var).clamp(0.02, 0.32)],
+                    dim=0,
+                )
+                alb_p = torch.where(m_ew3[None], torch.where((plank_gap & (~post_v))[None], wood_base * 0.22, wood_base), alb_p)
+
+                m_ew4 = m_ew14 & (w_style == 4)
+                cy4 = (hit_ly + sy_m).remainder(1.10)
+                cz4 = (hit_lz + sz_m).remainder(0.62)
+                in_p4 = m_ew4 & (cy4 > 0.16) & (cy4 < 0.94) & (cz4 > 0.12) & (cz4 < 0.50)
+                pane4 = torch.tensor([0.05, 0.08, 0.12], device=dev, dtype=torch.float32)[:, None, None]
+                alb_p = torch.where(m_ew4[None], torch.where(in_p4[None], pane4, (alb_p * 1.12).clamp(0.08, 0.88)), alb_p)
+                p_rough = torch.where(in_p4, torch.full_like(p_rough, 0.08), p_rough)
+                p_coat = torch.where(in_p4, torch.full_like(p_coat, 0.80), p_coat)
+
+                p_emit_map = torch.zeros((h, w), device=dev, dtype=torch.float32)
+                m_ew5 = m_env_w & (sy_m > 1.2) & (w_style == 5) & (p_liv == 0)
+                cy5 = (hit_ly + sy_m).remainder(0.92)
+                cz5 = (hit_lz + sz_m).remainder(0.64)
+                in_p5 = m_ew5 & (cy5 > 0.10) & (cy5 < 0.82) & (cz5 > 0.10) & (cz5 < 0.54)
+                cid_y5 = torch.floor((hit_ly + sy_m) / 0.92)
+                cid_z5 = torch.floor((hit_lz + sz_m) / 0.64)
+                chash5 = torch.sin(cid_y5 * 12.9898 + cid_z5 * 78.233 + ph_e)
+                plit5 = in_p5 & (chash5 > (0.08 if is_night else 0.28))
+                warm5 = (0.5 + 0.5 * torch.cos(cid_y5 * 3.1 + cid_z5 * 1.7)).clamp(0.0, 1.0)
+                lit5_col = torch.stack([0.86 + 0.12 * warm5, 0.80 + 0.08 * warm5, 0.88 - 0.36 * warm5], dim=0)
+                dp5 = torch.tensor([0.05, 0.08, 0.12], device=dev, dtype=torch.float32)[:, None, None]
+                mc5 = torch.tensor([0.16, 0.18, 0.21], device=dev, dtype=torch.float32)[:, None, None]
+                alb_p = torch.where(m_ew5[None], torch.where(plit5[None], lit5_col, torch.where(in_p5[None], dp5, mc5)), alb_p)
+                p_rough = torch.where(in_p5, torch.full_like(p_rough, 0.07), p_rough)
+                p_coat = torch.where(in_p5, torch.full_like(p_coat, 0.82), p_coat)
+                p_emit_map = torch.where(plit5, torch.full_like(p_emit_map, 1.38 if is_night else 0.40), p_emit_map)
+
+                # Gen-7 `w_style == 6`: Colorful Japanese Storefront (striped shop awning + wide lit display window + upper facade)
+                m_ew6 = m_env_w & (sy_m > 1.0) & (w_style == 6) & (p_liv == 0)
+                in_awn6 = m_ew6 & (zn_l >= -0.08) & (zn_l <= 0.18)
+                awn_st = ((hit_ly * 4.5).remainder(1.0) > 0.48)
+                awn_col = torch.where(awn_st[None], liv_rgb_p, torch.full_like(alb_p, 0.95))
+                in_shopw6 = m_ew6 & (zn_l < -0.14) & (zn_l > -0.84) & (yn_l.abs() < 0.82)
+                shop_col = torch.tensor([0.92, 0.88, 0.78], device=dev, dtype=torch.float32)[:, None, None] if is_night else torch.tensor([0.16, 0.22, 0.28], device=dev, dtype=torch.float32)[:, None, None]
+                up_win6 = m_ew6 & (zn_l > 0.30) & (zn_l < 0.82) & (((hit_ly + sy_m).remainder(1.15) > 0.18) & ((hit_ly + sy_m).remainder(1.15) < 0.96))
+                alb_p = torch.where(in_awn6[None], awn_col, torch.where(in_shopw6[None], shop_col, torch.where(up_win6[None], dp5, alb_p)))
+                p_rough = torch.where(in_shopw6 | up_win6, torch.full_like(p_rough, 0.08), p_rough)
+                p_coat = torch.where(in_shopw6 | up_win6, torch.full_like(p_coat, 0.84), p_coat)
+                p_emit_map = torch.where(in_shopw6, torch.full_like(p_emit_map, 2.20 if is_night else 0.35), p_emit_map)
+
+                # Gen-7 `w_style == 7`: Sunlit Japanese Tiled Apartment / Office Facade
+                m_ew7 = m_env_w & (sy_m > 1.0) & (w_style == 7) & (p_liv == 0)
+                tile_g7 = ((hit_ly.remainder(0.32).abs() < 0.018) | (hit_lz.remainder(0.18).abs() < 0.016))
+                cy7 = (hit_ly + sy_m).remainder(1.55)
+                cz7 = (hit_lz + sz_m).remainder(1.35)
+                in_win7 = m_ew7 & (cy7 > 0.26) & (cy7 < 1.28) & (cz7 > 0.30) & (cz7 < 1.12)
+                w7_col = torch.tensor([0.12, 0.18, 0.26], device=dev, dtype=torch.float32)[:, None, None]
+                alb_p = torch.where(m_ew7[None], torch.where(in_win7[None], w7_col, torch.where(tile_g7[None], alb_p * 0.82, alb_p)), alb_p)
+                p_rough = torch.where(in_win7, torch.full_like(p_rough, 0.07), p_rough)
+                p_coat = torch.where(in_win7, torch.full_like(p_coat, 0.86), p_coat)
+
+                # 7) Substrate-Decoupled Conformal Alpha-Paint & 3D Relief Decals (ONLY on visible decal prims!)
+                for d_pidx, du0, du1, dv0, dv1, px_sp_d in decal_rois:
+                    pr_d = prims[d_pidx]
+                    assert pr_d.decal_spec is not None
+                    own_m = prim_id_buf[dv0:dv1, du0:du1] == d_pidx
+                    d_idx, proj_face, u_c, v_c, u_hw, v_hh, rel_str = pr_d.decal_spec
+                    mips_dec = self.bank.alpha_decal_mips[int(d_idx) % len(self.bank.alpha_decal_mips)]
+                    uh_s = max(1e-3, float(u_hw))
+                    vh_s = max(1e-3, float(v_hh))
+                    hx_d = hit_lx[dv0:dv1, du0:du1]
+                    hy_d = hit_ly[dv0:dv1, du0:du1]
+                    xn_d = xn_l[dv0:dv1, du0:du1]
+                    yn_d = yn_l[dv0:dv1, du0:du1]
+                    zn_d = zn_l[dv0:dv1, du0:du1]
+                    nlx_d = nlx[dv0:dv1, du0:du1]
+                    nly_d = nly[dv0:dv1, du0:du1]
+                    ic_d = is_cap_buf[dv0:dv1, du0:du1]
+                    if proj_face == 2:
+                        s_side = torch.where(hx_d >= 0.0, torch.ones_like(hx_d), -torch.ones_like(hx_d))
+                        ang_cyl = torch.atan2(zn_d, xn_d.abs().clamp_min(1e-3))
+                        u_dec = (s_side * yn_d - float(u_c)) / uh_s
+                        v_dec = -((ang_cyl / 0.88) - float(v_c)) / vh_s
+                        face_ok = own_m & (~ic_d) & (xn_d.abs() > 0.12) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
+                        tu_lx, tu_ly, tu_lz = torch.zeros_like(hx_d), s_side, torch.zeros_like(hx_d)
+                        tv_lx, tv_ly, tv_lz = s_side * torch.sin(ang_cyl), torch.zeros_like(hx_d), -torch.cos(ang_cyl)
+                    elif proj_face == 1:
+                        s_y = torch.where(hy_d >= 0.0, -torch.ones_like(hy_d), torch.ones_like(hy_d))
+                        u_dec = (s_y * xn_d - float(u_c)) / uh_s
+                        v_dec = -(zn_d - float(v_c)) / vh_s
+                        face_ok = own_m & (nly_d.abs() > 0.60) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
+                        tu_lx, tu_ly, tu_lz = s_y, torch.zeros_like(hy_d), torch.zeros_like(hy_d)
+                        tv_lx, tv_ly, tv_lz = torch.zeros_like(hy_d), torch.zeros_like(hy_d), -torch.ones_like(hy_d)
+                    else:
+                        s_x = torch.where(hx_d >= 0.0, torch.ones_like(hx_d), -torch.ones_like(hx_d))
+                        u_dec = (s_x * yn_d - float(u_c)) / uh_s
+                        v_dec = -(zn_d - float(v_c)) / vh_s
+                        face_ok = own_m & (nlx_d.abs() > 0.58) & (u_dec.abs() <= 1.0) & (v_dec.abs() <= 1.0)
+                        tu_lx, tu_ly, tu_lz = torch.zeros_like(hx_d), s_x, torch.zeros_like(hx_d)
+                        tv_lx, tv_ly, tv_lz = torch.zeros_like(hx_d), torch.zeros_like(hx_d), -torch.ones_like(hx_d)
+
+                    if face_ok.any():
+                        grid_d = torch.stack([u_dec.clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
+                        dec_rgba = self._sample_mip_trilinear(mips_dec, grid_d, px_sp_d * min(uh_s, vh_s))
+                        alpha_d = torch.where(face_ok, dec_rgba[3].clamp(0.0, 1.0), torch.zeros_like(u_dec))
+                        if float(rel_str) != 0.0:
+                            mip_g = mips_dec[min(1, len(mips_dec) - 1)][:, 3:4]
+                            eps_uv = 0.014
+                            g_pu = torch.stack([(u_dec + eps_uv).clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
+                            g_mu = torch.stack([(u_dec - eps_uv).clamp(-1.0, 1.0), v_dec.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
+                            g_pv = torch.stack([u_dec.clamp(-1.0, 1.0), (v_dec + eps_uv).clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
+                            g_mv = torch.stack([u_dec.clamp(-1.0, 1.0), (v_dec - eps_uv).clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
+                            da_du = (
+                                F.grid_sample(mip_g, g_pu, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
+                                - F.grid_sample(mip_g, g_mu, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
+                            )
+                            da_dv = (
+                                F.grid_sample(mip_g, g_pv, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
+                                - F.grid_sample(mip_g, g_mv, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
+                            )
+                            rel_amp = abs(float(rel_str)) * 1.15 * face_ok.to(torch.float32)
+                            nlx[dv0:dv1, du0:du1] = nlx_d - rel_amp * (da_du * tu_lx + da_dv * tv_lx)
+                            nly[dv0:dv1, du0:du1] = nly_d - rel_amp * (da_du * tu_ly + da_dv * tv_ly)
+                            nlz[dv0:dv1, du0:du1] = nlz[dv0:dv1, du0:du1] - rel_amp * (da_du * tu_lz + da_dv * tv_lz)
+                        if float(rel_str) >= 0.0:
+                            alb_p[:, dv0:dv1, du0:du1] = alb_p[:, dv0:dv1, du0:du1] * (1.0 - alpha_d[None]) + dec_rgba[:3] * alpha_d[None]
+                            p_rough[dv0:dv1, du0:du1] = p_rough[dv0:dv1, du0:du1] * (1.0 - alpha_d) + 0.30 * alpha_d
+
+                # 8) Mud Splatter
+                has_mud = has_prim & (mud_l > 0.01)
+                h_frac_m = ((hit_lz + sz_m) / (2.0 * sz_m).clamp_min(0.1)).clamp(0.0, 1.0)
+                splat_m = 0.5 + 0.5 * torch.sin(hit_lx * 11.3 + mud_p) * torch.cos(hit_ly * 9.7 - hit_lz * 7.1 + mud_p)
+                mud_a = torch.where(has_mud, (mud_l * (1.0 - 0.68 * h_frac_m) * (0.45 + 0.75 * splat_m)).clamp(0.0, 0.88), torch.zeros_like(mud_l))
                 mud_col = torch.tensor([0.11, 0.085, 0.058], device=dev, dtype=torch.float32)[:, None, None]
-                alb = alb * (1.0 - mud_a[None]) + mud_col * mud_a[None]
+                alb_p = alb_p * (1.0 - mud_a[None]) + mud_col * mud_a[None]
                 p_rough = p_rough * (1.0 - mud_a) + 0.88 * mud_a
                 p_coat = p_coat * (1.0 - mud_a)
 
-            nw_len = torch.sqrt(nl_x * nl_x + nl_y * nl_y + nl_z * nl_z).clamp_min(1e-5)
-            nl_x, nl_y, nl_z = nl_x / nw_len, nl_y / nw_len, nl_z / nw_len
-            nw_x = Rw2l_t[0, 0] * nl_x + Rw2l_t[1, 0] * nl_y + Rw2l_t[2, 0] * nl_z
-            nw_y = Rw2l_t[0, 1] * nl_x + Rw2l_t[1, 1] * nl_y + Rw2l_t[2, 1] * nl_z
-            nw_z = Rw2l_t[0, 2] * nl_x + Rw2l_t[1, 2] * nl_y + Rw2l_t[2, 2] * nl_z
+                # 9) Transform Perturbed Local Normals -> World & Commit Unified G-Buffers ONCE!
+                nw_len = torch.sqrt(nlx * nlx + nly * nly + nlz * nlz).clamp_min(1e-5)
+                nlx, nly, nlz = nlx / nw_len, nly / nw_len, nlz / nw_len
+                nw_x = Rw[..., 0, 0] * nlx + Rw[..., 1, 0] * nly + Rw[..., 2, 0] * nlz
+                nw_y = Rw[..., 0, 1] * nlx + Rw[..., 1, 1] * nly + Rw[..., 2, 1] * nlz
+                nw_z = Rw[..., 0, 2] * nlx + Rw[..., 1, 2] * nly + Rw[..., 2, 2] * nlz
 
-            is_lamp = pr.role in (_ROLE_HEADLIGHT, _ROLE_TAILLIGHT)
-            if pr.role == _ROLE_HEADLIGHT:
-                emit_val = 6.4 if is_ir else (5.8 if is_night else 1.4)
-            elif pr.role == _ROLE_TAILLIGHT:
-                emit_val = 3.4 if is_ir else (2.8 if is_night else 0.9)
-            else:
-                emit_val = 0.0
-            nir_sc = (
-                float(pr.nir_scale_override)
-                if pr.nir_scale_override > 0.0
-                else (0.45 if pr.role == _ROLE_CABIN_GLASS else (0.70 if pr.role == _ROLE_TIRE else 1.0))
-            )
-            hk_val = 4 if is_lamp else 2
-
-            alb_buf[:, v0:v1, u0:u1] = torch.where(valid_p[None, :, :], alb, alb_buf[:, v0:v1, u0:u1])
-            nw_x_buf[v0:v1, u0:u1] = torch.where(valid_p, nw_x, nw_x_buf[v0:v1, u0:u1])
-            nw_y_buf[v0:v1, u0:u1] = torch.where(valid_p, nw_y, nw_y_buf[v0:v1, u0:u1])
-            nw_z_buf[v0:v1, u0:u1] = torch.where(valid_p, nw_z, nw_z_buf[v0:v1, u0:u1])
-            ng_x_buf[v0:v1, u0:u1] = torch.where(valid_p, ng_x_p, ng_x_buf[v0:v1, u0:u1])
-            ng_y_buf[v0:v1, u0:u1] = torch.where(valid_p, ng_y_p, ng_y_buf[v0:v1, u0:u1])
-            ng_z_buf[v0:v1, u0:u1] = torch.where(valid_p, ng_z_p, ng_z_buf[v0:v1, u0:u1])
-            rough_buf[v0:v1, u0:u1] = torch.where(valid_p, p_rough, rough_buf[v0:v1, u0:u1])
-            metal_buf[v0:v1, u0:u1] = torch.where(valid_p, p_metal, metal_buf[v0:v1, u0:u1])
-            f0_buf[v0:v1, u0:u1] = torch.where(valid_p, p_f0, f0_buf[v0:v1, u0:u1])
-            coat_buf[v0:v1, u0:u1] = torch.where(valid_p, p_coat, coat_buf[v0:v1, u0:u1])
-            retro_buf[v0:v1, u0:u1] = torch.where(valid_p, p_retro, retro_buf[v0:v1, u0:u1])
-            if p_emit_map is not None:
-                emit_buf[v0:v1, u0:u1] = torch.where(valid_p, p_emit_map, emit_buf[v0:v1, u0:u1])
-                hk_map = torch.where(
-                    p_emit_map > 0.0,
-                    torch.full_like(hit_kind_buf[v0:v1, u0:u1], 4),
-                    torch.full_like(hit_kind_buf[v0:v1, u0:u1], 2),
+                is_hl = p_role == _ROLE_HEADLIGHT
+                is_tl = p_role == _ROLE_TAILLIGHT
+                hl_e = 6.4 if is_ir else ((8.2 if is_train_v7 else 5.8) if is_night else 1.5)
+                tl_e = 3.4 if is_ir else ((4.2 if is_train_v7 else 2.8) if is_night else 1.0)
+                emit_p = torch.where(is_hl, hl_e, torch.where(is_tl, tl_e, p_emit_map))
+                hk_p = torch.where(
+                    is_hl | is_tl | (p_emit_map > 0.0),
+                    torch.full((h, w), 4, device=dev, dtype=torch.int8),
+                    torch.full((h, w), 2, device=dev, dtype=torch.int8),
                 )
-                hit_kind_buf[v0:v1, u0:u1] = torch.where(valid_p, hk_map, hit_kind_buf[v0:v1, u0:u1])
-            else:
-                emit_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(emit_buf[v0:v1, u0:u1], emit_val), emit_buf[v0:v1, u0:u1])
-                hit_kind_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(hit_kind_buf[v0:v1, u0:u1], hk_val), hit_kind_buf[v0:v1, u0:u1])
-            nir_scale_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(nir_scale_buf[v0:v1, u0:u1], nir_sc), nir_scale_buf[v0:v1, u0:u1])
-            green_plate_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.zeros_like(green_plate_buf[v0:v1, u0:u1]), green_plate_buf[v0:v1, u0:u1])
-            cavity_ao_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.ones_like(cavity_ao_buf[v0:v1, u0:u1]), cavity_ao_buf[v0:v1, u0:u1])
-            prim_id_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(prim_id_buf[v0:v1, u0:u1], p_idx), prim_id_buf[v0:v1, u0:u1])
-            quad_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(quad_buf[v0:v1, u0:u1], -1), quad_buf[v0:v1, u0:u1])
-            t_best[v0:v1, u0:u1] = torch.where(valid_p, t_hit, t_best[v0:v1, u0:u1])
-            t_geom[v0:v1, u0:u1] = torch.where(valid_p, t_hit, t_geom[v0:v1, u0:u1])
-            veh_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(veh_buf[v0:v1, u0:u1], pr.veh_idx), veh_buf[v0:v1, u0:u1])
-            if record_masks and role_buf is not None:
-                role_buf[v0:v1, u0:u1] = torch.where(valid_p, torch.full_like(role_buf[v0:v1, u0:u1], pr.role), role_buf[v0:v1, u0:u1])
+                nir_sc_p = torch.where(
+                    nir_ov > 0.0,
+                    nir_ov,
+                    torch.where(p_role == _ROLE_CABIN_GLASS, 0.45, torch.where(p_role == _ROLE_TIRE, 0.70, 1.0)),
+                )
+
+                alb_buf = torch.where(has_prim[None], alb_p, alb_buf)
+                nw_x_buf = torch.where(has_prim, nw_x, nw_x_buf)
+                nw_y_buf = torch.where(has_prim, nw_y, nw_y_buf)
+                nw_z_buf = torch.where(has_prim, nw_z, nw_z_buf)
+                ng_x_buf = torch.where(has_prim, ng_x_p, ng_x_buf)
+                ng_y_buf = torch.where(has_prim, ng_y_p, ng_y_buf)
+                ng_z_buf = torch.where(has_prim, ng_z_p, ng_z_buf)
+                rough_buf = torch.where(has_prim, p_rough, rough_buf)
+                metal_buf = torch.where(has_prim, p_metal, metal_buf)
+                f0_buf = torch.where(has_prim, p_f0, f0_buf)
+                coat_buf = torch.where(has_prim, p_coat, coat_buf)
+                retro_buf = torch.where(has_prim, p_retro, retro_buf)
+                emit_buf = torch.where(has_prim, emit_p, emit_buf)
+                hit_kind_buf = torch.where(has_prim, hk_p, hit_kind_buf)
+                nir_scale_buf = torch.where(has_prim, nir_sc_p, nir_scale_buf)
+                green_plate_buf.masked_fill_(has_prim, False)
+                cavity_ao_buf.masked_fill_(has_prim, 1.0)
+                quad_buf.masked_fill_(has_prim, -1)
+                veh_buf = torch.where(has_prim, p_veh.to(torch.int16), veh_buf)
+                if record_masks and role_buf is not None:
+                    role_buf = torch.where(has_prim, p_role.to(torch.int16), role_buf)
 
         # Pass 1C: Exact 3D Planar Quads & Substrate-Decoupled Frameless Alpha Stencils (Zero analytic overhang_shadow!)
         for q_idx, qd in enumerate(quads):
@@ -7372,21 +9524,21 @@ class Scene3DGPUEngine:
             sub_dx = dx_w[v0:v1, u0:u1]
             sub_dy = dy_w[v0:v1, u0:u1]
             sub_dz = dz_w[v0:v1, u0:u1]
-            n_t = torch.from_numpy(qd.normal).to(device=dev, dtype=torch.float32)
-            u_t = torch.from_numpy(qd.u_axis).to(device=dev, dtype=torch.float32)
-            v_t = torch.from_numpy(qd.v_axis).to(device=dev, dtype=torch.float32)
-            c_t = torch.from_numpy(qd.center).to(device=dev, dtype=torch.float32)
+            nx_q, ny_q, nz_q = float(qd.normal[0]), float(qd.normal[1]), float(qd.normal[2])
+            ux_q, uy_q, uz_q = float(qd.u_axis[0]), float(qd.u_axis[1]), float(qd.u_axis[2])
+            vx_q, vy_q, vz_q = float(qd.v_axis[0]), float(qd.v_axis[1]), float(qd.v_axis[2])
+            cx_q, cy_q, cz_q = float(qd.center[0]), float(qd.center[1]), float(qd.center[2])
 
-            denom = n_t[0] * sub_dx + n_t[1] * sub_dy + n_t[2] * sub_dz
-            num = float(torch.dot(n_t, c_t - cam_o_t).item())
+            denom = nx_q * sub_dx + ny_q * sub_dy + nz_q * sub_dz
+            num = nx_q * (cx_q - float(cam_o[0])) + ny_q * (cy_q - float(cam_o[1])) + nz_q * (cz_q - float(cam_o[2]))
             lam_q = num / torch.where(denom.abs() > 1e-6, denom, torch.full_like(denom, -1e-6))
 
-            px_w = cam_o_t[0] + lam_q * sub_dx - c_t[0]
-            py_w = cam_o_t[1] + lam_q * sub_dy - c_t[1]
-            pz_w = cam_o_t[2] + lam_q * sub_dz - c_t[2]
+            px_w = float(cam_o[0]) + lam_q * sub_dx - cx_q
+            py_w = float(cam_o[1]) + lam_q * sub_dy - cy_q
+            pz_w = float(cam_o[2]) + lam_q * sub_dz - cz_q
 
-            xi = (px_w * u_t[0] + py_w * u_t[1] + pz_w * u_t[2]) / max(1e-4, qd.half_w)
-            eta = (px_w * v_t[0] + py_w * v_t[1] + pz_w * v_t[2]) / max(1e-4, qd.half_h)
+            xi = (px_w * ux_q + py_w * uy_q + pz_w * uz_q) / max(1e-4, qd.half_w)
+            eta = (px_w * vx_q + py_w * vy_q + pz_w * vz_q) / max(1e-4, qd.half_h)
 
             if not qd.has_backing_substrate:
                 if self.config.domain_split == "train" and qd.decal_prim_coupled:
@@ -7400,12 +9552,7 @@ class Scene3DGPUEngine:
                         & ((lam_q - t_best[v0:v1, u0:u1]).abs() <= 0.28)
                         & (quad_buf[v0:v1, u0:u1] < 0)
                     )
-                    if in_decal_plane.any():
-                        quad_buf[v0:v1, u0:u1] = torch.where(
-                            in_decal_plane,
-                            torch.full_like(quad_buf[v0:v1, u0:u1], q_idx),
-                            quad_buf[v0:v1, u0:u1],
-                        )
+                    quad_buf[v0:v1, u0:u1].masked_fill_(in_decal_plane, q_idx)
                     continue
                 # Frameless painted alpha stencil applied onto an existing underlying surface (zero rectangular border!)
                 in_stencil = (
@@ -7427,26 +9574,20 @@ class Scene3DGPUEngine:
                 grid_s = torch.stack([xi.clamp(-1.0, 1.0), eta.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
                 samp_s = self._sample_mip_trilinear(mips_st, grid_s, px_span)
                 alpha_s = (samp_s[3].clamp(0.0, 1.0) if samp_s.shape[0] >= 4 else torch.ones_like(xi)) * in_stencil.to(torch.float32)
-                if (alpha_s > 1e-4).any():
-                    cur_alb = alb_buf[:, v0:v1, u0:u1]
-                    alb_buf[:, v0:v1, u0:u1] = cur_alb * (1.0 - alpha_s[None]) + samp_s[:3] * alpha_s[None]
-                    rough_buf[v0:v1, u0:u1] = rough_buf[v0:v1, u0:u1] * (1.0 - alpha_s) + float(qd.roughness) * alpha_s
+                cur_alb = alb_buf[:, v0:v1, u0:u1]
+                alb_buf[:, v0:v1, u0:u1] = cur_alb * (1.0 - alpha_s[None]) + samp_s[:3] * alpha_s[None]
+                rough_buf[v0:v1, u0:u1] = rough_buf[v0:v1, u0:u1] * (1.0 - alpha_s) + float(qd.roughness) * alpha_s
                 if self.config.domain_split == "train":
                     vis_st_plane = in_stencil & (quad_buf[v0:v1, u0:u1] < 0)
-                    if vis_st_plane.any():
-                        quad_buf[v0:v1, u0:u1] = torch.where(
-                            vis_st_plane,
-                            torch.full_like(quad_buf[v0:v1, u0:u1], q_idx),
-                            quad_buf[v0:v1, u0:u1],
-                        )
+                    quad_buf[v0:v1, u0:u1].masked_fill_(vis_st_plane, q_idx)
                 continue
 
             # Coplanar +3cm tolerance ONLY against the plate's OWN parent vehicle body (never nearer pillars/signs/trucks!)
             if qd.veh_idx > 0:
                 same_owner = veh_buf[v0:v1, u0:u1] == qd.veh_idx
-                depth_tol = torch.where(same_owner, torch.full_like(lam_q, 0.03), torch.zeros_like(lam_q))
+                depth_tol = torch.where(same_owner, 0.03, 0.0)
             else:
-                depth_tol = torch.zeros_like(lam_q)
+                depth_tol = 0.0
 
             in_quad = (
                 (denom < -1e-5)
@@ -7473,16 +9614,16 @@ class Scene3DGPUEngine:
             grid = torch.stack([xi.clamp(-1.0, 1.0), eta.clamp(-1.0, 1.0)], dim=-1).unsqueeze(0)
             sampled = self._sample_mip_trilinear(mips_any, grid, px_span)[:3]
 
-            qn_x = torch.full_like(xi, float(n_t[0]))
-            qn_y = torch.full_like(xi, float(n_t[1]))
-            qn_z = torch.full_like(xi, float(n_t[2]))
+            qn_x = torch.full_like(xi, nx_q)
+            qn_y = torch.full_like(xi, ny_q)
+            qn_z = torch.full_like(xi, nz_q)
             if qd.normal_undul_amp > 0.0:
                 ua = float(qd.normal_undul_amp)
                 du_w = ua * (torch.sin(xi * 4.3 + eta * 2.9 + float(q_idx)) + 0.4 * torch.cos(xi * 9.7 - eta * 7.1))
                 dv_w = ua * (torch.cos(eta * 5.1 - xi * 3.4 + float(q_idx)) + 0.4 * torch.sin(eta * 11.3 + xi * 6.2))
-                qn_x = qn_x + du_w * u_t[0] + dv_w * v_t[0]
-                qn_y = qn_y + du_w * u_t[1] + dv_w * v_t[1]
-                qn_z = qn_z + du_w * u_t[2] + dv_w * v_t[2]
+                qn_x = qn_x + du_w * ux_q + dv_w * vx_q
+                qn_y = qn_y + du_w * uy_q + dv_w * vy_q
+                qn_z = qn_z + du_w * uz_q + dv_w * vz_q
                 qn_len = torch.sqrt(qn_x * qn_x + qn_y * qn_y + qn_z * qn_z).clamp_min(1e-5)
                 qn_x, qn_y, qn_z = qn_x / qn_len, qn_y / qn_len, qn_z / qn_len
 
@@ -7490,32 +9631,27 @@ class Scene3DGPUEngine:
             nw_x_buf[v0:v1, u0:u1] = torch.where(in_quad, qn_x, nw_x_buf[v0:v1, u0:u1])
             nw_y_buf[v0:v1, u0:u1] = torch.where(in_quad, qn_y, nw_y_buf[v0:v1, u0:u1])
             nw_z_buf[v0:v1, u0:u1] = torch.where(in_quad, qn_z, nw_z_buf[v0:v1, u0:u1])
-            ng_x_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(n_t[0])), ng_x_buf[v0:v1, u0:u1])
-            ng_y_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(n_t[1])), ng_y_buf[v0:v1, u0:u1])
-            ng_z_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(n_t[2])), ng_z_buf[v0:v1, u0:u1])
-            rough_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.roughness)), rough_buf[v0:v1, u0:u1])
-            metal_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.metallic)), metal_buf[v0:v1, u0:u1])
-            f0_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.specular_f0)), f0_buf[v0:v1, u0:u1])
-            coat_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.clearcoat)), coat_buf[v0:v1, u0:u1])
-            retro_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.retro_gain)), retro_buf[v0:v1, u0:u1])
-            emit_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.zeros_like(xi), emit_buf[v0:v1, u0:u1])
-            nir_scale_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.ones_like(xi), nir_scale_buf[v0:v1, u0:u1])
-            cavity_ao_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(xi, float(qd.cavity_sky_ao)), cavity_ao_buf[v0:v1, u0:u1])
-            green_plate_buf[v0:v1, u0:u1] = torch.where(
-                in_quad,
-                torch.full_like(green_plate_buf[v0:v1, u0:u1], bool(qd.is_green_plate)),
-                green_plate_buf[v0:v1, u0:u1],
-            )
-            hit_kind_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(hit_kind_buf[v0:v1, u0:u1], 3), hit_kind_buf[v0:v1, u0:u1])
-            prim_id_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(prim_id_buf[v0:v1, u0:u1], -1), prim_id_buf[v0:v1, u0:u1])
+            ng_x_buf[v0:v1, u0:u1].masked_fill_(in_quad, nx_q)
+            ng_y_buf[v0:v1, u0:u1].masked_fill_(in_quad, ny_q)
+            ng_z_buf[v0:v1, u0:u1].masked_fill_(in_quad, nz_q)
+            rough_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.roughness))
+            metal_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.metallic))
+            f0_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.specular_f0))
+            coat_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.clearcoat))
+            retro_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.retro_gain))
+            emit_buf[v0:v1, u0:u1].masked_fill_(in_quad, 0.0)
+            nir_scale_buf[v0:v1, u0:u1].masked_fill_(in_quad, 1.0)
+            cavity_ao_buf[v0:v1, u0:u1].masked_fill_(in_quad, float(qd.cavity_sky_ao))
+            green_plate_buf[v0:v1, u0:u1].masked_fill_(in_quad, bool(qd.is_green_plate))
+            hit_kind_buf[v0:v1, u0:u1].masked_fill_(in_quad, 3)
+            prim_id_buf[v0:v1, u0:u1].masked_fill_(in_quad, -1)
             t_best[v0:v1, u0:u1] = torch.where(in_quad, torch.minimum(lam_q, t_best[v0:v1, u0:u1]), t_best[v0:v1, u0:u1])
             t_geom[v0:v1, u0:u1] = torch.where(in_quad, lam_q, t_geom[v0:v1, u0:u1])
-            # ALWAYS update both quad_buf and veh_buf (standalone signs have qd.veh_idx == 0, clearing occluded vehicle pixels!)
-            quad_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(quad_buf[v0:v1, u0:u1], q_idx), quad_buf[v0:v1, u0:u1])
-            veh_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(veh_buf[v0:v1, u0:u1], qd.veh_idx), veh_buf[v0:v1, u0:u1])
+            quad_buf[v0:v1, u0:u1].masked_fill_(in_quad, q_idx)
+            veh_buf[v0:v1, u0:u1].masked_fill_(in_quad, qd.veh_idx)
             if record_masks and role_buf is not None:
                 q_role = _ROLE_BODY if qd.veh_idx > 0 else _ROLE_ENV_SOLID
-                role_buf[v0:v1, u0:u1] = torch.where(in_quad, torch.full_like(role_buf[v0:v1, u0:u1], q_role), role_buf[v0:v1, u0:u1])
+                role_buf[v0:v1, u0:u1].masked_fill_(in_quad, q_role)
 
         # Pass 2: True 3D 1-Ray Shadow Visibility `V(x, omega_i)` onto Ground, 3D Bodies, AND Planar Quads!
         shadow_vis = torch.ones((h, w), device=dev, dtype=torch.float32)
@@ -7531,36 +9667,106 @@ class Scene3DGPUEngine:
                 I3_np = np.eye(3, dtype=np.float32)
                 inv_sd_z = 1.0 / max(0.08, sd_z)
 
-                for p_idx, pr in enumerate(prims):
-                    if pr.role in (_ROLE_HEADLIGHT, _ROLE_TAILLIGHT):
-                        continue
+                # Vectorized shadow-volume screen ROI computation + Fused Triton OBB/SlopedCab shadow kernel on CUDA!
+                s_cand_indices = [pi for pi, pr in enumerate(prims) if pr.role not in (_ROLE_HEADLIGHT, _ROLE_TAILLIGHT)]
+                if s_cand_indices:
+                    sc_cen = np.array([prims[pi].center for pi in s_cand_indices], dtype=np.float32)
+                    sc_he = np.array([prims[pi].half_ext for pi in s_cand_indices], dtype=np.float32)
+                    sc_rot = np.stack([prims[pi].rot_w2l for pi in s_cand_indices], axis=0).astype(np.float32)
+                    aabb_he_all = np.einsum("pij,pj->pi", np.abs(sc_rot.swapaxes(1, 2)), sc_he)
+                    z_top_all = sc_cen[:, 2] + aabb_he_all[:, 2]
+                    l_throw_all = np.clip((z_top_all + 0.25) * inv_sd_z, 0.4, 55.0)
+                    lo_sv_all = np.minimum(sc_cen - aabb_he_all, sc_cen - aabb_he_all - l_throw_all[:, None] * sd_np[None, :]) - 0.03
+                    hi_sv_all = np.maximum(sc_cen + aabb_he_all, sc_cen + aabb_he_all - l_throw_all[:, None] * sd_np[None, :]) + 0.03
+                    sv_c_all = (0.5 * (lo_sv_all + hi_sv_all)).astype(np.float32)
+                    sv_he_all = (0.5 * (hi_sv_all - lo_sv_all)).astype(np.float32)
+                    sv_rot_id = np.broadcast_to(I3_np[None, :, :], (len(s_cand_indices), 3, 3)).copy()
+                    sv_rois_all = self._batch_obb_rois_uv(sv_c_all, sv_rot_id, sv_he_all, cam_o, R_cam, fx, fy, cx, cy, w, h, z_near=0.15, pad=1.0)
+
+                    use_triton_sh = _HAS_TRITON and dev.type == "cuda"
+                    if use_triton_sh:
+                        sh_obb_rows: list[np.ndarray] = []
+                        sh_obb_pids: list[int] = []
+                        sh_cd_rows: list[np.ndarray] = []
+                        sh_cd_pids: list[int] = []
+                        sh_curved_items: list[tuple[int, int, int, int, int, float]] = []
+                        sdl_all = np.einsum("pij,j->pi", sc_rot, sd_np).astype(np.float32)
+                        for loc_i, p_idx in enumerate(s_cand_indices):
+                            z_top = float(z_top_all[loc_i])
+                            if z_top < 0.01:
+                                continue
+                            su0, su1, sv0, sv1 = int(sv_rois_all[loc_i, 0]), int(sv_rois_all[loc_i, 1]), int(sv_rois_all[loc_i, 2]), int(sv_rois_all[loc_i, 3])
+                            if su1 <= su0 or sv1 <= sv0:
+                                continue
+                            pr = prims[p_idx]
+                            if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
+                                row = np.empty((24,), dtype=np.float32)
+                                row[0:9] = sc_rot[loc_i].reshape(9)
+                                row[9:12] = sc_cen[loc_i]
+                                row[12:15] = sc_he[loc_i]
+                                row[15:18] = sdl_all[loc_i]
+                                row[18] = float(pr.slope_param) if pr.shape == _SHAPE_SLOPED_CAB else 0.0
+                                row[19] = z_top
+                                row[20:24] = (float(su0), float(su1), float(sv0), float(sv1))
+                                sh_obb_rows.append(row)
+                                sh_obb_pids.append(p_idx)
+                            elif pr.shape in (_SHAPE_CYLINDER_X, _SHAPE_TAPER_DRUM_Y):
+                                crow = np.empty((26,), dtype=np.float32)
+                                crow[0:9] = sc_rot[loc_i].reshape(9)
+                                crow[9:12] = sc_cen[loc_i]
+                                crow[12:15] = sc_he[loc_i]
+                                crow[15:18] = sdl_all[loc_i]
+                                is_d = pr.shape == _SHAPE_TAPER_DRUM_Y
+                                crow[18] = 1.0 if is_d else 0.0
+                                crow[19] = float(np.clip(pr.slope_param, 0.0, 0.65)) if is_d else float(pr.radial_n)
+                                crow[20] = float(pr.mud_phase)
+                                crow[21] = z_top
+                                crow[22:26] = (float(su0), float(su1), float(sv0), float(sv1))
+                                sh_cd_rows.append(crow)
+                                sh_cd_pids.append(p_idx)
+                            else:
+                                sh_curved_items.append((p_idx, su0, su1, sv0, sv1, z_top))
+                        wx_c = wy_c = wz_c = lit_i8 = None
+                        g2d = (triton.cdiv(w, 16), triton.cdiv(h, 16))
+                        if sh_obb_rows:
+                            wx_c, wy_c, wz_c = wx_hit.contiguous(), wy_hit.contiguous(), wz_hit.contiguous()
+                            lit_i8 = lit_cand.to(torch.int8).contiguous()
+                            sdata_t = torch.from_numpy(np.stack(sh_obb_rows, axis=0)).to(device=dev, dtype=torch.float32)
+                            spid_t = torch.tensor(sh_obb_pids, device=dev, dtype=torch.int32)
+                            _triton_obb_shadow_kernel[g2d](
+                                wx_c, wy_c, wz_c, lit_i8, prim_id_buf, shadow_vis,
+                                sdata_t, spid_t, h, w, len(sh_obb_rows),
+                            )
+                        if sh_cd_rows:
+                            if wx_c is None:
+                                wx_c, wy_c, wz_c = wx_hit.contiguous(), wy_hit.contiguous(), wz_hit.contiguous()
+                                lit_i8 = lit_cand.to(torch.int8).contiguous()
+                            scdata_t = torch.from_numpy(np.stack(sh_cd_rows, axis=0)).to(device=dev, dtype=torch.float32)
+                            scpid_t = torch.tensor(sh_cd_pids, device=dev, dtype=torch.int32)
+                            _triton_cyl_drum_shadow_kernel[g2d](
+                                wx_c, wy_c, wz_c, lit_i8, prim_id_buf, shadow_vis,
+                                scdata_t, scpid_t, h, w, len(sh_cd_rows),
+                            )
+                    else:
+                        sh_curved_items = []
+                        for loc_i, p_idx in enumerate(s_cand_indices):
+                            z_top = float(z_top_all[loc_i])
+                            if z_top < 0.01:
+                                continue
+                            su0, su1, sv0, sv1 = int(sv_rois_all[loc_i, 0]), int(sv_rois_all[loc_i, 1]), int(sv_rois_all[loc_i, 2]), int(sv_rois_all[loc_i, 3])
+                            if su1 <= su0 or sv1 <= sv0:
+                                continue
+                            sh_curved_items.append((p_idx, su0, su1, sv0, sv1, z_top))
+                else:
+                    sh_curved_items = []
+
+                for p_idx, su0, su1, sv0, sv1, z_top in sh_curved_items:
+                    pr = prims[p_idx]
                     c_np = np.array(pr.center, dtype=np.float32)
-                    he_np = np.array(pr.half_ext, dtype=np.float32)
-                    aabb_he = np.abs(pr.rot_w2l.T) @ he_np
-                    z_top = float(c_np[2] + aabb_he[2])
-                    if z_top < 0.01:
-                        continue
-                    l_throw = min(55.0, max(0.4, (z_top + 0.25) * inv_sd_z))
-                    lo_sv = np.minimum(c_np - aabb_he, c_np - aabb_he - l_throw * sd_np) - 0.03
-                    hi_sv = np.maximum(c_np + aabb_he, c_np + aabb_he - l_throw * sd_np) + 0.03
-                    sv_c = 0.5 * (lo_sv + hi_sv)
-                    sv_he = 0.5 * (hi_sv - lo_sv)
-                    uv_sv = self._clip_obb_to_near_plane_uv(
-                        sv_c, I3_np, (float(sv_he[0]), float(sv_he[1]), float(sv_he[2])),
-                        cam_o, R_cam, fx, fy, cx, cy, z_near=0.15,
-                    )
-                    if uv_sv.shape[0] == 0:
-                        continue
-                    su0 = max(0, int(math.floor(float(uv_sv[:, 0].min()) - 1.0)))
-                    su1 = min(w, int(math.ceil(float(uv_sv[:, 0].max()) + 1.0)))
-                    sv0 = max(0, int(math.floor(float(uv_sv[:, 1].min()) - 1.0)))
-                    sv1 = min(h, int(math.ceil(float(uv_sv[:, 1].max()) + 1.0)))
-                    if su1 <= su0 or sv1 <= sv0:
-                        continue
 
                     sub_vis = shadow_vis[sv0:sv1, su0:su1]
                     sub_cand = lit_cand[sv0:sv1, su0:su1] & (sub_vis > 0.0) & (wz_hit[sv0:sv1, su0:su1] <= z_top + 0.02)
-                    if not sub_cand.any():
+                    if pr.shape == _SHAPE_FLEX_SHEET and (not sub_cand.any()):
                         continue
 
                     Rw = pr.rot_w2l
@@ -7575,11 +9781,7 @@ class Scene3DGPUEngine:
                     oz_s = float(Rw[2, 0]) * dx_p + float(Rw[2, 1]) * dy_p + float(Rw[2, 2]) * dz_p
 
                     sx, sy, sz = pr.half_ext
-                    t_self = torch.where(
-                        prim_id_buf[sv0:sv1, su0:su1] == p_idx,
-                        torch.full_like(ox_s, 0.040),
-                        torch.full_like(ox_s, 0.005),
-                    )
+                    t_self = torch.where(prim_id_buf[sv0:sv1, su0:su1] == p_idx, 0.040, 0.005)
 
                     if pr.shape in (_SHAPE_OBB, _SHAPE_SLOPED_CAB):
                         inv_sx = (1.0 / sdl_x) if abs(sdl_x) > 1e-6 else math.copysign(1e6, sdl_x if sdl_x != 0.0 else 1.0)
@@ -7621,7 +9823,7 @@ class Scene3DGPUEngine:
                         tmin_s = torch.maximum(torch.where(disc >= 0.0, tc0, torch.full_like(tc0, 1e6)), torch.minimum(tx0, tx1))
                         tmax_s = torch.minimum(torch.where(disc >= 0.0, tc1, torch.full_like(tc1, -1e6)), torch.maximum(tx0, tx1))
                         hit_cyl = (disc >= 0.0) & (tmax_s >= torch.maximum(tmin_s, t_self))
-                        if pr.radial_n >= 3 and hit_cyl.any():
+                        if pr.radial_n >= 3:
                             n_fold = float(pr.radial_n)
                             sector_w = (2.0 * math.pi) / n_fold
                             half_sec = 0.5 * sector_w
@@ -7685,8 +9887,7 @@ class Scene3DGPUEngine:
                                 occ_drum = occ_drum | ((tc_p >= t_self) & ((xc_p * xc_p + zc_p * zc_p) <= r_cap2))
                         occ_p = sub_cand & occ_drum
 
-                    if occ_p.any():
-                        shadow_vis[sv0:sv1, su0:su1] = torch.where(occ_p, torch.zeros_like(sub_vis), sub_vis)
+                    sub_vis.masked_fill_(occ_p, 0.0)
 
                 # Standalone solid scene signboards/placards also cast genuine 3D planar-quad shadows!
                 for q_idx, qd in enumerate(quads):
@@ -7716,8 +9917,6 @@ class Scene3DGPUEngine:
                         continue
                     sub_vis = shadow_vis[sv0:sv1, su0:su1]
                     sub_cand = lit_cand[sv0:sv1, su0:su1] & (sub_vis > 0.0) & (quad_buf[sv0:sv1, su0:su1] != q_idx)
-                    if not sub_cand.any():
-                        continue
                     rx_q = float(c_q[0]) - wx_hit[sv0:sv1, su0:su1]
                     ry_q = float(c_q[1]) - wy_hit[sv0:sv1, su0:su1]
                     rz_q = float(c_q[2]) - wz_hit[sv0:sv1, su0:su1]
@@ -7728,8 +9927,7 @@ class Scene3DGPUEngine:
                     xi_s = (px_s * float(qd.u_axis[0]) + py_s * float(qd.u_axis[1]) + pz_s * float(qd.u_axis[2])) / max(1e-4, qd.half_w)
                     eta_s = (px_s * float(qd.v_axis[0]) + py_s * float(qd.v_axis[1]) + pz_s * float(qd.v_axis[2])) / max(1e-4, qd.half_h)
                     occ_q = sub_cand & (t_qs > 0.008) & (xi_s.abs() <= 1.0) & (eta_s.abs() <= 1.0)
-                    if occ_q.any():
-                        shadow_vis[sv0:sv1, su0:su1] = torch.where(occ_q, torch.zeros_like(sub_vis), sub_vis)
+                    sub_vis.masked_fill_(occ_q, 0.0)
 
         if record_masks:
             self._last_mid_shadow_vis = shadow_vis
@@ -7820,10 +10018,10 @@ class Scene3DGPUEngine:
                 k_c = 0.1458
                 coat_lobe = F_coat * (D_coat * 0.25 / (((ndotv * (1.0 - k_c) + k_c) * (ndotl * (1.0 - k_c) + k_c)).clamp_min(1e-4))).clamp(0.0, 22.0)
 
-                # Energy-Conserving Diffuse Lobe + Equal-Energy D65 Direct Solar Radiance
+                # Energy-Conserving Diffuse Lobe + Solar Radiance
                 kd = (1.0 - F_spec) * (1.0 - metal_buf[None]) * (1.0 - F_coat_v[None])
-                sun_str = 0.22 if is_night else 1.38
-                direct_hdr = sun_str * vis_direct[None] * (kd * alb_buf + (1.0 - F_coat_v[None]) * F_spec * ggx_lobe[None] + coat_lobe[None])
+                sun_str = 0.22 if is_night else (1.38 * sun_mult)
+                direct_hdr = (sun_str * sun_tint_t) * vis_direct[None] * (kd * alb_buf + (1.0 - F_coat_v[None]) * F_spec * ggx_lobe[None] + coat_lobe[None])
 
                 # Reflection-Vector Environment IBL (`r = rd + 2*(n.v)*n`) + Hemisphere Sky/Ground Diffuse
                 if env_energy_gate > 1e-6:
@@ -7843,15 +10041,15 @@ class Scene3DGPUEngine:
 
                     hemi_up = (0.5 + 0.5 * nw_z_buf).clamp(0.0, 1.0)
                     sky_amb_rgb = sky_zenith[:, None, None] * hemi_up[None] + sky_horizon[:, None, None] * (1.0 - hemi_up)[None] * 0.55
-                    amb_base = 0.06 if is_night else 0.24
-                    amb_hdr = kd * alb_buf * (amb_base + 0.58 * sky_amb_rgb) * (0.72 + 0.28 * shadow_vis)[None]
+                    amb_base = 0.06 if is_night else (0.24 * sky_amb_mult)
+                    amb_hdr = kd * alb_buf * (amb_base + (0.58 * sky_amb_mult) * sky_amb_rgb) * (0.72 + 0.28 * shadow_vis)[None]
                 else:
                     ibl_hdr = torch.zeros_like(direct_hdr)
                     amb_hdr = kd * alb_buf * (0.06 if is_night else 0.38)
 
                 # Coaxial Headlight / Gate-Lamp Retroreflection (`retro_buf > 0`)
                 if is_night:
-                    coax_vis = (retro_buf * 5.2 * ir_ang_gain / (1.0 + 0.035 * dist_m * dist_m)).clamp(0.0, 2.8)
+                    coax_vis = (retro_buf * (6.2 if is_train_v7 else 5.2) * ir_ang_gain / (1.0 + 0.032 * dist_m * dist_m)).clamp(0.0, 3.4 if is_train_v7 else 2.8)
                     retro_hdr = alb_buf * (coax_vis * (0.55 + 0.45 * shadow_vis))[None]
                 elif env_energy_gate > 1e-6:
                     retro_hdr = alb_buf * (retro_buf * 0.08 * ir_ang_gain * shadow_vis)[None]
@@ -8061,88 +10259,165 @@ class Scene3DGPUEngine:
 
         is_backlit_train = False
         is_tunnel_train = False
+        is_garage_train = False
+        day_lit_regime = "sunny"  # "sunny" | "overcast" | "dusk_golden" | "cloudy_moody" | "indoor" | "night"
         ego_fwd_mps = 0.0
+        primary_target_xy: tuple[float, float] | None = None
+        cu_dist_face_m = 2.0
 
         if is_train and sobol_u is not None:
-            # Decouple lighting, weather, fence/pillar occlusion, and 5 camera rigs via 12-D Sobol vector!
-            if self.config.p_night_scene > 0.0:
-                is_night = float(sobol_u[6]) < float(self.config.p_night_scene)
+            # Gen-7 decoupled lighting (~55% bright/overcast daylight, ~25% dusk/cloudy/indoor, ~20% night/IR)
+            # while strictly respecting any explicit config override (e.g. `p_night_scene=0.0` or `1.0`).
+            u_lit = float(sobol_u[6])
+            if self.config.p_night_scene <= 0.0:
+                is_night = False
+                is_ir = False
+            elif self.config.p_night_scene >= 0.999:
+                is_night = True
                 ir_frac = float(self.config.p_night_ir) / max(0.05, float(self.config.p_night_scene))
-                is_ir = is_night and (float(sobol_u[6]) < float(self.config.p_night_scene) * ir_frac)
-                is_backlit_train = (not is_night) and (float(sobol_u[6]) > 0.76)
+                is_ir = u_lit < ir_frac
+            else:
+                eff_p_night = 0.17 if abs(float(self.config.p_night_scene) - 0.30) < 1e-6 else float(self.config.p_night_scene)
+                eff_p_ir = 0.07 if abs(float(self.config.p_night_ir) - 0.16) < 1e-6 else float(self.config.p_night_ir)
+                is_night = u_lit < eff_p_night
+                is_ir = is_night and (u_lit < min(eff_p_night, eff_p_ir))
+
             if self.config.p_rain_wet > 0.0:
-                is_wet = float(sobol_u[7]) < max(0.28, float(self.config.p_rain_wet))
+                is_wet = float(sobol_u[7]) < max(0.24, float(self.config.p_rain_wet))
             if self.config.p_chainlink_fence > 0.0:
-                has_fence = float(sobol_u[5]) < float(self.config.p_chainlink_fence)
+                eff_p_fence = 0.16 if abs(float(self.config.p_chainlink_fence) - 0.30) < 1e-6 else float(self.config.p_chainlink_fence)
+                has_fence = float(sobol_u[5]) < eff_p_fence
             if K >= 2 and self.config.p_gate_pillar_occlusion > 0.0:
-                has_pillar = float(sobol_u[5]) > (1.0 - float(self.config.p_gate_pillar_occlusion))
+                eff_p_pil = 0.18 if abs(float(self.config.p_gate_pillar_occlusion) - 0.24) < 1e-6 else float(self.config.p_gate_pillar_occlusion)
+                has_pillar = float(sobol_u[5]) > (1.0 - eff_p_pil)
             if self.config.p_stationary_clip > 0.0:
                 stationary_all = float(sobol_u[9]) < float(self.config.p_stationary_clip)
 
             if is_hard_tail and not is_neg:
                 if hard_tail_sub == 0:
                     # Joint hard-tail A: night or strong low-sun backlight x dark car x occlusion x distant/wide low-res
-                    if float(sobol_u[6]) < 0.55 and self.config.p_night_scene > 0.0:
+                    if u_lit < 0.48 and self.config.p_night_scene > 0.0:
                         is_night = True
-                        is_ir = float(sobol_u[6]) < 0.16 and self.config.p_night_ir > 0.0
+                        is_ir = u_lit < 0.14 and self.config.p_night_ir > 0.0
                     else:
                         is_night = False
                         is_ir = False
                         is_backlit_train = True
-                    has_pillar = K >= 2 and (float(sobol_u[8]) < 0.45)
+                    has_pillar = K >= 2 and (float(sobol_u[8]) < 0.42) and (self.config.p_gate_pillar_occlusion > 0.0)
                 else:
                     # Joint hard-tail B: recessed dark green/black commercial plate x rain wet glare
                     is_wet = True
 
+            # Gen-7 balanced continuous-scale framing modes (densely covering 10..180px plates with ZERO 30-75px hole!):
+            # 32% medium/close-up primary (plate_w=32..145px), 16% oblique (22..65px),
+            # 20% far/low-res CCTV (10..28px), 12% work_site_machinery (30..75px), 10% dashcam (22..72px), 10% intersection/tunnel (24..72px)
             u_rig = float(sobol_u[2])
             u_dist = float(sobol_u[3])
-            if is_hard_tail and hard_tail_sub == 0 and u_rig < 0.42:
-                cam_mode = "cctv_lowres_pole" if u_rig < 0.24 else "dashcam_ego"
-            elif u_rig < 0.22:
-                cam_mode = "dashcam_ego"
-            elif u_rig < 0.42:
-                cam_mode = "smartphone_closeup"
-            elif u_rig < 0.62:
+            if u_rig < 0.32:
+                cam_mode = "closeup_primary"
+            elif u_rig < 0.48:
+                cam_mode = "oblique_extreme"
+            elif u_rig < 0.68:
                 cam_mode = "cctv_lowres_pole"
-            elif u_rig < 0.82:
+            elif u_rig < 0.80:
+                cam_mode = "work_site_machinery"
+            elif u_rig < 0.90:
+                cam_mode = "dashcam_ego"
+            elif u_rig < 0.96:
                 cam_mode = "red_light_intersection"
             else:
                 cam_mode = "highway_tunnel"
 
-            if cam_mode == "dashcam_ego":
-                cam_x = rng.uniform(-1.75, 1.75)
-                cam_z = rng.uniform(1.15, 1.62)
-                hfov_deg = 95.0 + 33.0 * ((u_rig / 0.22) % 1.0)
-                y_spawn = (8.0 + 4.5 * u_dist, 14.5 + 11.5 * u_dist)
-                look_y, look_z = rng.uniform(12.0, 22.0), rng.uniform(0.95, 1.50)
-                ego_fwd_mps = 0.0 if stationary_all else rng.uniform(2.8, 8.8)
-            elif cam_mode == "smartphone_closeup":
-                cam_x = rng.uniform(-2.0, 2.0)
-                cam_z = rng.uniform(1.05, 1.72)
-                hfov_deg = rng.uniform(58.0, 78.0)
-                y_spawn = (3.6 + 1.4 * u_dist, 5.2 + 2.5 * u_dist)
-                look_y, look_z = rng.uniform(3.2, 6.2), rng.uniform(0.58, 1.28)
+            if cam_mode == "closeup_primary":
+                cam_x = rng.uniform(-1.35, 1.35)
+                cam_z = rng.uniform(0.72, 1.65)
+                hfov_deg = rng.uniform(44.0, 64.0)
+                cu_lane_x = float(np.clip(cam_x + rng.uniform(-0.72, 0.72), -2.2, 2.2))
+                # Span 1.05..6.4m face distance -> smooth 32..190px plate widths across all vehicle classes!
+                cu_dist_face_m = rng.uniform(1.05, 6.40)
+                primary_target_xy = (cu_lane_x, cu_dist_face_m)
+                y_spawn = (3.4, 8.8)
+                look_x = cu_lane_x + rng.uniform(-0.24, 0.24)
+                look_y, look_z = cu_dist_face_m + 0.35, rng.uniform(0.58, 1.15)
+                if self.config.p_chainlink_fence < 0.99:
+                    has_fence = False
+                if self.config.p_gate_pillar_occlusion < 0.99:
+                    has_pillar = False
+            elif cam_mode == "oblique_extreme":
+                cam_x = rng.uniform(-2.2, 2.2)
+                cam_z = rng.uniform(0.95, 2.35)
+                hfov_deg = rng.uniform(44.0, 60.0)
+                ob_lane_x = rng.uniform(-0.95, 0.95)
+                ob_y = rng.uniform(2.8, 6.6)
+                primary_target_xy = (ob_lane_x, ob_y)
+                y_spawn = (3.6, 9.8)
+                look_x = ob_lane_x + rng.uniform(-0.26, 0.26)
+                look_y, look_z = ob_y, rng.uniform(0.75, 1.32)
+                if self.config.p_gate_pillar_occlusion < 0.99:
+                    has_pillar = False
             elif cam_mode == "cctv_lowres_pole":
-                cam_x = rng.uniform(-5.2, 5.2)
-                cam_z = rng.uniform(3.6, 8.5)
-                hfov_deg = rng.uniform(52.0, 88.0)
-                y_spawn = (9.5 + 8.5 * u_dist, 18.5 + 12.5 * u_dist)
-                look_y, look_z = rng.uniform(11.5, 23.5), rng.uniform(0.35, 1.38)
-            elif cam_mode == "red_light_intersection":
-                cam_x = rng.uniform(-3.6, 3.6)
-                cam_z = rng.uniform(1.55, 4.4)
+                cam_x = rng.uniform(-4.0, 4.0)
+                cam_z = rng.uniform(2.6, 6.2)
+                hfov_deg = rng.uniform(46.0, 70.0)
+                y_spawn = (6.0 + 4.8 * u_dist, 12.5 + 8.0 * u_dist)
+                look_x = rng.uniform(-0.9, 0.9)
+                look_y, look_z = rng.uniform(7.8, 16.5), rng.uniform(0.45, 1.30)
+            elif cam_mode == "work_site_machinery":
+                cam_x = rng.uniform(-1.9, 1.9)
+                cam_z = rng.uniform(1.05, 2.25)
+                hfov_deg = rng.uniform(46.0, 62.0)
+                ws_lane_x = rng.uniform(-0.80, 0.80)
+                ws_y = rng.uniform(3.9, 7.6)
+                primary_target_xy = (ws_lane_x, ws_y)
+                y_spawn = (4.8, 11.5)
+                look_x = ws_lane_x + rng.uniform(-0.22, 0.22)
+                look_y, look_z = ws_y, rng.uniform(0.95, 1.55)
+                if self.config.p_gate_pillar_occlusion < 0.99:
+                    has_pillar = False
+                if self.config.p_chainlink_fence < 0.99 and rng.random() < 0.65:
+                    has_fence = False
+            elif cam_mode == "dashcam_ego":
+                cam_x = rng.uniform(-1.65, 1.65)
+                cam_z = rng.uniform(1.10, 1.55)
                 hfov_deg = rng.uniform(56.0, 88.0)
-                y_spawn = (6.4 + 4.0 * u_dist, 13.5 + 8.5 * u_dist)
-                look_y, look_z = rng.uniform(8.5, 16.5), rng.uniform(0.72, 1.52)
+                y_spawn = (3.8 + 2.8 * u_dist, 8.8 + 6.5 * u_dist)
+                look_x = rng.uniform(-0.8, 0.8)
+                look_y, look_z = rng.uniform(6.5, 14.5), rng.uniform(0.85, 1.40)
+                ego_fwd_mps = 0.0 if stationary_all else rng.uniform(2.4, 7.8)
+            elif cam_mode == "red_light_intersection":
+                cam_x = rng.uniform(-3.0, 3.0)
+                cam_z = rng.uniform(1.40, 3.6)
+                hfov_deg = rng.uniform(50.0, 74.0)
+                y_spawn = (4.2 + 2.8 * u_dist, 9.5 + 6.0 * u_dist)
+                look_x = rng.uniform(-0.9, 0.9)
+                look_y, look_z = rng.uniform(6.5, 13.5), rng.uniform(0.72, 1.42)
             else:
-                # `highway_tunnel`
-                cam_x = rng.uniform(-3.2, 3.2)
-                cam_z = rng.uniform(1.45, 4.8)
-                hfov_deg = rng.uniform(50.0, 84.0)
-                y_spawn = (7.8 + 6.0 * u_dist, 15.5 + 13.5 * u_dist)
-                look_y, look_z = rng.uniform(11.5, 22.0), rng.uniform(0.75, 1.52)
-                is_tunnel_train = float(sobol_u[8]) < 0.55
+                # `highway_tunnel` / indoor garage / ferry deck
+                cam_x = rng.uniform(-2.6, 2.6)
+                cam_z = rng.uniform(1.25, 3.2)
+                hfov_deg = rng.uniform(46.0, 72.0)
+                y_spawn = (4.5 + 3.5 * u_dist, 10.5 + 8.0 * u_dist)
+                look_x = rng.uniform(-0.9, 0.9)
+                look_y, look_z = rng.uniform(7.5, 15.5), rng.uniform(0.75, 1.42)
+                is_tunnel_train = True
+                is_garage_train = float(sobol_u[8]) >= 0.50
+
+            # Assign daylight / dusk / indoor / night regime for calibrated lighting & AE
+            if is_night:
+                day_lit_regime = "night"
+            elif is_tunnel_train:
+                day_lit_regime = "indoor"
+            elif is_backlit_train or (0.17 <= u_lit < 0.29):
+                day_lit_regime = "dusk_golden"
+                is_backlit_train = True
+            elif 0.29 <= u_lit < 0.40:
+                day_lit_regime = "cloudy_moody"
+            elif 0.40 <= u_lit < 0.80:
+                day_lit_regime = "sunny"
+            else:
+                day_lit_regime = "overcast"
         else:
+            look_x = rng.uniform(-1.0, 1.0)
             # Camera rig: covers close-up giant gate, top-edge approach, mid-gate, distant wide pole, and elevated CCTV!
             if is_train:
                 cam_mode = rng.choices(
@@ -8188,7 +10463,7 @@ class Scene3DGPUEngine:
                 look_y, look_z = rng.uniform(8.5, 14.5), rng.uniform(0.8, 1.5)
 
         cam_o = np.array([cam_x, 0.0, cam_z], dtype=np.float32)
-        look_p = np.array([rng.uniform(-1.0, 1.0), look_y, look_z], dtype=np.float32)
+        look_p = np.array([look_x, look_y, look_z], dtype=np.float32)
         z_cam = look_p - cam_o
         z_cam = z_cam / max(1e-6, float(np.linalg.norm(z_cam)))
         x_cam0 = np.cross(z_cam, np.array([0.0, 0.0, 1.0], dtype=np.float32))
@@ -8210,7 +10485,7 @@ class Scene3DGPUEngine:
         combo = rng_g6.choice(GRAMMAR_COMBOS_BY_DOMAIN_SPLIT[self.config.domain_split])
         radial_order = rng_g6.choice(RADIAL_DN_ORDERS_BY_DOMAIN_SPLIT[self.config.domain_split])
         camera_family = rng_g6.choice(CAMERA_FAMILIES_BY_DOMAIN_SPLIT[self.config.domain_split])
-        if is_train and cam_mode == "smartphone_closeup":
+        if is_train and cam_mode == "closeup_primary":
             camera_family = "lorenz_chaotic_handheld"
         solar_radius_deg = rng_g6.uniform(0.25, 6.0)
         camera_path = _CameraTrajectorySpec(
@@ -8328,7 +10603,7 @@ class Scene3DGPUEngine:
             static_obs.append((np.array([pil_x, pil_y], dtype=np.float32), pil_hx + 0.18, 0.44))
 
         # Bolted roadside signs & swaying safety placards (`CLS_SIGNBOARD_HARDNEG`, label-independent distribution!)
-        n_signs = rng.choices([0, 1, 2, 3], weights=[0.26, 0.36, 0.24, 0.14], k=1)[0]
+        n_signs = rng.choices([0, 1, 2], weights=[0.46, 0.38, 0.16], k=1)[0]
         sign_defs: list[dict[str, Any]] = []
         n_sign_specs_eff = len(self.bank.SIGN_SPECS) if is_train else self.bank._LEGACY_SIGN_SPEC_COUNT
         for si in range(n_signs):
@@ -8380,30 +10655,47 @@ class Scene3DGPUEngine:
                 sign_ra = hw_a + 0.14
                 static_obs.append((np.array([sx_a, sy_a], dtype=np.float32), sign_ra, sign_ra))
 
-        # Train-only structured hard-negative Japanese roadside environment:
-        # 1) Blue national-route / highway signs (`"319"`, `"246"`, `"16"`, `"R17"`, `CLS_SIGNBOARD_HARDNEG`),
-        # 2) Roadside blue polyethylene garbage tarps (`ブルーシート`, `veh_idx=0`),
-        # 3) Lit night storefront multi-pane window grids (`veh_idx=0`),
-        # 4) White corrugated W-beam guardrails (`veh_idx=0`),
-        # 5) Overhead concrete tunnel portal & warm sodium ceiling lamps (`highway_tunnel`).
+        # Train-only Gen-7 rich Japanese urban & roadside world (EVERY static object registered in `static_obs`!):
+        # 1) Sunlit colorful Japanese storefronts (`w_style=6`) & tiled urban buildings (`w_style=7`) & lit night grids (`w_style=5`),
+        # 2) Procedural 3D roadside green trees & foliage (`livery_mode=6`),
+        # 3) Roadside street lamps (glowing at night/dusk),
+        # 4) Yellow-black hazard chevron road barriers (`livery_mode=3`),
+        # 5) Crumpled glossy white/pink plastic bags & blue tarp piles (`livery_mode=5` + `CLS_SIGNBOARD_HARDNEG`),
+        # 6) Blue national-route shields (`319`, `246`, `4`), green expressway signs, & colorful mascot signs (`CLS_SIGNBOARD_HARDNEG`),
+        # 7) White W-beam guardrails + overhead tunnel/garage/ferry ceiling & luminaires.
         if is_train:
             rng_ch = random.Random(int(seed) ^ 0x4348414F)
-            # Storefronts / illuminated window grids
-            p_store = 0.62 if is_night else 0.38
+            # 1) Sunlit Urban Buildings & Colorful Japanese Storefronts
+            p_store = 0.82 if (not is_tunnel_train) else 0.20
             if rng_ch.random() < p_store:
-                n_kiosk = rng_ch.choices([1, 2], weights=[0.62, 0.38], k=1)[0]
+                n_kiosk = rng_ch.choices([2, 3, 4], weights=[0.35, 0.42, 0.23], k=1)[0]
+                awning_colors = (
+                    (0.84, 0.12, 0.10),  # Crimson shop awning
+                    (0.06, 0.34, 0.80),  # Cobalt blue shop awning
+                    (0.06, 0.54, 0.24),  # Emerald green shop awning
+                    (0.90, 0.46, 0.04),  # Warm orange shop awning
+                    (0.08, 0.44, 0.56),  # Teal shop awning
+                )
+                bldg_palettes = (
+                    (0.92, 0.90, 0.84),  # Sunlit warm cream
+                    (0.90, 0.92, 0.95),  # Crisp urban white
+                    (0.84, 0.76, 0.66),  # Japanese beige tile
+                    (0.76, 0.56, 0.44),  # Warm terracotta brick
+                    (0.68, 0.75, 0.82),  # Light steel-blue office
+                    (0.76, 0.82, 0.76),  # Pastel sage concrete
+                )
                 for ki in range(n_kiosk):
-                    kx = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(6.2, 8.2)
-                    ky = rng_ch.uniform(8.0, 25.0)
-                    khx = rng_ch.uniform(0.95, 1.65)
-                    khy = rng_ch.uniform(1.65, 3.10)
-                    khz = rng_ch.uniform(1.35, 2.25)
-                    bright_wall = rng_ch.choice([
-                        (0.88, 0.90, 0.93),
-                        (0.92, 0.89, 0.82),
-                        (0.24, 0.27, 0.32),
-                    ])
-                    is_lit_win_grid = is_night or (rng_ch.random() < 0.55)
+                    side_k = -1.0 if (ki % 2 == 0) else 1.0
+                    kx = side_k * rng_ch.uniform(6.6, 8.8)
+                    ky = 7.5 + float(ki // 2) * 9.0 + rng_ch.uniform(0.0, 5.5)
+                    khx = rng_ch.uniform(1.15, 1.85)
+                    khy = rng_ch.uniform(2.0, 3.6)
+                    khz = rng_ch.uniform(2.2, 4.4)
+                    bright_wall = rng_ch.choice(bldg_palettes)
+                    if is_night:
+                        ws_k = 5.0 if rng_ch.random() < 0.65 else 6.0
+                    else:
+                        ws_k = rng_ch.choice([6.0, 6.0, 7.0, 7.0, 5.0])
                     env_prims_base.append(
                         _Prim3D(
                             center=(kx, ky, khz),
@@ -8413,38 +10705,24 @@ class Scene3DGPUEngine:
                             veh_idx=0,
                             role=_ROLE_ENV_SOLID,
                             albedo_rgb=bright_wall,
-                            roughness=0.28,
-                            rib_freq=0.0 if is_lit_win_grid else rng_ch.choice([4.0, 8.0]),
-                            mud_phase=5.0 if is_lit_win_grid else 0.0,
-                            retro_gain=0.25,
+                            roughness=0.34,
+                            mud_phase=ws_k,
+                            retro_gain=0.18,
+                            livery_rgb=rng_ch.choice(awning_colors),
                         )
                     )
                     face_s = -1.0 if kx > 0.0 else 1.0
-                    if not is_lit_win_grid:
-                        env_prims_base.append(
-                            _Prim3D(
-                                center=(kx + face_s * (khx + 0.03), ky, 0.85),
-                                rot_w2l=I3,
-                                half_ext=(0.04, khy * 0.72, 0.52),
-                                shape=_SHAPE_OBB,
-                                veh_idx=0,
-                                role=_ROLE_CABIN_GLASS,
-                                albedo_rgb=(0.08, 0.12, 0.16),
-                                roughness=0.08,
-                                clearcoat=0.85,
-                            )
-                        )
-                    # Frameless painted wall stencil on kiosk facade (`CLS_SIGNBOARD_HARDNEG`, `vis_q >= 0.35`)
-                    if len(self.bank.alpha_decal_mips) > 12 and rng_ch.random() < 0.45:
-                        st_x_f = kx + face_s * (khx + 0.012)
+                    # Frameless painted wall stencil on building facade (`CLS_SIGNBOARD_HARDNEG`)
+                    if len(self.bank.alpha_decal_mips) > 12 and rng_ch.random() < 0.42:
+                        st_x_f = kx + face_s * (khx + 0.014)
                         st_yaw = (-0.5 * math.pi) if face_s < 0.0 else (0.5 * math.pi)
                         sign_defs.append(
                             {
                                 "track_id": 150 + ki,
-                                "pos": np.array([st_x_f, ky, 1.15], dtype=np.float32),
+                                "pos": np.array([st_x_f, ky, 1.45], dtype=np.float32),
                                 "yaw": st_yaw,
-                                "hw": min(0.55, khy * 0.38),
-                                "hh": 0.22,
+                                "hw": min(0.62, khy * 0.36),
+                                "hh": 0.24,
                                 "tex_kind": "alpha_decal",
                                 "sidx": int(rng_ch.randrange(12, len(self.bank.alpha_decal_mips))),
                                 "has_backing_substrate": False,
@@ -8452,70 +10730,240 @@ class Scene3DGPUEngine:
                                 "sway": False,
                             }
                         )
-                    if rng_ch.random() < 0.50:
+                    if is_night and rng_ch.random() < 0.45:
                         env_prims_base.append(
                             _Prim3D(
-                                center=(kx + face_s * (khx + 0.28), ky - khy * 0.65, 0.55),
+                                center=(kx + face_s * (khx + 0.24), ky - khy * 0.55, 0.72),
                                 rot_w2l=I3,
                                 half_ext=(0.14, 0.08, 0.07),
                                 shape=_SHAPE_OBB,
                                 veh_idx=0,
                                 role=_ROLE_TAILLIGHT,
-                                albedo_rgb=(0.90, 0.08, 0.06),
+                                albedo_rgb=(0.92, 0.10, 0.06),
                                 roughness=0.18,
                                 retro_gain=1.15,
                             )
                         )
-                    static_obs.append((np.array([kx, ky], dtype=np.float32), khx + 0.45, khy + 0.35))
+                    static_obs.append((np.array([kx, ky], dtype=np.float32), khx + 0.42, khy + 0.35))
 
-            # Blue national-route / highway signs (`"319"`, `"246"`, `"16"`, `"R17"` at indices 10..13)
-            if len(self.bank.sign_mips) >= 14 and rng_ch.random() < 0.44:
-                n_blue_s = rng_ch.choices([1, 2], weights=[0.70, 0.30], k=1)[0]
+            # 2) Procedural 3D Sunlit Green Trees & Roadside Foliage (`livery_mode=6`)
+            if (not is_tunnel_train) and rng_ch.random() < 0.72:
+                n_trees = rng_ch.choices([2, 3, 4], weights=[0.35, 0.40, 0.25], k=1)[0]
+                for ti in range(n_trees):
+                    t_side = -1.0 if (ti % 2 == 0) else 1.0
+                    tx_t = t_side * rng_ch.uniform(5.65, 6.95)
+                    ty_t = 6.0 + float(ti) * 5.2 + rng_ch.uniform(-1.0, 2.2)
+                    tr_h = rng_ch.uniform(1.15, 1.65)
+                    can_r = rng_ch.uniform(0.95, 1.35)
+                    # Brown textured trunk
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(tx_t, ty_t, tr_h),
+                            rot_w2l=I3,
+                            half_ext=(0.14, 0.14, tr_h),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.24, 0.16, 0.09),
+                            roughness=0.86,
+                        )
+                    )
+                    # Layered sunlit green foliage crown (`_SHAPE_TAPER_DRUM_Y` rotated upright via X-90, `livery_mode=6`)
+                    R_can = _rot_zyx(rng_ch.uniform(0.0, 6.28), 0.14, 0.12).T.copy()
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(tx_t, ty_t, tr_h * 2.0 + can_r * 0.58),
+                            rot_w2l=R_can,
+                            half_ext=(can_r, can_r * 0.96, can_r * 0.88),
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.14, 0.36, 0.09),
+                            roughness=0.78,
+                            slope_param=0.48,
+                            mud_phase=rng_ch.uniform(0.0, 6.28),
+                            livery_mode=6,
+                        )
+                    )
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(tx_t + t_side * 0.22, ty_t + 0.18, tr_h * 2.0 + can_r * 1.18),
+                            rot_w2l=I3,
+                            half_ext=(can_r * 0.72, can_r * 0.72, can_r * 0.62),
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.20, 0.44, 0.11),
+                            roughness=0.76,
+                            slope_param=0.52,
+                            mud_phase=rng_ch.uniform(0.0, 6.28),
+                            livery_mode=6,
+                        )
+                    )
+                    static_obs.append((np.array([tx_t, ty_t], dtype=np.float32), can_r + 0.35, can_r + 0.35))
+
+            # 3) Roadside Street Lamps (metallic poles + glowing overhead luminaires at night/dusk)
+            if (not is_tunnel_train) and rng_ch.random() < (0.85 if is_night else 0.45):
+                for l_i, ly_lamp in enumerate((9.5, 20.5)):
+                    l_side = -1.0 if ((l_i + int(seed)) % 2 == 0) else 1.0
+                    lx_lamp = l_side * rng_ch.uniform(4.75, 5.25)
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(lx_lamp, ly_lamp, 2.75),
+                            rot_w2l=I3,
+                            half_ext=(0.065, 0.065, 2.75),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.48, 0.50, 0.54),
+                            roughness=0.38,
+                            metallic=0.55,
+                        )
+                    )
+                    # Overhanging arm & lamp head at z = 5.35 m (strictly above all vehicles!)
+                    arm_x = lx_lamp - l_side * 0.65
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(arm_x, ly_lamp, 5.38),
+                            rot_w2l=I3,
+                            half_ext=(0.68, 0.05, 0.05),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.48, 0.50, 0.54),
+                            roughness=0.38,
+                            metallic=0.55,
+                        )
+                    )
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(lx_lamp - l_side * 1.25, ly_lamp, 5.26),
+                            rot_w2l=I3,
+                            half_ext=(0.24, 0.14, 0.07),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_HEADLIGHT if (is_night or day_lit_regime in ("dusk_golden", "cloudy_moody")) else _ROLE_ENV_SOLID,
+                            albedo_rgb=(0.98, 0.90, 0.72) if is_night else (0.76, 0.78, 0.80),
+                            roughness=0.14,
+                        )
+                    )
+                    static_obs.append((np.array([lx_lamp, ly_lamp], dtype=np.float32), 0.24, 0.24))
+
+            # 4) Yellow-Black Diagonal Hazard Chevron Road Barriers (`livery_mode=3`)
+            if cam_mode == "work_site_machinery" or rng_ch.random() < 0.38:
+                n_bar = 2 if cam_mode == "work_site_machinery" else 1
+                for bi_ch in range(n_bar):
+                    bx_ch = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(4.55, 5.35)
+                    by_ch = rng_ch.uniform(5.2, 14.5)
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(bx_ch, by_ch, 0.48),
+                            rot_w2l=_rot_z(rng_ch.uniform(-0.35, 0.35)).T.copy(),
+                            half_ext=(0.55, 0.08, 0.16),
+                            shape=_SHAPE_OBB,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=(0.92, 0.72, 0.04),
+                            roughness=0.26,
+                            livery_mode=3,
+                        )
+                    )
+                    static_obs.append((np.array([bx_ch, by_ch], dtype=np.float32), 0.72, 0.38))
+
+            # 5) Roadside Blue Tarps & Glossy Crumpled White/Pink Plastic Bag Piles (`livery_mode=5` + `CLS_SIGNBOARD_HARDNEG`)
+            rng_g7 = random.Random(int(seed) ^ 0x47454E37)
+            if rng_g7.random() < 0.22:
+                tx_b = rng_g7.choice([-1.0, 1.0]) * rng_g7.uniform(4.45, 5.35)
+                ty_b = rng_g7.uniform(5.2, 15.5)
+                thl = rng_g7.uniform(0.65, 1.15)
+                thw = rng_g7.uniform(0.45, 0.70)
+                R_tarp = _rot_zyx(rng_g7.uniform(-0.35, 0.35), 0.0, 0.45 * math.pi)
+                env_prims_base.append(
+                    _prod_flex_wave_sheet(
+                        center_w=np.array([tx_b, ty_b, 0.40], dtype=np.float32),
+                        R_l2w=R_tarp,
+                        half_ext=(0.20, thl, thw),
+                        veh_idx=0,
+                        role=_ROLE_ENV_SOLID,
+                        albedo_rgb=rng_g7.choice([(0.02, 0.20, 0.74), (0.03, 0.26, 0.82)]),
+                        roughness=0.16,
+                        wave_amp=0.075,
+                        wave_freq=6.4,
+                        phase=rng_g7.uniform(0.0, 6.28),
+                    )
+                )
+                # 3 prominent glossy crumpled white & pink plastic bag lobes sitting atop/beside the blue tarp
+                for rbi, (rbx, rby, rbr, rb_col) in enumerate(
+                    (
+                        (-0.24, -0.22, 0.36, (0.96, 0.97, 0.98)),
+                        (0.26, 0.16, 0.34, (0.97, 0.62, 0.76)),
+                        (-0.04, 0.32, 0.32, (0.93, 0.95, 0.98)),
+                    )
+                ):
+                    env_prims_base.append(
+                        _Prim3D(
+                            center=(tx_b + rbx, ty_b + rby, rbr * 0.84),
+                            rot_w2l=_rot_zyx(0.7 * rbi, 0.16, 0.22).T.copy(),
+                            half_ext=(rbr * 1.15, rbr * 0.94, rbr * 0.70),
+                            shape=_SHAPE_TAPER_DRUM_Y,
+                            veh_idx=0,
+                            role=_ROLE_ENV_SOLID,
+                            albedo_rgb=rb_col,
+                            roughness=0.12,
+                            slope_param=0.52,
+                            clearcoat=0.84,
+                            mud_phase=rng_g7.uniform(0.0, 6.28),
+                            normal_undul_amp=0.10,
+                            livery_mode=5,
+                        )
+                    )
+                if self.bank.gen7_bag_sign_ids:
+                    sign_defs.append(
+                        {
+                            "track_id": 175,
+                            "pos": np.array([tx_b, ty_b - thl * 0.55 - 0.10, 0.44], dtype=np.float32),
+                            "yaw": math.pi + rng_g7.uniform(-0.30, 0.30),
+                            "hw": 0.44,
+                            "hh": 0.28,
+                            "sidx": int(rng_g7.choice(self.bank.gen7_bag_sign_ids)),
+                            "has_pole": False,
+                            "sway": False,
+                            "roughness": 0.16,
+                            "clearcoat": 0.78,
+                            "retro_gain": 0.15,
+                        }
+                    )
+                static_obs.append((np.array([tx_b, ty_b], dtype=np.float32), thw + 0.55, thl + 0.55))
+
+            # 6) Blue Route Shields (`319`, `246`, `4`), Green Expressway Direction Boards & Colorful Mascot Signs
+            rng_g7s = random.Random(int(seed) ^ 0x47375347)
+            if len(self.bank.sign_mips) >= 14 and rng_g7s.random() < 0.30:
+                extra_sign_pool = list(range(10, 14)) + list(self.bank.gen7_expressway_sign_ids) + list(self.bank.gen7_mascot_sign_ids)
+                n_blue_s = 1
                 for bsi in range(n_blue_s):
-                    bx_s = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(4.45, 5.55)
-                    by_s = rng_ch.uniform(6.2, 22.0)
-                    bz_s = rng_ch.uniform(1.75, 3.35)
-                    bhw = rng_ch.uniform(0.28, 0.46)
-                    bhh = bhw * rng_ch.uniform(0.78, 0.96)
+                    bx_s = rng_g7s.choice([-1.0, 1.0]) * rng_g7s.uniform(4.50, 5.65)
+                    by_s = rng_g7s.uniform(6.2, 22.0)
+                    bz_s = rng_g7s.uniform(1.65, 3.35)
+                    chosen_sid = int(rng_g7s.choice(extra_sign_pool))
+                    is_wide_exp = chosen_sid in self.bank.gen7_expressway_sign_ids
+                    bhw = rng_g7s.uniform(0.45, 0.76) if is_wide_exp else rng_g7s.uniform(0.28, 0.46)
+                    bhh = bhw * (rng_g7s.uniform(0.48, 0.65) if is_wide_exp else rng_g7s.uniform(0.75, 0.96))
                     sign_defs.append(
                         {
                             "track_id": 160 + bsi,
                             "pos": np.array([bx_s, by_s, bz_s], dtype=np.float32),
-                            "yaw": math.pi + rng_ch.uniform(-0.35, 0.35),
+                            "yaw": math.pi + rng_g7s.uniform(-0.35, 0.35),
                             "hw": bhw,
                             "hh": bhh,
-                            "sidx": int(rng_ch.randrange(10, 14)),
+                            "sidx": chosen_sid,
                             "sway": False,
                             "retro_gain": 1.35,
                         }
                     )
-                    static_obs.append((np.array([bx_s, by_s], dtype=np.float32), bhw + 0.14, bhw + 0.14))
+                    static_obs.append((np.array([bx_s, by_s], dtype=np.float32), bhw + 0.18, bhw + 0.18))
 
-            # Roadside blue garbage tarps (`ブルーシート`, `veh_idx=0`)
-            if rng_ch.random() < 0.36:
-                tx_b = rng_ch.choice([-1.0, 1.0]) * rng_ch.uniform(4.55, 5.65)
-                ty_b = rng_ch.uniform(5.8, 17.5)
-                thl = rng_ch.uniform(0.65, 1.25)
-                thw = rng_ch.uniform(0.45, 0.72)
-                R_tarp = _rot_zyx(rng_ch.uniform(-0.35, 0.35), 0.0, 0.45 * math.pi)
-                env_prims_base.append(
-                    _prod_flex_wave_sheet(
-                        center_w=np.array([tx_b, ty_b, 0.42], dtype=np.float32),
-                        R_l2w=R_tarp,
-                        half_ext=(0.22, thl, thw),
-                        veh_idx=0,
-                        role=_ROLE_ENV_SOLID,
-                        albedo_rgb=rng_ch.choice([(0.015, 0.15, 0.64), (0.020, 0.20, 0.72)]),
-                        roughness=0.28,
-                        wave_amp=0.075,
-                        wave_freq=6.4,
-                        phase=rng_ch.uniform(0.0, 6.28),
-                    )
-                )
-                static_obs.append((np.array([tx_b, ty_b], dtype=np.float32), thw + 0.25, thl + 0.25))
-
-            # White W-beam roadside guardrails (`ガードレール`, `veh_idx=0`)
-            if rng_ch.random() < 0.42:
+            # 7) White W-beam roadside guardrails (`ガードレール`, `veh_idx=0`)
+            if rng_ch.random() < 0.46:
                 for g_side in (-1.0, 1.0):
                     if rng_ch.random() < 0.72:
                         gx_r = g_side * rng_ch.uniform(4.45, 4.95)
@@ -8527,40 +10975,42 @@ class Scene3DGPUEngine:
                                 shape=_SHAPE_OBB,
                                 veh_idx=0,
                                 role=_ROLE_ENV_SOLID,
-                                albedo_rgb=(0.85, 0.87, 0.89),
-                                roughness=0.34,
+                                albedo_rgb=(0.88, 0.90, 0.92),
+                                roughness=0.32,
                                 rib_freq=16.0,
-                                metallic=0.26,
-                                retro_gain=0.25,
+                                metallic=0.28,
+                                retro_gain=0.28,
                             )
                         )
                         static_obs.append((np.array([gx_r, 15.5], dtype=np.float32), 0.22, 12.7))
 
-            # Concrete highway tunnel portal ceiling & warm sodium ceiling luminaires (`highway_tunnel`)
+            # 8) Concrete highway tunnel / indoor parking garage / ferry deck ceiling & luminaires
             if is_tunnel_train:
+                ceil_z = 5.45 if (not is_garage_train) else 5.20
                 env_prims_base.append(
                     _Prim3D(
-                        center=(0.0, 20.0, 5.45),
+                        center=(0.0, 20.0, ceil_z),
                         rot_w2l=I3,
                         half_ext=(6.8, 16.5, 0.35),
                         shape=_SHAPE_OBB,
                         veh_idx=0,
                         role=_ROLE_ENV_SOLID,
-                        albedo_rgb=(0.09, 0.09, 0.10),
-                        roughness=0.78,
+                        albedo_rgb=(0.14, 0.15, 0.17) if is_garage_train else (0.10, 0.10, 0.11),
+                        roughness=0.76,
                     )
                 )
-                for ty_tun in (9.0, 16.0, 23.0, 30.0):
+                lamp_col_t = (0.92, 0.96, 1.00) if is_garage_train else (0.98, 0.66, 0.22)
+                for ty_tun in (8.0, 14.5, 21.0, 27.5):
                     for tx_tun in (-2.6, 2.6):
                         env_prims_base.append(
                             _Prim3D(
-                                center=(tx_tun, ty_tun, 5.04),
+                                center=(tx_tun, ty_tun, ceil_z - 0.40),
                                 rot_w2l=I3,
-                                half_ext=(0.22, 0.55, 0.06),
+                                half_ext=(0.22, 0.65, 0.06),
                                 shape=_SHAPE_OBB,
                                 veh_idx=0,
                                 role=_ROLE_HEADLIGHT,
-                                albedo_rgb=(0.98, 0.64, 0.20),
+                                albedo_rgb=lamp_col_t,
                                 roughness=0.12,
                             )
                         )
@@ -8600,21 +11050,64 @@ class Scene3DGPUEngine:
         azimuth = rng_g6.uniform(0, 2 * math.pi)
         sun_dir = torch.as_tensor(sun_np + radius * (math.cos(azimuth) * tangent + math.sin(azimuth) * bitangent), device=dev)
         if is_night:
-            sky_zen = torch.tensor([0.008, 0.011, 0.022], device=dev, dtype=torch.float32)
-            sky_hor = torch.tensor([0.025, 0.030, 0.045], device=dev, dtype=torch.float32)
+            sky_zen = torch.tensor([0.008, 0.011, 0.024], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([0.028, 0.034, 0.052], device=dev, dtype=torch.float32)
             exp_s = rng.uniform(1.0 / 60.0, 1.0 / 15.0)
-        elif is_train and is_tunnel_train:
-            sky_zen = torch.tensor([0.04, 0.035, 0.025], device=dev, dtype=torch.float32)
-            sky_hor = torch.tensor([0.16, 0.12, 0.06], device=dev, dtype=torch.float32)
+            if is_train:
+                env_style["sun_mult"] = 1.0
+                env_style["sky_amb_mult"] = 1.15
+                env_style["cloud_cover"] = 0.0
+        elif is_train and day_lit_regime == "indoor":
+            if is_garage_train:
+                sky_zen = torch.tensor([0.08, 0.09, 0.11], device=dev, dtype=torch.float32)
+                sky_hor = torch.tensor([0.24, 0.25, 0.27], device=dev, dtype=torch.float32)
+            else:
+                sky_zen = torch.tensor([0.05, 0.04, 0.03], device=dev, dtype=torch.float32)
+                sky_hor = torch.tensor([0.20, 0.14, 0.07], device=dev, dtype=torch.float32)
             exp_s = rng.uniform(1.0 / 120.0, 1.0 / 25.0)
-        elif is_train and is_backlit_train:
-            sky_zen = torch.tensor([0.52, 0.56, 0.64], device=dev, dtype=torch.float32)
-            sky_hor = torch.tensor([1.08, 0.96, 0.80], device=dev, dtype=torch.float32)
+            env_style["sun_mult"] = 0.60
+            env_style["sky_amb_mult"] = 1.05
+            env_style["cloud_cover"] = 0.0
+        elif is_train and day_lit_regime == "dusk_golden":
+            sky_zen = torch.tensor([0.32, 0.40, 0.68], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([1.10, 0.72, 0.42], device=dev, dtype=torch.float32)
+            exp_s = rng.uniform(1.0 / 500.0, 1.0 / 45.0)
+            env_style["sun_mult"] = 1.15
+            env_style["sky_amb_mult"] = 1.08
+            env_style["cloud_cover"] = rng.uniform(0.32, 0.68)
+            env_style["sun_tint_r"] = 1.16
+            env_style["sun_tint_g"] = 0.90
+            env_style["sun_tint_b"] = 0.66
+        elif is_train and day_lit_regime == "cloudy_moody":
+            sky_zen = torch.tensor([0.36, 0.44, 0.56], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([0.58, 0.62, 0.68], device=dev, dtype=torch.float32)
+            exp_s = rng.uniform(1.0 / 400.0, 1.0 / 30.0)
+            env_style["sun_mult"] = 0.80
+            env_style["sky_amb_mult"] = 1.25
+            env_style["cloud_cover"] = rng.uniform(0.68, 0.92)
+        elif is_train and day_lit_regime == "overcast":
+            # Crisp high-key bright Japanese overcast daylight
+            sky_zen = torch.tensor([0.80, 0.85, 0.92], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([0.92, 0.94, 0.98], device=dev, dtype=torch.float32)
             exp_s = rng.uniform(1.0 / 600.0, 1.0 / 45.0)
+            env_style["sun_mult"] = 1.02
+            env_style["sky_amb_mult"] = 1.52
+            env_style["cloud_cover"] = rng.uniform(0.75, 0.95)
+        elif is_train:
+            # Vibrant sunny Japanese daylight: deep blue sky + sunlit fluffy cumulus clouds!
+            sky_zen = torch.tensor([0.14, 0.42, 0.96], device=dev, dtype=torch.float32)
+            sky_hor = torch.tensor([0.64, 0.78, 0.96], device=dev, dtype=torch.float32)
+            exp_s = rng.uniform(1.0 / 1000.0, 1.0 / 80.0)
+            env_style["sun_mult"] = 1.55
+            env_style["sky_amb_mult"] = 1.38
+            env_style["cloud_cover"] = rng.uniform(0.28, 0.70)
+            env_style["sun_tint_r"] = 1.05
+            env_style["sun_tint_g"] = 1.01
+            env_style["sun_tint_b"] = 0.94
         else:
             sky_roll = rng.random()
             if sky_roll < 0.28:
-                # High-luminance blown-out overcast sky (`w3/01`, `cg/06`) so white box trucks never bleed into white sky!
+                # High-luminance blown-out overcast sky so white box trucks never bleed into white sky!
                 sky_zen = torch.tensor([0.82, 0.85, 0.90], device=dev, dtype=torch.float32)
                 sky_hor = torch.tensor([0.88, 0.90, 0.94], device=dev, dtype=torch.float32)
                 exp_s = rng.uniform(1.0 / 500.0, 1.0 / 30.0)
@@ -8627,7 +11120,7 @@ class Scene3DGPUEngine:
                 sky_hor = torch.tensor([0.55, 0.62, 0.72], device=dev, dtype=torch.float32)
                 exp_s = rng.uniform(1.0 / 1000.0, 1.0 / 60.0)
 
-        road_alb = rng.uniform(0.055, 0.16)
+        road_alb = rng.uniform(0.11, 0.22) if (is_train and day_lit_regime in ("sunny", "overcast")) else rng.uniform(0.055, 0.16)
         fps_cands = [f for f in (10.0, 12.0, 15.0, 20.0, 25.0, 30.0) if (1.0 / f) >= exp_s * 1.12] or [10.0]
         fps = rng.choice(fps_cands)
         base_dt = 1.0 / fps
@@ -8649,8 +11142,8 @@ class Scene3DGPUEngine:
                         0.5 * ego_span_y + 0.75,
                     )
                 )
-            elif is_train and cam_mode == "smartphone_closeup":
-                static_obs.append((cam_o[:2].copy(), 0.36, 0.36))
+            elif is_train and cam_mode == "closeup_primary":
+                static_obs.append((cam_o[:2].copy(), 0.18, 0.18))
             else:
                 static_obs.append((cam_o[:2].copy(), 0.55, 0.55))
 
@@ -8685,12 +11178,14 @@ class Scene3DGPUEngine:
             if is_train and sobol_u is not None:
                 if cam_mode == "red_light_intersection" or (is_hard_tail and hard_tail_sub == 0):
                     n_veh = rng_v5.choices([3, 4, 5, 6], weights=[0.30, 0.32, 0.22, 0.16], k=1)[0]
-                elif cam_mode == "smartphone_closeup":
-                    n_veh = rng_v5.choices([1, 2, 3], weights=[0.48, 0.36, 0.16], k=1)[0]
+                elif cam_mode == "closeup_primary":
+                    n_veh = rng_v5.choices([1, 2, 3], weights=[0.52, 0.34, 0.14], k=1)[0]
+                elif cam_mode in ("oblique_extreme", "work_site_machinery"):
+                    n_veh = rng_v5.choices([1, 2, 3, 4], weights=[0.32, 0.38, 0.20, 0.10], k=1)[0]
                 else:
                     n_veh = rng_v5.choices([1, 2, 3, 4, 5, 6], weights=[0.18, 0.26, 0.22, 0.16, 0.10, 0.08], k=1)[0]
 
-                y_min_floor = 3.4 if cam_mode == "smartphone_closeup" else (7.6 if ego_fwd_mps > 0.0 else 5.0)
+                y_min_floor = 3.2 if cam_mode == "closeup_primary" else (7.6 if ego_fwd_mps > 0.0 else 5.0)
                 y_base0 = max(y_min_floor, float(y_spawn[0]))
                 y_base1 = max(y_base0 + 2.2, min(16.5, float(y_spawn[1])))
                 if cam_mode == "red_light_intersection":
@@ -8722,21 +11217,149 @@ class Scene3DGPUEngine:
                 ordered_slots = [lead_slot] + tail_slots if rng_veh.random() < 0.68 else (tail_slots[:2] + [lead_slot] + tail_slots[2:])
 
                 t_chk_lo = -0.6 * exp_s
-                do_fleet_clones = (n_veh >= 2) and (float(sobol_u[11]) < 0.30)
-                do_edge_trunc = float(sobol_u[10]) < 0.25
+                do_fleet_clones = (n_veh >= 2) and (float(sobol_u[11]) < 0.30) and (cam_mode not in ("closeup_primary", "work_site_machinery"))
+                do_edge_trunc = (float(sobol_u[10]) < 0.25) and (cam_mode not in ("closeup_primary", "oblique_extreme", "work_site_machinery"))
                 used_plate_ids: set[int] = set()
                 fleet_paint_choice = rng_veh.choice(
                     (
-                        (0.90, 0.91, 0.93),  # Fleet white
-                        (0.72, 0.74, 0.77),  # Fleet metallic silver
+                        (0.92, 0.93, 0.95),  # Fleet white
+                        (0.74, 0.76, 0.79),  # Fleet metallic silver
                         (0.04, 0.04, 0.05),  # Fleet jet black
                     )
                 )
                 force_dark_clip = bool(is_hard_tail and hard_tail_sub == 0)
                 force_comm_recess_clip = bool(is_hard_tail and hard_tail_sub == 1)
 
-                # Optional 25% frame-edge truncated foreground/side-lane vehicle (`25–70%` body truncated by border!)
                 next_tid = 1
+                # Gen-7 Dedicated Primary Subject Spawners for Close-Up, Extreme Oblique Yaw, & Work-Site Machinery!
+                if cam_mode == "closeup_primary" and primary_target_xy is not None:
+                    cu_lx, cu_df = primary_target_xy
+                    want_white_van = rng_veh.random() < 0.16
+                    cu_arch_choice = (
+                        "hiace_van"
+                        if want_white_van
+                        else rng_veh.choice(
+                            (
+                                "sedan", "hatchback_compact", "minivan_1box_jp", "suv_4wd",
+                                "kei_tall_wagon", "kei_crossover", "kei_truck",
+                                "hiace_van", "box_wing_truck", "concrete_mixer",
+                                "dump_10t", "garbage_packer", "cargo_crane_truck", "wheel_loader",
+                            )
+                        )
+                    )
+                    show_rear_cu = True if want_white_van else (rng_veh.random() < 0.52)
+                    for cu_att in range(14):
+                        cu_yaw = (0.0 if show_rear_cu else math.pi) + math.radians(rng_veh.uniform(-22.0, 22.0))
+                        # Move away from camera (or stationary) so close-up vehicle never clips camera across frames
+                        stat_cu = stationary_all or (not show_rear_cu) or (rng_veh.random() < 0.58)
+                        spd_cu = 0.0 if stat_cu else rng_veh.uniform(0.35, 2.2)
+                        proto_cu = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=next_tid,
+                            lane_x=cu_lx + (0.0 if cu_att == 0 else rng_veh.uniform(-0.35, 0.35)),
+                            y_range=(5.0, 5.05),
+                            stationary=stat_cu,
+                            veh_struct_prod=combo[1],
+                            marking_prod=combo[3],
+                            radial_dn_n=radial_order,
+                            sobol_vec=sobol_u,
+                            forced_arch=cu_arch_choice,
+                            forced_yaw_rad=cu_yaw,
+                            forced_speed_mps=spd_cu,
+                            force_dark_car=(force_dark_clip and not want_white_van),
+                            force_comm_plate=force_comm_recess_clip,
+                            force_recessed_ao=(force_comm_recess_clip and not want_white_van),
+                            exclude_plate_indices=used_plate_ids,
+                            forced_white_livery_van=want_white_van,
+                        )
+                        # Place closest face at exact `cu_df + 0.15 * cu_att` (`1.15..3.1m`) -> `plate_w = 55..220px`!
+                        face_dist_try = cu_df + 0.18 * float(cu_att)
+                        y_center_cu = face_dist_try + 0.5 * float(proto_cu.length_m) * abs(math.cos(cu_yaw)) + 0.5 * float(proto_cu.width_m) * abs(math.sin(cu_yaw))
+                        cand_cu = replace(proto_cu, p0=np.array([float(proto_cu.p0[0]), float(y_center_cu), 0.0], dtype=np.float32))
+                        if _static_obs_clear(cand_cu, t_chk_lo, clip_span_s, pw_c=0.06, pl_c=0.08):
+                            veh_specs.append(cand_cu)
+                            used_plate_ids.add(cand_cu.front_plate_idx)
+                            used_plate_ids.add(cand_cu.rear_plate_idx)
+                            next_tid += 1
+                            break
+
+                elif cam_mode == "oblique_extreme" and primary_target_xy is not None:
+                    ob_lx, ob_y0 = primary_target_xy
+                    ob_arch_pool = (
+                        "dump_10t", "deep_dump", "box_wing_truck", "flatbed_truck",
+                        "garbage_packer", "hiace_van", "minivan_1box_jp", "sedan", "kei_truck",
+                    )
+                    for ob_att in range(16):
+                        lx_try = ob_lx + (0.0 if ob_att == 0 else rng_veh.uniform(-0.85, 0.85))
+                        y_try = ob_y0 + (0.0 if ob_att == 0 else rng_veh.uniform(-0.8, 1.8))
+                        ux_ob = float(cam_o[0]) - lx_try
+                        uy_ob = -y_try
+                        un_ob = max(1e-5, math.hypot(ux_ob, uy_ob))
+                        yaw_rear_face = math.atan2(ux_ob / un_ob, -(uy_ob / un_ob))
+                        theta_ob = math.radians(rng_veh.uniform(36.0, 70.0))
+                        show_front_ob = rng_veh.random() < 0.45
+                        yaw_ob = yaw_rear_face + (math.pi if show_front_ob else 0.0) + rng_veh.choice([-1.0, 1.0]) * theta_ob
+                        stat_ob = stationary_all or (rng_veh.random() < 0.55)
+                        cand_ob = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=next_tid,
+                            lane_x=lx_try,
+                            y_range=(y_try, y_try + 0.05),
+                            stationary=stat_ob,
+                            veh_struct_prod=combo[1],
+                            marking_prod=combo[3],
+                            radial_dn_n=radial_order,
+                            sobol_vec=sobol_u,
+                            forced_arch=rng_veh.choice(ob_arch_pool),
+                            forced_yaw_rad=yaw_ob,
+                            forced_speed_mps=0.0 if stat_ob else rng_veh.uniform(0.4, 2.6),
+                            force_dark_car=force_dark_clip,
+                            force_comm_plate=force_comm_recess_clip,
+                            force_recessed_ao=force_comm_recess_clip,
+                            exclude_plate_indices=used_plate_ids,
+                        )
+                        if _static_obs_clear(cand_ob, t_chk_lo, clip_span_s, pw_c=0.10, pl_c=0.14):
+                            veh_specs.append(cand_ob)
+                            used_plate_ids.add(cand_ob.front_plate_idx)
+                            used_plate_ids.add(cand_ob.rear_plate_idx)
+                            next_tid += 1
+                            break
+
+                elif cam_mode == "work_site_machinery" and primary_target_xy is not None:
+                    ws_lx, ws_y0 = primary_target_xy
+                    for ws_att in range(16):
+                        lx_try = ws_lx + (0.0 if ws_att == 0 else rng_veh.uniform(-0.8, 0.8))
+                        y_try = ws_y0 + (0.0 if ws_att == 0 else rng_veh.uniform(-0.8, 1.8))
+                        ux_ws = float(cam_o[0]) - lx_try
+                        uy_ws = -y_try
+                        un_ws = max(1e-5, math.hypot(ux_ws, uy_ws))
+                        # Aim `+X` side-of-hood plate (`track_id==1` -> `side_sgn_m==+1`) squarely at camera ± 32 deg!
+                        yaw_side_face = math.atan2(uy_ws / un_ws, ux_ws / un_ws) + (math.pi if (next_tid % 2 == 0) else 0.0)
+                        yaw_ws = yaw_side_face + math.radians(rng_veh.uniform(-34.0, 34.0))
+                        stat_ws = stationary_all or (rng_veh.random() < 0.65)
+                        cand_ws = self._sample_vehicle_spec(
+                            rng_veh,
+                            track_id=next_tid,
+                            lane_x=lx_try,
+                            y_range=(y_try, y_try + 0.05),
+                            stationary=stat_ws,
+                            veh_struct_prod=combo[1],
+                            marking_prod=combo[3],
+                            radial_dn_n=radial_order,
+                            sobol_vec=sobol_u,
+                            forced_yaw_rad=yaw_ws,
+                            forced_speed_mps=0.0 if stat_ws else rng_veh.uniform(0.3, 2.0),
+                            exclude_plate_indices=used_plate_ids,
+                            forced_machinery_side_plate=True,
+                        )
+                        if _static_obs_clear(cand_ws, t_chk_lo, clip_span_s, pw_c=0.10, pl_c=0.14):
+                            veh_specs.append(cand_ws)
+                            used_plate_ids.add(cand_ws.front_plate_idx)
+                            used_plate_ids.add(cand_ws.rear_plate_idx)
+                            next_tid += 1
+                            break
+
+                # Optional 25% frame-edge truncated foreground/side-lane vehicle (`25–70%` body truncated by border!)
                 if do_edge_trunc:
                     for tr_att in range(14):
                         use_bot_edge = (ego_fwd_mps == 0.0) and (tr_att < 4) and (rng_veh.random() < 0.32)
@@ -8950,8 +11573,21 @@ class Scene3DGPUEngine:
         # Exposure-proportional signal scale & causal 1-frame-delayed Auto-Exposure (AE) initialization
         ref_exp_s = (1.0 / 35.0) if is_night else (1.0 / 150.0)
         exp_charge_scale = float(exp_s / ref_exp_s)
-        target_l = 0.17 if is_night else 0.28
-        ambient_prior_l = (0.045 if is_ir else (0.065 if is_night else 0.26)) * exp_charge_scale
+        if is_train and (not is_night):
+            if day_lit_regime in ("sunny", "overcast"):
+                target_l = 0.43 if day_lit_regime == "sunny" else 0.41
+                tone_k = 0.54
+            elif day_lit_regime == "indoor":
+                target_l = 0.27
+                tone_k = 0.72
+            else:
+                target_l = 0.34
+                tone_k = 0.65
+            ambient_prior_l = (0.42 if day_lit_regime in ("sunny", "overcast") else 0.28) * exp_charge_scale
+        else:
+            target_l = 0.18 if is_night else 0.28
+            tone_k = 0.78
+            ambient_prior_l = (0.045 if is_ir else (0.065 if is_night else 0.26)) * exp_charge_scale
         ae_gain = float(np.clip(target_l / max(0.012, ambient_prior_l), 0.20, 9.0)) * rng.uniform(0.88, 1.14)
 
         frames_out: list[Tensor] = []
@@ -9091,12 +11727,15 @@ class Scene3DGPUEngine:
                     mid_trans_buf = trans_b
                     mid_quads = quads_inst
 
-            # Optical PSF Glare / IR Halation in Linear HDR space
+            # Optical PSF Glare / IR Halation in Linear HDR space (multi-scale wide night bloom!)
             if float(bloom_accum.max().item()) > 0.015:
                 b_low = F.avg_pool2d(bloom_accum.unsqueeze(0), kernel_size=4, stride=4)
                 b_mid = F.avg_pool2d(b_low, kernel_size=3, stride=1, padding=1)
                 bloom = F.interpolate(b_mid, size=(h, w), mode="bilinear", align_corners=False)[0]
-                hdr_accum = hdr_accum + bloom * (0.62 if is_ir else (0.52 if is_night else 0.24))
+                if is_train and (is_night or is_ir):
+                    b_wide = F.avg_pool2d(b_mid, kernel_size=5, stride=1, padding=2)
+                    bloom = 0.65 * bloom + 0.55 * F.interpolate(b_wide, size=(h, w), mode="bilinear", align_corners=False)[0]
+                hdr_accum = hdr_accum + bloom * (0.68 if is_ir else (0.64 if is_night else 0.26))
 
             # Exposure-duration photon integration + Causal 1-frame-delayed AE gain!
             sensor_lin = hdr_accum * exp_charge_scale
@@ -9133,7 +11772,7 @@ class Scene3DGPUEngine:
             shadow_vis_cpu = self._last_mid_shadow_vis.cpu().numpy().copy()
 
             # Reinhard sensor saturation + sRGB transfer (monochrome preserved for 850nm/940nm Night-IR)
-            toned = noisy_lin / (1.0 + 0.78 * noisy_lin)
+            toned = noisy_lin / (1.0 + tone_k * noisy_lin)
             srgb = torch.where(toned <= 0.0031308, toned * 12.92, 1.055 * toned.clamp_min(1e-6).pow(1.0 / 2.4) - 0.055)
             srgb = srgb.clamp(0.0, 1.0)
             frames_out.append(srgb)
@@ -9311,14 +11950,19 @@ class Scene3DGPUEngine:
                     vs_p = veh_specs[qd.veh_idx - 1]
                     v_tid = vs_p.track_id
                     if qd.cls_id == CLS_PLATE:
-                        p_tid = vs_p.track_id * 10 + (1 if qd.plate_side == SIDE_REAR else 0)
+                        if qd.plate_side == SIDE_REAR:
+                            p_tid = vs_p.track_id * 10 + 1
+                        elif qd.plate_side == SIDE_PURE_SIDE:
+                            p_tid = vs_p.track_id * 10 + 9
+                        else:
+                            p_tid = vs_p.track_id * 10
                     else:
                         ord_k = veh_hn_ordinal.get(qd.veh_idx, 0)
                         veh_hn_ordinal[qd.veh_idx] = ord_k + 1
-                        if is_train and ord_k >= 8:
+                        if is_train and ord_k >= 7:
                             p_tid = 2000 + vs_p.track_id * 32 + ord_k
                         else:
-                            p_tid = vs_p.track_id * 10 + 2 + min(7, ord_k)
+                            p_tid = vs_p.track_id * 10 + 2 + min(6, ord_k)
                 else:
                     v_tid = 0
                     si_idx = max(0, q_idx - num_veh_quads)
@@ -9466,6 +12110,91 @@ class Scene3DGPUEngine:
                     ae_gain_applied=ae_gain_used,
                 )
             )
+
+        # Gen-7 2D Post-Render TV Broadcast Corner Badges (~18% of train clips, skipped on monochrome Night-IR!)
+        # Strictly verified ZERO overlap (>= 10 px margin) against EVERY real `CLS_PLATE` and plate ignore box across ALL K frames!
+        if is_train and (not is_ir) and self.bank.gen7_tv_badges_rgba and h >= 120 and w >= 160:
+            rng_tv = random.Random((int(seed) ^ 0x54564244) & 0x7FFFFFFF)
+            if rng_tv.random() < 0.12:
+                # Collect every plate / ignored-plate bbox across all K frames
+                plate_excl_boxes: list[tuple[float, float, float, float]] = []
+                for f_gt in gts_out:
+                    for p_g in f_gt.plates_and_signs:
+                        if int(p_g.cls_id) == CLS_PLATE:
+                            b = p_g.bbox_xyxy
+                            plate_excl_boxes.append((float(b[0]), float(b[1]), float(b[2]), float(b[3])))
+                    for ib, ic in zip(f_gt.ignore_bboxes_xyxy, f_gt.ignore_bbox_classes):
+                        if int(ic) == CLS_PLATE:
+                            plate_excl_boxes.append((float(ib[0]), float(ib[1]), float(ib[2]), float(ib[3])))
+
+                corners_order = ["TL", "TR", "BL", "BR"]
+                rng_tv.shuffle(corners_order)
+                n_want_badges = 1
+                placed_tv = 0
+                pad_tv = 10.0
+                for c_tag in corners_order:
+                    if placed_tv >= n_want_badges:
+                        break
+                    bw = max(36, int(round(w * rng_tv.uniform(0.11, 0.21))))
+                    bh = max(18, int(round(h * rng_tv.uniform(0.065, 0.135))))
+                    mx = max(4, int(round(w * rng_tv.uniform(0.015, 0.042))))
+                    my = max(4, int(round(h * rng_tv.uniform(0.018, 0.048))))
+                    if c_tag == "TL":
+                        x0, y0 = mx, my
+                    elif c_tag == "TR":
+                        x0, y0 = w - mx - bw, my
+                    elif c_tag == "BL":
+                        x0, y0 = mx, h - my - bh
+                    else:
+                        x0, y0 = w - mx - bw, h - my - bh
+                    x1, y1 = x0 + bw, y0 + bh
+                    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
+                        continue
+                    overlaps_plate = False
+                    for px0, py0, px1, py1 in plate_excl_boxes:
+                        if (x0 - pad_tv) < px1 and (x1 + pad_tv) > px0 and (y0 - pad_tv) < py1 and (y1 + pad_tv) > py0:
+                            overlaps_plate = True
+                            break
+                    if overlaps_plate:
+                        continue
+                    badge_np = rng_tv.choice(self.bank.gen7_tv_badges_rgba)
+                    badge_t = torch.from_numpy(badge_np).to(device=dev, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                    badge_rs = F.interpolate(
+                        badge_t.unsqueeze(0), size=(bh, bw), mode="bilinear", align_corners=False
+                    )[0]  # (4, bh, bw) on `dev`
+                    b_rgb = badge_rs[:3].clamp(0.0, 1.0)
+                    b_a = (badge_rs[3:4].clamp(0.0, 1.0)) * rng_tv.uniform(0.86, 0.98)
+                    for fi_k in range(len(frames_out)):
+                        patch = frames_out[fi_k][:, y0:y1, x0:x1]
+                        frames_out[fi_k][:, y0:y1, x0:x1] = (patch * (1.0 - b_a) + b_rgb * b_a).clamp(0.0, 1.0)
+                        c4_tv = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+                        gts_out[fi_k].plates_and_signs.append(
+                            Scene3DPlateGT(
+                                cls_id=CLS_SIGNBOARD_HARDNEG,
+                                track_id=900 + placed_tv,
+                                veh_track_id=0,
+                                bbox_xyxy=np.array([float(x0), float(y0), float(x1), float(y1)], dtype=np.float32),
+                                corners_xy=c4_tv,
+                                blur_vec_xy=np.zeros((2,), dtype=np.float32),
+                                visibility=1.0,
+                                plate_side=SIDE_FRONT,
+                                is_large=False,
+                                overhang_shadow=0.0,
+                                plate_text_str="",
+                                plate_type_str="",
+                                is_plate=0.0,
+                                plate_vis_mask=np.ones((16, 32), dtype=np.float32),
+                                geometry_usable=0.0,
+                                slot_readability=np.zeros((12,), dtype=np.float32),
+                                visible_support_fraction=1.0,
+                                min_projected_edge_px=float(min(bw, bh)),
+                                blur_magnitude_px=0.0,
+                                local_illuminance=0.5,
+                                local_contrast_snr=0.0,
+                                slot_contrast_snr=np.zeros((12,), dtype=np.float32),
+                            )
+                        )
+                    placed_tv += 1
 
         mode_str = "hard_negative" if is_neg else ("night_gate_ir" if is_ir else ("night_gate" if is_night else cam_mode))
         return Scene3DClipSample(

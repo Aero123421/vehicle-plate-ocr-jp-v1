@@ -59,19 +59,20 @@ _BUNDLED_FONTS_DIR = Path(__file__).resolve().parents[3] / "data" / "fonts"
 
 
 class NonPlateStencilAtlas:
-    """Cached `(48, 3, 96, 160)` atlas of Japanese text-bearing non-plate hard negatives.
+    """Cached `(72, 3, 96, 160)` atlas of Japanese/Latin text & adversarial non-plate hard negatives.
 
-    Renders real Katakana/Kanji/digit roadside & vehicle-body stencils (`319` blue route shields,
+    Renders real Katakana/Kanji/Latin/digit roadside & vehicle-body stencils (`319` blue route shields,
     `スケルトン車` painted door text, `最大積載量 5000kg` decals, single-row `春日 2503` stencils,
-    `50` speed rings, phone numbers, and shop-window/grille clutter) exclusively from bundled
-    SIL-OFL-1.1 fonts so `target_status == 1` (`UNREADABLE`) defeats text-bearing false positives.
+    `TOLL GATE` / `HINO 500` badges, glossy white/pink blobs, yellow-black hazard stripes, blank bolted
+    metal panels, headlights, and static clutter) exclusively from bundled SIL-OFL-1.1 fonts so
+    `target_status == 1` (`UNREADABLE`) defeats every false-positive crop mode.
     """
 
     ROI_H: int = 96
     ROI_W: int = 160
 
     def __init__(self) -> None:
-        self.templates_rgb: np.ndarray = self._build_templates()  # (48, 3, 96, 160) float32
+        self.templates_rgb: np.ndarray = self._build_templates()  # (72, 3, 96, 160) float32
         self._device_cache: dict[torch.device, torch.Tensor] = {}
 
     def to_torch(self, device: torch.device | str) -> torch.Tensor:
@@ -256,7 +257,101 @@ class NonPlateStencilAtlas:
                 arr[2] = np.clip(0.20 + 0.58 * mullion + 0.48 * sky_ref, 0.0, 1.0)
             templates.append(arr)
 
-        return np.stack(templates[:48], axis=0).astype(np.float32)
+        # 6. 8x Latin / Mixed Commercial Signage & Vehicle Emblems
+        latin_specs = [
+            ("TOLL GATE", "ETC ONLY", (18, 86, 48), (246, 248, 246)),
+            ("EXIT 12B", "出口 500m", (20, 74, 152), (246, 248, 250)),
+            ("DIESEL TURBO", "4WD", (32, 34, 38), (222, 226, 232)),
+            ("HYBRID", "SYNERGY", (236, 240, 246), (26, 76, 168)),
+            ("HINO 500", "", (44, 48, 54), (240, 242, 244)),
+            ("ISUZU ELF", "", (232, 234, 238), (192, 28, 30)),
+            ("CAUTION 24V", "立入禁止", (236, 192, 22), (20, 20, 20)),
+            ("STOP", "止まれ", (196, 26, 24), (248, 248, 248)),
+        ]
+        for idx_l, (l1, l2, bg_c, fg_c) in enumerate(latin_specs):
+            img = Image.new("RGB", (w, h), bg_c)
+            dr = ImageDraw.Draw(img)
+            dr.rectangle([4, 6, w - 4, h - 6], outline=fg_c, width=2)
+            if l2:
+                draw_centered(dr, l1, gf(idx_l, 22), w // 2, 34, fg_c)
+                draw_centered(dr, l2, gf(idx_l + 1, 18), w // 2, 66, fg_c)
+            else:
+                draw_centered(dr, l1, gf(idx_l, 28), w // 2, h // 2, fg_c)
+            templates.append(np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0)
+
+        # 7. 6x Glossy White / Pink / Pastel Specular Blobs
+        yy_b, xx_b = np.meshgrid(
+            np.linspace(-1.0, 1.0, h, dtype=np.float32),
+            np.linspace(-1.0, 1.0, w, dtype=np.float32),
+            indexing="ij",
+        )
+        blob_colors = [
+            ((0.96, 0.96, 0.97), (0.28, 0.30, 0.34), -0.15, -0.05),
+            ((0.96, 0.62, 0.76), (0.22, 0.18, 0.24), 0.10, 0.05),
+            ((0.98, 0.74, 0.84), (0.82, 0.84, 0.88), -0.20, 0.10),
+            ((0.95, 0.92, 0.86), (0.16, 0.17, 0.20), 0.18, -0.10),
+            ((0.92, 0.48, 0.66), (0.14, 0.12, 0.16), 0.0, 0.0),
+            ((0.94, 0.95, 0.98), (0.60, 0.64, 0.70), 0.05, -0.15),
+        ]
+        for fg_c, bg_c, cx_b, cy_b in blob_colors:
+            g_b = np.exp(-(((xx_b - cx_b) / 0.58) ** 2 + ((yy_b - cy_b) / 0.52) ** 2)).astype(np.float32)
+            spec_b = (g_b ** 4) * 0.28
+            arr = np.zeros((3, h, w), dtype=np.float32)
+            for ci in range(3):
+                arr[ci] = np.clip(bg_c[ci] * (1.0 - g_b) + fg_c[ci] * g_b + spec_b, 0.0, 1.0)
+            templates.append(arr)
+
+        # 8. 4x Yellow-Black & Red-White Diagonal Hazard Warning Stripes
+        yy_h, xx_h = np.meshgrid(
+            np.linspace(0.0, 1.0, h, dtype=np.float32),
+            np.linspace(0.0, 3.5, w, dtype=np.float32),
+            indexing="ij",
+        )
+        for idx_h in range(4):
+            phase_h = 0.25 * idx_h
+            stripe = (((xx_h + (1.2 if idx_h % 2 == 0 else -1.2) * yy_h + phase_h) % 1.0) > 0.48).astype(np.float32)
+            c1 = (0.94, 0.78, 0.08) if idx_h < 3 else (0.90, 0.14, 0.12)
+            c2 = (0.09, 0.09, 0.10) if idx_h < 3 else (0.95, 0.95, 0.95)
+            arr = np.zeros((3, h, w), dtype=np.float32)
+            for ci in range(3):
+                arr[ci] = stripe * c1[ci] + (1.0 - stripe) * c2[ci]
+            templates.append(arr)
+
+        # 9. 4x Pure Blank Brushed Metal / Empty Bolted Panels (Plate-shaped, zero characters!)
+        blank_bgs = [
+            (226, 228, 230),
+            (236, 198, 38),
+            (32, 92, 54),
+            (152, 158, 166),
+        ]
+        for idx_m, bg_m in enumerate(blank_bgs):
+            img = Image.new("RGB", (w, h), (36, 38, 42))
+            dr = ImageDraw.Draw(img)
+            dr.rounded_rectangle([14, 10, w - 14, h - 10], radius=6, fill=bg_m, outline=(60, 62, 66), width=3)
+            # Two mounting bolts with zero text
+            for bx_m in (42, w - 42):
+                dr.ellipse([bx_m - 5, 22 - 5, bx_m + 5, 22 + 5], fill=(168, 172, 178), outline=(72, 74, 78), width=1)
+            arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
+            # Brushed horizontal metallic grain
+            rng_m = np.random.default_rng(700 + idx_m)
+            grain = rng_m.normal(0.0, 0.025, size=(1, h, 1)).astype(np.float32)
+            templates.append(np.clip(arr + grain, 0.0, 1.0))
+
+        # 10. 2x Dual Headlight Glare & Extreme Static Noise
+        lamp2 = (
+            np.exp(-(((xx_b + 0.45) / 0.24) ** 2 + (yy_b / 0.32) ** 2))
+            + np.exp(-(((xx_b - 0.45) / 0.24) ** 2 + (yy_b / 0.32) ** 2))
+        ).astype(np.float32)
+        arr_hl = np.zeros((3, h, w), dtype=np.float32)
+        arr_hl[0] = np.clip(0.08 + 0.96 * lamp2, 0.0, 1.0)
+        arr_hl[1] = np.clip(0.09 + 0.94 * lamp2, 0.0, 1.0)
+        arr_hl[2] = np.clip(0.11 + 0.88 * lamp2, 0.0, 1.0)
+        templates.append(arr_hl)
+
+        rng_st = np.random.default_rng(799)
+        templates.append(rng_st.uniform(0.0, 1.0, size=(3, h, w)).astype(np.float32))
+
+        return np.stack(templates[:72], axis=0).astype(np.float32)
 
 
 _DEFAULT_STENCIL_ATLAS: NonPlateStencilAtlas | None = None
@@ -538,6 +633,15 @@ class PlateSurface25DBuilder:
         frame_top_extra_np = np.zeros(bsz, dtype=np.float32)
         rust_lvl_np = np.zeros(bsz, dtype=np.float32)
         salt_dust_np = np.zeros(bsz, dtype=np.float32)
+        sdf_bias_np = np.zeros(bsz, dtype=np.float32)
+        emboss_h_np = np.full(bsz, 1.5, dtype=np.float32)
+        emboss_bevel_np = np.full(bsz, 0.85, dtype=np.float32)
+        chip_lvl_np = np.zeros(bsz, dtype=np.float32)
+        seal_h_np = np.full(bsz, 8.0, dtype=np.float32)
+        bolt_dx_l_np = np.zeros(bsz, dtype=np.float32)
+        bolt_dy_l_np = np.zeros(bsz, dtype=np.float32)
+        bolt_dx_r_np = np.zeros(bsz, dtype=np.float32)
+        bolt_dy_r_np = np.zeros(bsz, dtype=np.float32)
 
         is_large_np = np.zeros(bsz, dtype=bool)
         bot_bolt_mode_np = np.zeros(bsz, dtype=np.int64)   # 0=none, 1=raised M10 hex+washer (85%), 2=flush/unbolted hole (15%)
@@ -729,28 +833,55 @@ class PlateSurface25DBuilder:
             has_border_np[b] = bool(cfg.with_border)
             has_emboss_np[b] = bool(cfg.with_emboss) and not is_illum_np[b]
 
-            # Rear-left aluminum seal (封印): +8.0 mm height, Ø22..25 mm when rear & with_seal
+            # Rear-left aluminum seal (封印): +8.0..10.2 mm height, Ø22..28 mm when rear & with_seal
             legal_seal_type = (
                 cfg.plate_type in (PlateType.STANDARD_PRIVATE, PlateType.STANDARD_COMMERCIAL)
                 or (is_graphic_np[b] and graphic_rim_np[b] in (0, 2))
             )
             if side == 1 and cfg.with_seal and legal_seal_type and not cfg.is_temporary_plate:
                 has_seal_np[b] = True
-                seal_r_np[b] = rng.uniform(11.0, 12.5)  # Ø22..25 mm
+                if layout_jitter:
+                    seal_r_np[b] = rng.uniform(11.0, 14.2)  # heavy rear-seal overlap envelope
+                    seal_h_np[b] = rng.uniform(8.0, 10.2)
+                else:
+                    seal_r_np[b] = rng.uniform(11.0, 12.5)  # Ø22..25 mm
+                    seal_h_np[b] = 8.0
 
             if cfg.bolt_cap_size_mm >= 14.0:
                 bolt_cap_r_np[b] = 0.5 * float(cfg.bolt_cap_size_mm)  # r = 9..11 mm
                 bolt_h_np[b] = 5.5
             elif cfg.with_bolt_holes:
-                if is_large_np[b]:
+                if layout_jitter and rng.random() < 0.22:
+                    # Oversized aftermarket theft-deterrent bolt caps / wide flange washers overlapping upper slots
+                    bolt_cap_r_np[b] = rng.uniform(8.2, 12.5)
+                    bolt_h_np[b] = rng.uniform(5.2, 7.6)
+                elif is_large_np[b]:
                     bolt_cap_r_np[b] = 6.2  # M10 hex bolt + flange washer mapped via 0.75x (~16.5mm physical Ø)
                     bolt_h_np[b] = 4.6
                 else:
                     bolt_cap_r_np[b] = 5.5  # standard M6 hex bolt + washer Ø11 mm
                     bolt_h_np[b] = 4.0
+            if layout_jitter and cfg.with_bolt_holes:
+                # Realistic slight mounting / overlap jitter pulling bolts/seals closer to Region 0 & Class 6
+                bolt_dx_l_np[b] = rng.uniform(-2.5, 4.5)
+                bolt_dy_l_np[b] = rng.uniform(-2.5, 3.0)
+                bolt_dx_r_np[b] = rng.uniform(-4.5, 2.5)
+                bolt_dy_r_np[b] = rng.uniform(-2.5, 3.0)
             if is_large_np[b] and cfg.with_bolt_holes and not is_temp_np[b]:
                 # ~85% raised M10 hex bolts + washers, ~15% flush/unbolted lower mounting holes
                 bot_bolt_mode_np[b] = 2 if rng.random() < 0.15 else 1
+
+            # Continuous SDF stroke-weight perturbation (±0.40..0.90px), emboss relief & paint chipping!
+            if layout_jitter:
+                if rng.random() < 0.70:
+                    sgn_s = 1.0 if rng.random() < 0.52 else -1.0
+                    sdf_bias_np[b] = sgn_s * rng.uniform(0.40, 0.90)
+                else:
+                    sdf_bias_np[b] = rng.uniform(-0.25, 0.25)
+                emboss_h_np[b] = rng.uniform(0.85, 2.35)
+                emboss_bevel_np[b] = rng.uniform(0.55, 1.25)
+                if (weath > 0.10 or float(cfg.mud_level) > 0.05 or rng.random() < 0.24):
+                    chip_lvl_np[b] = rng.uniform(0.12, 0.52)
 
             f_style = cfg.frame_style or ("black_plastic" if (cfg.plate_frame or is_illum_np[b]) else None)
             if f_style in frame_map:
@@ -791,7 +922,7 @@ class PlateSurface25DBuilder:
         any_frame = bool((frame_type_np > 0).any())
         any_mud = bool((mud_lvl_np > 1e-3).any())
 
-        # Pack all per-plate float32 scalars into ONE contiguous (B, 27) tensor upload!
+        # Pack all per-plate float32 scalars into ONE contiguous (B, 36) tensor upload!
         float_pack_np = np.column_stack(
             [
                 bg_rgb_np,          # 0..2
@@ -815,6 +946,15 @@ class PlateSurface25DBuilder:
                 frame_top_extra_np, # 24
                 rust_lvl_np,        # 25
                 salt_dust_np,       # 26
+                sdf_bias_np,        # 27
+                emboss_h_np,        # 28
+                emboss_bevel_np,    # 29
+                chip_lvl_np,        # 30
+                seal_h_np,          # 31
+                bolt_dx_l_np,       # 32
+                bolt_dy_l_np,       # 33
+                bolt_dx_r_np,       # 34
+                bolt_dy_r_np,       # 35
             ]
         ).astype(np.float32, copy=False)
         fp = torch.from_numpy(float_pack_np).to(dev)
@@ -840,6 +980,15 @@ class PlateSurface25DBuilder:
         frame_top_extra = fp[:, 24:25, None, None]
         rust_lvl = fp[:, 25:26, None, None]
         salt_dust = fp[:, 26:27, None, None]
+        sdf_bias = fp[:, 27:28, None, None]
+        emboss_h = fp[:, 28:29, None, None]
+        emboss_bevel_w = fp[:, 29:30, None, None]
+        chip_lvl = fp[:, 30:31, None, None]
+        seal_h = fp[:, 31:32, None, None]
+        bolt_dx_l = fp[:, 32:33, None, None]
+        bolt_dy_l = fp[:, 33:34, None, None]
+        bolt_dx_r = fp[:, 34:35, None, None]
+        bolt_dy_r = fp[:, 35:36, None, None]
 
         # Pack all per-plate int64 scalars into ONE contiguous (B, 26) tensor upload!
         int_pack_np = np.column_stack(
@@ -983,8 +1132,32 @@ class PlateSurface25DBuilder:
             if any_mud
             else torch.zeros((bsz, 1, 16, 32), device=dev)
         )
+        chip_low = (
+            torch.rand((bsz, 1, 24, 48), generator=gen, device=dev)
+            if layout_jitter
+            else torch.zeros((bsz, 1, 24, 48), device=dev)
+        )
 
-        if bool(is_large_np.any()):
+        if layout_jitter:
+            is_lg_f = torch.from_numpy(is_large_np).to(dev)[:, None, None, None].float()
+            bx_l = 60.0 * (1.0 - is_lg_f) + 75.0 * is_lg_f + bolt_dx_l
+            by_l = 25.0 * (1.0 - is_lg_f) + 26.25 * is_lg_f + bolt_dy_l
+            bx_r = 270.0 * (1.0 - is_lg_f) + 255.0 * is_lg_f + bolt_dx_r
+            by_r = 25.0 * (1.0 - is_lg_f) + 26.25 * is_lg_f + bolt_dy_r
+            xx4 = xx_mm[None, None, :, :]
+            yy4 = yy_mm[None, None, :, :]
+            d_left_eff = torch.hypot(xx4 - bx_l, yy4 - by_l)
+            d_right_eff = torch.hypot(xx4 - bx_r, yy4 - by_r)
+            h_left_eff = torch.maximum(
+                torch.abs(xx4 - bx_l) * 0.8660254 + torch.abs(yy4 - by_l) * 0.5,
+                torch.abs(yy4 - by_l),
+            )
+            h_right_eff = torch.maximum(
+                torch.abs(xx4 - bx_r) * 0.8660254 + torch.abs(yy4 - by_r) * 0.5,
+                torch.abs(yy4 - by_r),
+            )
+            rust_streak_eff = torch.where(is_lg_f > 0.5, rust_streak_lg, rust_streak_med)
+        elif bool(is_large_np.any()):
             is_lg_t = torch.from_numpy(is_large_np).to(dev)[:, None, None, None]
             d_left_eff = torch.where(is_lg_t, d_left_bolt_lg, d_left_bolt)
             d_right_eff = torch.where(is_lg_t, d_right_bolt_lg, d_right_bolt)
@@ -1068,6 +1241,12 @@ class PlateSurface25DBuilder:
             salt_dust,
             warm_el,
             mud_low,
+            sdf_bias,
+            emboss_h,
+            emboss_bevel_w,
+            chip_lvl,
+            seal_h,
+            chip_low,
         )
 
         return PlateSurface25DPacket(
@@ -1317,6 +1496,12 @@ def _compose_surface_tail_impl(
     salt_dust: torch.Tensor,
     warm_el: torch.Tensor,
     mud_low: torch.Tensor,
+    sdf_bias: torch.Tensor,
+    emboss_h: torch.Tensor,
+    emboss_bevel_w: torch.Tensor,
+    chip_lvl: torch.Tensor,
+    seal_h: torch.Tensor,
+    chip_low: torch.Tensor,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1330,8 +1515,14 @@ def _compose_surface_tail_impl(
     torch.Tensor,
 ]:
     bsz = surround_base.shape[0]
-    stroke_alpha = torch.clamp(ext_sdf_px + 0.5, 0.0, 1.0)
-    emboss_bevel = torch.clamp((ext_sdf_px + 0.65) / 0.85, 0.0, 1.0)
+    # Continuous SDF stroke-weight dilation/erosion (±0.40..0.90px, gentler 0.65x on dense upper Kanji) + paint chipping
+    upper_row_scale = torch.where(yy_mm[None, None, :, :] < 62.0, 0.65, 1.0)
+    chip_field = F.interpolate(chip_low, size=(EXT_H, EXT_W), mode="bilinear", align_corners=False)
+    chip_erode = F.relu(chip_field - 0.56) * chip_lvl * 1.45
+    sdf_eff = ext_sdf_px + sdf_bias * upper_row_scale - chip_erode
+
+    stroke_alpha = torch.clamp(sdf_eff + 0.5, 0.0, 1.0)
+    emboss_bevel = torch.clamp((sdf_eff + 0.65) / emboss_bevel_w.clamp_min(0.45), 0.0, 1.0)
     emboss_bevel = emboss_bevel * emboss_bevel * (3.0 - 2.0 * emboss_bevel)
 
     albedo = surround_base * grille_stripes
@@ -1361,7 +1552,7 @@ def _compose_surface_tail_impl(
     nir = nir * (1.0 - s_mask) + txt_nir * s_mask
     retro = retro * (1.0 - s_mask) + txt_retro * s_mask
     rough = rough * (1.0 - s_mask) + 0.22 * s_mask
-    height_mm = height_mm + 1.5 * emboss_bevel * in_plate * has_emboss[:, None, None, None].float()
+    height_mm = height_mm + emboss_h * emboss_bevel * in_plate * has_emboss[:, None, None, None].float()
 
     # Vertical bolt rust streaks below upper mounting bolts
     rust_alpha = (rust_streak_geom * rust_lvl * 0.78).clamp(0.0, 0.78)
@@ -1423,7 +1614,7 @@ def _compose_surface_tail_impl(
     retro = retro * (1.0 - seal_mask)
     rough = rough * (1.0 - seal_mask) + 0.20 * seal_mask
     metal = torch.maximum(metal, 0.88 * seal_mask)
-    height_mm = torch.where(seal_plateau > 0.02, torch.maximum(height_mm, 8.0 * seal_plateau), height_mm)
+    height_mm = torch.where(seal_plateau > 0.02, torch.maximum(height_mm, seal_h * seal_plateau), height_mm)
     occ_2d_ext = torch.maximum(occ_2d_ext, seal_mask)
 
     f_f = (frame_type > 0)[:, None, None, None].float()

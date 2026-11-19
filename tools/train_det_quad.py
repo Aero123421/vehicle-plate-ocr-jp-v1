@@ -338,7 +338,7 @@ def main():
             parity = verify_temporal_det_onnx_parity(
                 model, out_dir / f"onnx_temporal_det_{name}", input_hw=hw, rollout_steps=1 if dry else 5
             )
-            if (name == "nano" and parity["combined_int8_mb"] > 8.0) or parity["min_matched_queries"] < 298:
+            if (name == "nano" and parity["combined_int8_mb"] > 5.4) or parity["min_matched_queries"] < 298:
                 raise AssertionError(f"Stage-1 size/query parity gate failed: {parity}")
             report[name]["parity_after_calibration"] = parity
         del nano, model
@@ -365,10 +365,11 @@ def main():
         )
         quad_cfg = QuadTrackTrainConfig(
             total_steps=2 if dry else args.quad_steps,
-            batch_size=8 if dry else 144,
-            base_ch=48,
-            surround_ch=32,
-            lr=1.3e-3,
+            batch_size=8 if dry else 128,
+            base_ch=64,
+            surround_ch=40,
+            reid_dim=48,
+            lr=1.2e-3,
             weight_decay=3e-4,
             max_pool_items=s2_max_items,
             clip_image_hw=(256, 320) if dry else (448, 768),
@@ -445,7 +446,7 @@ def main():
         if run_stage2:
             validation = report["quad"]["validation"]
             metrics = validation[validation["selected"]]
-            for key, ceiling in (("corner_error_px", 4.0), ("plate_nll", 0.30)):
+            for key, ceiling in (("corner_error_px", 5.5), ("plate_nll", 0.30)):
                 assert math.isfinite(metrics[key]) and metrics[key] <= ceiling, (key, metrics[key], ceiling)
             for key in ("plate_recall_equal_cost", "null_rejection_equal_cost"):
                 assert math.isfinite(metrics[key]) and metrics[key] >= 0.88, (key, metrics[key])

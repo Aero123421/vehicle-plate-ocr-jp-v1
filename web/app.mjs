@@ -235,14 +235,19 @@ function extrapolateCorners(corners, vel, sizeVel, dt) {
 }
 
 function updateSmoothingTargets(payload, wallNow) {
+  if (payload.sceneCut) {
+    smoothVehicles.clear();
+    smoothPlates.clear();
+  }
   const payloadTime = payload.timestamp;
   const activeV = new Set();
   for (const v of payload.vehicles) {
+    if (v.coasted && (v.patchNcc ?? 1) < 0.40) continue;
     activeV.add(v.id);
     const prev = smoothVehicles.get(v.id);
     let offset = [0, 0, 0, 0];
     if (prev) {
-      const dtPrev = clamp(payloadTime - prev.time, 0, 0.4);
+      const dtPrev = clamp(payloadTime - prev.time, 0, 0.28);
       const decay = Math.exp(-(wallNow - prev.wall) / 75);
       const predPrev = [
         prev.box[0] + prev.vel[0] * dtPrev - 0.5 * prev.vel[2] * dtPrev + prev.offset[0] * decay,
@@ -255,6 +260,8 @@ function updateSmoothingTargets(payload, wallNow) {
     smoothVehicles.set(v.id, {
       box: v.box,
       vel: v.velocity ?? [0, 0, 0, 0],
+      coasted: Boolean(v.coasted),
+      patchNcc: v.patchNcc ?? 1,
       time: payloadTime,
       wall: wallNow,
       offset,
@@ -750,8 +757,9 @@ function paintSmooth(wallNow) {
     resolvedPlates.push({ track, corners });
   }
 
-  // 2. Render vehicles (coupled to live optical plate delta when available).
+  // 2. Render vehicles (coupled to live optical plate delta when available; never render low-NCC ghosts).
   for (const v of payload.vehicles) {
+    if (v.coasted && (v.patchNcc ?? 1) < 0.40) continue;
     const sm = smoothVehicles.get(v.id);
     const coupled = vehicleLiveDelta.get(v.id);
     let box = v.box;
@@ -767,12 +775,12 @@ function paintSmooth(wallNow) {
     } else if (sm) {
       const decay = Math.exp(-(wallNow - sm.wall) / 75);
       const [vx, vy, vw, vh] = sm.vel;
-      const posDt = Math.max(0, dt);
+      const posDt = Math.min(Math.max(0, dt), 0.20) * (v.coasted ? 0.35 : 0.78);
       box = [
-        clamp(sm.box[0] + vx * posDt - 0.5 * vw * posDt * 0.4 + sm.offset[0] * decay, 0, w),
-        clamp(sm.box[1] + vy * posDt - 0.5 * vh * posDt * 0.4 + sm.offset[1] * decay, 0, h),
-        clamp(sm.box[2] + vx * posDt + 0.5 * vw * posDt * 0.4 + sm.offset[2] * decay, 0, w),
-        clamp(sm.box[3] + vy * posDt + 0.5 * vh * posDt * 0.4 + sm.offset[3] * decay, 0, h),
+        clamp(sm.box[0] + vx * posDt - 0.5 * vw * posDt * 0.35 + sm.offset[0] * decay, 0, w),
+        clamp(sm.box[1] + vy * posDt - 0.5 * vh * posDt * 0.35 + sm.offset[1] * decay, 0, h),
+        clamp(sm.box[2] + vx * posDt + 0.5 * vw * posDt * 0.35 + sm.offset[2] * decay, 0, w),
+        clamp(sm.box[3] + vy * posDt + 0.5 * vh * posDt * 0.35 + sm.offset[3] * decay, 0, h),
       ];
     }
     const [a, b, c, d] = box;

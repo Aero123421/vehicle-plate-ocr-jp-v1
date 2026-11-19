@@ -44,14 +44,14 @@ REGIME_TO_ID: dict[str, int] = {name: i for i, name in enumerate(REGIME_NAMES)}
 
 # Progressive 4-stage curriculum sampling weights over REGIME_NAMES (length 14)
 STAGE_REGIME_WEIGHTS: dict[int, tuple[float, ...]] = {
-    # Stage 1: Clean/mild geometry + color/glyph/IR basics + 4% negative_garbage
-    1: (0.34, 0.08, 0.14, 0.05, 0.12, 0.06, 0.07, 0.02, 0.03, 0.02, 0.02, 0.00, 0.01, 0.04),
-    # Stage 2: Relief parallax, harsh shadows, 850/940nm IR, turn sweep, 8% negative_garbage
-    2: (0.15, 0.09, 0.09, 0.08, 0.10, 0.08, 0.07, 0.05, 0.06, 0.05, 0.04, 0.03, 0.03, 0.08),
-    # Stage 3: Heavy rain droplets, steep oblique, multicam, glare, track_mixed, 11% negative_garbage
-    3: (0.08, 0.08, 0.06, 0.09, 0.09, 0.08, 0.07, 0.08, 0.07, 0.06, 0.05, 0.04, 0.04, 0.11),
-    # Stage 4: Full hard real-world OOD envelope + 12% negative_garbage
-    4: (0.06, 0.07, 0.06, 0.08, 0.09, 0.08, 0.06, 0.08, 0.08, 0.07, 0.06, 0.05, 0.04, 0.12),
+    # Stage 1: Clean/mild geometry + color/glyph/IR basics + 6% negative_garbage
+    1: (0.32, 0.08, 0.14, 0.05, 0.12, 0.06, 0.07, 0.02, 0.03, 0.02, 0.02, 0.00, 0.01, 0.06),
+    # Stage 2: Relief parallax, harsh shadows, 850/940nm IR, turn sweep, 10% negative_garbage
+    2: (0.13, 0.09, 0.09, 0.08, 0.10, 0.08, 0.07, 0.05, 0.06, 0.05, 0.04, 0.03, 0.03, 0.10),
+    # Stage 3: Heavy rain droplets, steep oblique, multicam, glare, track_mixed, 13% negative_garbage
+    3: (0.06, 0.08, 0.06, 0.08, 0.09, 0.08, 0.07, 0.08, 0.08, 0.06, 0.05, 0.04, 0.04, 0.13),
+    # Stage 4: Full hard real-world OOD envelope + 14% negative_garbage
+    4: (0.05, 0.07, 0.06, 0.08, 0.08, 0.07, 0.06, 0.08, 0.09, 0.07, 0.06, 0.05, 0.04, 0.14),
 }
 
 
@@ -196,9 +196,9 @@ def sample_se3_trajectories(
         else torch.zeros((1, 1), device=cpu_dev, dtype=torch.float32)
     )  # (1, T)
 
-    # Stage-dependent maximum angle envelopes
-    max_yaw_std = {1: 24.0, 2: 46.0, 3: 58.0, 4: 64.0}[stage]
-    max_pitch_std = {1: 16.0, 2: 32.0, 3: 42.0, 4: 48.0}[stage]
+    # Stage-dependent maximum angle envelopes (standard oblique extended to ±70° in stage 4)
+    max_yaw_std = {1: 26.0, 2: 50.0, 3: 64.0, 4: 70.0}[stage]
+    max_pitch_std = {1: 16.0, 2: 32.0, 3: 44.0, 4: 50.0}[stage]
     max_roll_std = {1: 4.5, 2: 8.5, 3: 11.5, 4: 13.5}[stage]
 
     # Sample start & end angles per sequence on CPU (B*T ~ 384 scalars -> <0.25ms, zero GPU launch overhead!)
@@ -241,10 +241,10 @@ def sample_se3_trajectories(
     pitch_eff_deg = (pitch_deg - stay_tilt[:, None]).clamp(-32.0, 55.0)
 
     # 2. Target sensor plate width scale:
-    #    - 28% persistent `distant_lowres_sr` (LogUniform(12.0, 26.0) -> [12.0, 28.0] across ALL T frames
-    #      with continuous non-integer sub-pixel translation 0.22..1.45 px/frame sweeping [0, 1)^2 phase!)
-    #    - 27% `approach_far_to_near` (13..22 px -> 78..138 px)
-    #    - 45% `standard_multiscale` (28..130 px)
+    #    - 38% persistent `distant_lowres_sr` (LogUniform(12.0, 26.0) -> [12.0, 28.0] across ALL T frames
+    #      with physically consistent smooth sub-pixel shift 0.15..0.85 source-px/frame sweeping [0, 1)^2!)
+    #    - 24% `approach_far_to_near` (13..22 px -> 78..138 px)
+    #    - 38% `standard_multiscale` (28..130 px)
     min_w_px = {1: 56.0, 2: 38.0, 3: 28.0, 4: 28.0}[stage]
     max_w_px = 130.0
     w_start = min_w_px + u_rand[:, 12] * (max_w_px - min_w_px)
@@ -257,20 +257,20 @@ def sample_se3_trajectories(
     elif approach_prob is not None and float(approach_prob) <= 0.0:
         eff_lr_p = 0.0
     elif stage >= 3 and regime_override is None and seq_len >= 2:
-        eff_lr_p = 0.28
+        eff_lr_p = 0.38
     elif stage == 2 and regime_override is None and seq_len >= 2:
-        eff_lr_p = 0.16
+        eff_lr_p = 0.24
     else:
         eff_lr_p = 0.0
 
     if approach_prob is None:
-        eff_app_p = (0.27 if stage >= 3 else 0.24) if (stage >= 2 and regime_override is None and seq_len >= 4) else 0.0
+        eff_app_p = (0.24 if stage >= 3 else 0.22) if (stage >= 2 and regime_override is None and seq_len >= 4) else 0.0
     else:
         eff_app_p = float(approach_prob) if seq_len >= 3 else 0.0
     eff_app_p = min(eff_app_p, max(0.0, 1.0 - eff_lr_p))
 
     u_app = torch.rand((batch_size, 4), generator=gen, device=cpu_dev)
-    u_lr = torch.rand((batch_size, 6), generator=gen, device=cpu_dev)
+    u_lr = torch.rand((batch_size, 8), generator=gen, device=cpu_dev)
     can_scale_spec = (
         (reg_ids_cpu != REGIME_TO_ID["negative_garbage"])
         & (reg_ids_cpu != REGIME_TO_ID["multicam_rgb_ir"])
@@ -306,6 +306,12 @@ def sample_se3_trajectories(
         torch.where(is_approach_cpu[:, None], w_app_px, w_target_px),
     )
 
+    # Keep persistent 12..26px low-res SR trajectories within physically recoverable viewing angles
+    # (|yaw| <= 42 deg, pitch in [-20, 36] deg) so multi-frame sub-pixel SR has non-zero stroke SNR,
+    # while standard & steep_oblique trajectories retain full +/-70..72 deg oblique envelope!
+    yaw_deg = torch.where(is_lowres_sr_cpu[:, None], yaw_deg.clamp(-42.0, 42.0), yaw_deg)
+    pitch_eff_deg = torch.where(is_lowres_sr_cpu[:, None], pitch_eff_deg.clamp(-20.0, 36.0), pitch_eff_deg)
+
     fx = torch.full((batch_size, seq_len), 1400.0, device=cpu_dev, dtype=torch.float32)
     fy = fx
     cx_cam = torch.full_like(fx, 960.0)
@@ -319,18 +325,33 @@ def sample_se3_trajectories(
     tx_std_mm = tx0_mm[:, None] + vx_mm[:, None] * t_norm
     ty_std_mm = ty0_mm[:, None] + vy_mm[:, None] * t_norm
 
-    # Genuine sub-pixel inter-frame phase sweep (0.22..1.45 px/frame across [0, 1)^2) for lowres_sr!
-    spd_pf = 0.22 + 1.23 * u_lr[:, 2:3]
-    ang_pf = (0.18 + 0.64 * u_lr[:, 3:4]) * (0.5 * math.pi)
+    # Physically consistent sub-pixel inter-frame trajectory (0.15..0.85 source-px/frame across [0, 1)^2)
+    # Smooth constant velocity + gentle quadratic lane-curve drift + <= 0.045px camera vibration so
+    # multi-frame super-resolution across T=16..24 frames is genuinely solvable from sub-pixel phase diversity!
+    spd_pf = 0.15 + 0.70 * u_lr[:, 2:3]
+    ang_pf = (0.15 + 0.70 * u_lr[:, 3:4]) * (0.5 * math.pi)
     sgn_x = torch.where(u_lr[:, 4:5] < 0.5, -1.0, 1.0)
     sgn_y = torch.where(u_lr[:, 5:6] < 0.5, -1.0, 1.0)
     t_steps = torch.arange(seq_len, device=cpu_dev, dtype=torch.float32)[None, :]
+    t_quad = (t_norm - 0.5) ** 2
     phi_sub = u_lr[:, 0:1] * (2.0 * math.pi)
-    du_sub_px = u_lr[:, 4:5] + sgn_x * spd_pf * torch.cos(ang_pf) * t_steps + 0.19 * torch.sin(t_steps * 1.618034 + phi_sub)
-    dv_sub_px = u_lr[:, 5:6] + sgn_y * spd_pf * torch.sin(ang_pf) * t_steps + 0.17 * torch.cos(t_steps * 2.236068 + phi_sub)
+    curv_x = (u_lr[:, 6:7] * 2.0 - 1.0) * 0.28
+    curv_y = (u_lr[:, 7:8] * 2.0 - 1.0) * 0.20
+    du_sub_px = (
+        u_lr[:, 4:5]
+        + sgn_x * spd_pf * torch.cos(ang_pf) * t_steps
+        + curv_x * t_quad
+        + 0.045 * torch.sin(t_steps * 0.85 + phi_sub)
+    )
+    dv_sub_px = (
+        u_lr[:, 5:6]
+        + sgn_y * spd_pf * torch.sin(ang_pf) * t_steps
+        + curv_y * t_quad
+        + 0.040 * torch.cos(t_steps * 1.15 + phi_sub)
+    )
     mm_per_px = depth_mm / fx
-    tx_lr_mm = tx0_mm[:, None] * 0.35 + du_sub_px * mm_per_px
-    ty_lr_mm = ty0_mm[:, None] * 0.35 + dv_sub_px * mm_per_px
+    tx_lr_mm = tx0_mm[:, None] * 0.30 + du_sub_px * mm_per_px
+    ty_lr_mm = ty0_mm[:, None] * 0.30 + dv_sub_px * mm_per_px
     tx_mm = torch.where(is_lowres_sr_cpu[:, None], tx_lr_mm, tx_std_mm)
     ty_mm = torch.where(is_lowres_sr_cpu[:, None], ty_lr_mm, ty_std_mm)
 
@@ -459,7 +480,7 @@ def sample_se3_trajectories(
         near_sharp = is_approach_cpu[:, None] & (t_norm >= 0.74)
         motion_vec_px = torch.where(
             is_lowres_sr_cpu[:, None, None],
-            motion_vec_px.clamp(-1.4, 1.4),
+            motion_vec_px.clamp(-1.0, 1.0),
             torch.where(
                 near_sharp[:, :, None],
                 motion_vec_px * 0.28,

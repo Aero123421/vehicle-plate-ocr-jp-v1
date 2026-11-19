@@ -489,3 +489,291 @@ export function trackPlateOnRgba(ref, rgba, w, h, initCorners, opts) {
 export function trackPlateOnGray(ref, gray, gw, gh, initCorners, opts) {
   return trackPlateOpticalCore(ref, (x, y) => sampleGrayBilinear(gray, gw, gh, x, y), gw, gh, initCorners, opts);
 }
+
+// ==============================================================================
+// Lightweight 16x16 Patch-NCC + 24D RGB Histogram + 32D Appearance Vehicle Tracker
+// ==============================================================================
+export const VEH_TPL_W = 16;
+export const VEH_TPL_H = 16;
+const VEH_N = VEH_TPL_W * VEH_TPL_H; // 256
+const VEH_CW = 8;
+const VEH_CH = 8;
+const VEH_CN = VEH_CW * VEH_CH; // 64
+
+const vehFineBuf = new Float32Array(VEH_N);
+const vehCoarseBuf = new Float32Array(VEH_CN);
+
+function sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf) {
+  const stepX = iw / gw;
+  const stepY = ih / gh;
+  const maxX = w - 1;
+  const maxY = h - 1;
+  let sum = 0;
+  let idx = 0;
+  for (let j = 0; j < gh; j++) {
+    const py = clamp(iy0 + dy + (j + 0.5) * stepY, 0, maxY);
+    const y0 = py | 0;
+    const y1 = y0 < maxY ? y0 + 1 : y0;
+    const fy = py - y0;
+    const row0 = y0 * w;
+    const row1 = y1 * w;
+    for (let i = 0; i < gw; i++) {
+      const px = clamp(ix0 + dx + (i + 0.5) * stepX, 0, maxX);
+      const x0 = px | 0;
+      const x1 = x0 < maxX ? x0 + 1 : x0;
+      const fx = px - x0;
+      const a = (row0 + x0) * 4;
+      const b = (row0 + x1) * 4;
+      const d = (row1 + x0) * 4;
+      const e = (row1 + x1) * 4;
+      const la = 0.299 * rgba[a] + 0.587 * rgba[a + 1] + 0.114 * rgba[a + 2];
+      const lb = 0.299 * rgba[b] + 0.587 * rgba[b + 1] + 0.114 * rgba[b + 2];
+      const ld = 0.299 * rgba[d] + 0.587 * rgba[d + 1] + 0.114 * rgba[d + 2];
+      const le = 0.299 * rgba[e] + 0.587 * rgba[e + 1] + 0.114 * rgba[e + 2];
+      const val =
+        la * (1 - fx) * (1 - fy) +
+        lb * fx * (1 - fy) +
+        ld * (1 - fx) * fy +
+        le * fx * fy;
+      outBuf[idx++] = val;
+      sum += val;
+    }
+  }
+  return sum / (gw * gh);
+}
+
+export function extractVehicleAppearanceRgba(rgba, w, h, box) {
+  const bw = box[2] - box[0];
+  const bh = box[3] - box[1];
+  if (bw < 10 || bh < 10) return null;
+  // Interior 80% crop avoids background road/sky bleeding into the vehicle descriptor.
+  const ix0 = box[0] + 0.10 * bw;
+  const iy0 = box[1] + 0.10 * bh;
+  const iw = Math.max(4, 0.80 * bw);
+  const ih = Math.max(4, 0.80 * bh);
+  const stepX = iw / VEH_TPL_W;
+  const stepY = ih / VEH_TPL_H;
+  const maxX = w - 1;
+  const maxY = h - 1;
+
+  const rawLuma = new Float32Array(VEH_N);
+  const histCounts = new Float32Array(24);
+  const spatial8 = new Float32Array(8);
+  let sumY = 0;
+  let idx = 0;
+  for (let j = 0; j < VEH_TPL_H; j++) {
+    const py = clamp(iy0 + (j + 0.5) * stepY, 0, maxY);
+    const y0 = py | 0;
+    const row = y0 * w;
+    const bandY = j >> 2; // 0..3
+    for (let i = 0; i < VEH_TPL_W; i++) {
+      const px = clamp(ix0 + (i + 0.5) * stepX, 0, maxX);
+      const x0 = px | 0;
+      const p = (row + x0) * 4;
+      const r = rgba[p];
+      const g = rgba[p + 1];
+      const b = rgba[p + 2];
+      const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+      rawLuma[idx++] = luma;
+      sumY += luma;
+      histCounts[Math.min(7, r >> 5)] += 1;
+      histCounts[8 + Math.min(7, g >> 5)] += 1;
+      histCounts[16 + Math.min(7, b >> 5)] += 1;
+      const halfX = i >> 3; // 0..1
+      spatial8[bandY * 2 + halfX] += luma;
+    }
+  }
+
+  // 24D RGB Bhattacharyya-normalized histogram (dot product in [0, 1]).
+  const colorHist = new Float32Array(24);
+  const inv3N = 1 / (3 * VEH_N);
+  for (let k = 0; k < 24; k++) {
+    colorHist[k] = Math.sqrt(histCounts[k] * inv3N);
+  }
+
+  // 32D L2-normalized appearance descriptor = 24D RGB hist + 8D spatial 4x2 luma profile.
+  const app32 = new Float32Array(32);
+  let appSq = 0;
+  for (let k = 0; k < 24; k++) {
+    app32[k] = colorHist[k];
+    appSq += app32[k] * app32[k];
+  }
+  const spInv = 1 / (32 * 255);
+  let spMean = 0;
+  for (let k = 0; k < 8; k++) {
+    spatial8[k] *= spInv;
+    spMean += spatial8[k];
+  }
+  spMean /= 8;
+  for (let k = 0; k < 8; k++) {
+    const v = 0.85 * (spatial8[k] - spMean);
+    app32[24 + k] = v;
+    appSq += v * v;
+  }
+  const appInv = appSq > 1e-12 ? 1 / Math.sqrt(appSq) : 0;
+  for (let k = 0; k < 32; k++) app32[k] *= appInv;
+
+  // 16x16 zero-mean unit-L2-norm bilinear grayscale template matching trackVehiclePatchNccRgba exactly.
+  const mu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, 0, 0, VEH_TPL_W, VEH_TPL_H, rawLuma);
+  let sq = 0;
+  for (let k = 0; k < VEH_N; k++) {
+    const d = rawLuma[k] - mu;
+    rawLuma[k] = d;
+    sq += d * d;
+  }
+  const tplStd = Math.sqrt(sq / VEH_N);
+  if (tplStd < 1.5) {
+    return { tpl: null, coarse: null, tplStd, colorHist, app32 };
+  }
+  const invNorm = 1 / Math.sqrt(sq);
+  const tpl = new Float32Array(VEH_N);
+  for (let k = 0; k < VEH_N; k++) tpl[k] = rawLuma[k] * invNorm;
+
+  // 8x8 bilinear coarse template matching evalCoarse sampling coordinates identically.
+  const coarse = new Float32Array(VEH_CN);
+  const cMu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, 0, 0, VEH_CW, VEH_CH, coarse);
+  let cSq = 0;
+  for (let k = 0; k < VEH_CN; k++) {
+    coarse[k] -= cMu;
+    cSq += coarse[k] * coarse[k];
+  }
+  const cInv = cSq > 1e-12 ? 1 / Math.sqrt(cSq) : 0;
+  for (let k = 0; k < VEH_CN; k++) coarse[k] *= cInv;
+
+  return { tpl, coarse, tplStd, colorHist, app32 };
+}
+
+export function trackVehiclePatchNccRgba(
+  vehRef,
+  rgba,
+  w,
+  h,
+  predBox,
+  { maxShiftPx = 24, minNcc = 0.42 } = {}
+) {
+  if (!vehRef?.tpl || !vehRef?.coarse) {
+    return { ok: false, ncc: 0, dx: 0, dy: 0, box: predBox };
+  }
+  const bw = predBox[2] - predBox[0];
+  const bh = predBox[3] - predBox[1];
+  if (bw < 10 || bh < 10) {
+    return { ok: false, ncc: 0, dx: 0, dy: 0, box: predBox };
+  }
+  const ix0 = predBox[0] + 0.10 * bw;
+  const iy0 = predBox[1] + 0.10 * bh;
+  const iw = Math.max(4, 0.80 * bw);
+  const ih = Math.max(4, 0.80 * bh);
+  const tpl = vehRef.tpl;
+  const coarse = vehRef.coarse;
+  const tplStd = vehRef.tplStd ?? 0;
+
+  const evalCoarse = (dx, dy) => {
+    const cx = predBox[0] + 0.5 * bw + dx;
+    const cy = predBox[1] + 0.5 * bh + dy;
+    if (cx < -0.35 * bw || cx > w + 0.35 * bw || cy < -0.35 * bh || cy > h + 0.35 * bh) return -1;
+    const mu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, VEH_CW, VEH_CH, vehCoarseBuf);
+    let sq = 0, dot = 0;
+    for (let k = 0; k < VEH_CN; k++) {
+      const d = vehCoarseBuf[k] - mu;
+      sq += d * d;
+      dot += d * coarse[k];
+    }
+    if (sq < 2.25 * VEH_CN) return -1;
+    return dot / Math.sqrt(sq);
+  };
+
+  const evalFine = (dx, dy) => {
+    const cx = predBox[0] + 0.5 * bw + dx;
+    const cy = predBox[1] + 0.5 * bh + dy;
+    if (cx < -0.35 * bw || cx > w + 0.35 * bw || cy < -0.35 * bh || cy > h + 0.35 * bh) return 0;
+    const mu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, VEH_TPL_W, VEH_TPL_H, vehFineBuf);
+    let sq = 0, dot = 0;
+    for (let k = 0; k < VEH_N; k++) {
+      const d = vehFineBuf[k] - mu;
+      sq += d * d;
+      dot += d * tpl[k];
+    }
+    const candStd = Math.sqrt(sq / VEH_N);
+    if (candStd < 1.8) return 0;
+    let ncc = dot / Math.sqrt(sq);
+    // Prevent high-contrast vehicle templates from matching low-contrast flat asphalt noise.
+    if (tplStd > 10.0 && candStd < 0.20 * tplStd) {
+      ncc *= candStd / (0.20 * tplStd);
+    }
+    return ncc;
+  };
+
+  const rad = Math.max(4, Math.round(maxShiftPx));
+  const invRadSq = 1 / (rad * rad);
+
+  // Stage 1: Coarse 8px grid across [-rad, +rad] on 8x8 pooled template.
+  let bestDx = 0, bestDy = 0;
+  let bestPen = evalCoarse(0, 0);
+  const step1 = Math.max(4, Math.round(rad / 3));
+  for (let dy = -rad; dy <= rad; dy += step1) {
+    for (let dx = -rad; dx <= rad; dx += step1) {
+      if (dx === 0 && dy === 0) continue;
+      const sc = evalCoarse(dx, dy);
+      const pen = sc - 0.015 * (dx * dx + dy * dy) * invRadSq;
+      if (pen > bestPen) {
+        bestPen = pen;
+        bestDx = dx;
+        bestDy = dy;
+      }
+    }
+  }
+
+  // Stage 2: Medium 3px refinement on 8x8 pooled template around coarse peak.
+  const b1x = bestDx, b1y = bestDy;
+  const step2 = Math.max(2, Math.round(step1 / 2.5));
+  for (let iy = -2; iy <= 2; iy++) {
+    const dy = clamp(b1y + iy * step2, -rad, rad);
+    for (let ix = -2; ix <= 2; ix++) {
+      if (ix === 0 && iy === 0) continue;
+      const dx = clamp(b1x + ix * step2, -rad, rad);
+      const sc = evalCoarse(dx, dy);
+      const pen = sc - 0.015 * (dx * dx + dy * dy) * invRadSq;
+      if (pen > bestPen) {
+        bestPen = pen;
+        bestDx = dx;
+        bestDy = dy;
+      }
+    }
+  }
+
+  // Stage 3: Exact 16x16 fine search (4px -> 2px -> 1px step).
+  let bestFine = evalFine(bestDx, bestDy);
+  let bestFinePen = bestFine - 0.010 * (bestDx * bestDx + bestDy * bestDy) * invRadSq;
+  for (const step of [4, 2, 1]) {
+    const cx0 = bestDx, cy0 = bestDy;
+    for (let iy = -1; iy <= 1; iy++) {
+      const dy = clamp(cy0 + iy * step, -rad, rad);
+      for (let ix = -1; ix <= 1; ix++) {
+        if (ix === 0 && iy === 0) continue;
+        const dx = clamp(cx0 + ix * step, -rad, rad);
+        const sc = evalFine(dx, dy);
+        const pen = sc - 0.010 * (dx * dx + dy * dy) * invRadSq;
+        if (pen > bestFinePen) {
+          bestFinePen = pen;
+          bestFine = sc;
+          bestDx = dx;
+          bestDy = dy;
+        }
+      }
+    }
+  }
+
+  const shiftedBox = [
+    clamp(predBox[0] + bestDx, 0, w),
+    clamp(predBox[1] + bestDy, 0, h),
+    clamp(predBox[2] + bestDx, 0, w),
+    clamp(predBox[3] + bestDy, 0, h),
+  ];
+  return {
+    ok: bestFine >= minNcc,
+    ncc: bestFine,
+    dx: bestDx,
+    dy: bestDy,
+    box: shiftedBox,
+  };
+}

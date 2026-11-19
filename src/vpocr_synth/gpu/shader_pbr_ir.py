@@ -250,7 +250,7 @@ def _brdf_core_impl(
     base_pol_flat: torch.Tensor,   # (N,) float32 (+1 bright bg, -1 dark bg)
     ir_pow: torch.Tensor,          # (N, 1, 1, 1)
     g_amp: torch.Tensor,           # (N, 1, 1, 1)
-    rand_u: torch.Tensor,          # (N, 6) float32 in [0, 1)
+    rand_u: torch.Tensor,          # (N, 12) float32 in [0, 1) (0..5 frame, 6..11 seq-coherent)
     c_day: torch.Tensor,
     c_sky: torch.Tensor,
     c_sod: torch.Tensor,
@@ -308,7 +308,25 @@ def _brdf_core_impl(
     glare_lobe = torch.exp(-d2_glare / (eff_rough.squeeze(1) * 2.2 + 0.15)).unsqueeze(1)
     spec_term = g_amp * glare_lobe * (0.35 + 0.85 * metal + 0.45 * wet_rain) * (0.4 + 0.6 * ndotv)
 
-    u_col = rand_u[:, 5:6]
+    # Half-plate sunlight specular glare (sequence-coherent slanted specular veil on ~24% of daytime/dusk/oblique RGB frames)
+    has_half_sun = (~night_bt) & (ir_bt == 0) & (rand_u[:, 6] < 0.24)
+    sun_ang = rand_u[:, 7] * (2.0 * 3.14159265)
+    sun_nx = torch.cos(sun_ang)[:, None, None]
+    sun_ny = (0.75 * torch.sin(sun_ang))[:, None, None]
+    sun_off = ((rand_u[:, 8] * 2.0 - 1.0) * 58.0)[:, None, None]
+    sun_proj = (x_hit - 165.0) * sun_nx + (y_hit - 82.5) * sun_ny - sun_off
+    half_sun_mask = torch.sigmoid(sun_proj * 0.055).unsqueeze(1)
+    half_sun_amp = (0.42 + 0.64 * rand_u[:, 9])[:, None, None, None]
+    half_sun_glare = (
+        has_half_sun[:, None, None, None].float()
+        * half_sun_amp
+        * half_sun_mask
+        * (0.55 + 0.45 * ndotv)
+        * (0.70 + 0.30 * (1.0 - eff_rough))
+    )
+
+    # Sequence-coherent ambient/streetlight color temperature (prevents unrealistic frame-to-frame tint flicker in bursts)
+    u_col = (0.85 * rand_u[:, 12:13] + 0.15 * rand_u[:, 5:6]).clamp(0.0, 0.9999)
     night_tint = torch.where(u_col < 0.36, c_sod, torch.where(u_col < 0.58, c_mer, c_led))
     # Cool open-sky / outdoor-shade AWB / blue-white LED fog-lamp stray-light reflections on ~32% of daytime/overcast/rain/dusk frames
     cool_sky_w = torch.clamp((u_col - 0.68) / 0.32, 0.0, 1.0)
@@ -317,9 +335,29 @@ def _brdf_core_impl(
     illum_tint = torch.where(night_bt[:, None], night_tint, day_tint)[:, :, None, None]
     spec_tint = torch.where(night_bt[:, None], night_tint, spec_day_tint)[:, :, None, None]
 
-    rear_night_rgb = night_bt & (ir_bt == 0) & (sides_bt == 1)
-    edge_prox = torch.exp(-torch.minimum(x_hit, 330.0 - x_hit).clamp_min(0.0) / 55.0).unsqueeze(1)
-    brake_spill = rear_night_rgb[:, None, None, None].float() * edge_prox * c_brake
+    # Rear brake-light crimson wash: strong at night/dusk/rain, subtle on shadowed daytime rear plates (never neon-pink in bright sun!)
+    rear_rgb = (ir_bt == 0) & (sides_bt == 1)
+    low_amb_rear = night_bt | (reg_bt == 2) | (reg_bt == 7)
+    brake_active = rear_rgb & (low_amb_rear | ((reg_bt == 1) & (rand_u[:, 10] < 0.32)))
+    edge_prox = torch.exp(-torch.minimum(x_hit, 330.0 - x_hit).clamp_min(0.0) / 68.0).unsqueeze(1)
+    top_prox = torch.exp(-y_hit.clamp_min(0.0) / 48.0).unsqueeze(1)
+    side_one = torch.exp(-x_hit.clamp_min(0.0) / 88.0).unsqueeze(1)
+    brake_pat = rand_u[:, 11][:, None, None, None]
+    brake_spatial = torch.where(
+        brake_pat < 0.45,
+        edge_prox,
+        torch.where(brake_pat < 0.78, torch.maximum(edge_prox * 0.82, top_prox * 0.88), side_one),
+    )
+    brake_gain = torch.where(
+        night_bt[:, None, None, None],
+        0.55 + 0.75 * rand_u[:, 10][:, None, None, None],
+        torch.where(
+            low_amb_rear[:, None, None, None],
+            0.28 + 0.42 * rand_u[:, 10][:, None, None, None],
+            0.14 + 0.18 * rand_u[:, 10][:, None, None, None],
+        ),
+    )
+    brake_spill = brake_active[:, None, None, None].float() * brake_gain * brake_spatial * c_brake
 
     night_illum_active = night_bt & (ir_bt == 0) & illum_flat
     amb_level = torch.where(night_illum_active, 0.08, torch.where(night_bt, 0.22, 0.34))[:, None, None, None]
@@ -356,7 +394,14 @@ def _brdf_core_impl(
         * c_sky[:, :, None, None]
     )
     emis_gain = torch.where(night_bt[:, None, None, None], 1.15, 0.08)
-    hdr_vis = diffuse_and_retro + spec_term * spec_tint + cool_sheen + dark_sky_sheen + emis_rgb * emis_gain + brake_spill
+    hdr_vis = (
+        diffuse_and_retro
+        + (spec_term + half_sun_glare) * spec_tint
+        + cool_sheen
+        + dark_sky_sheen
+        + emis_rgb * emis_gain
+        + brake_spill
+    )
 
     is_940 = (ir_bt == 2)[:, None, None, None]
     qe_nir = torch.where(is_940, 0.58, 0.92)
@@ -375,29 +420,101 @@ def _garbage_roi_impl(
     xx: torch.Tensor,
     r_params: torch.Tensor,
     low_tex_in: torch.Tensor,
+    noise_in: torch.Tensor,
     is_ir: torch.Tensor,
 ) -> torch.Tensor:
+    """6 diverse sequence-coherent adversarial non-plate modes (grilles, glossy blobs, stripes, headlights, blank metal, noise)."""
     n_bt = is_ir.shape[0]
-    freq_y = (6.0 + 18.0 * r_params[:, 0:1, None, None])
-    freq_x = (4.0 + 16.0 * r_params[:, 1:2, None, None])
+    freq_y = 6.0 + 18.0 * r_params[:, 0:1, None, None]
+    freq_x = 4.0 + 16.0 * r_params[:, 1:2, None, None]
     mode = r_params[:, 2:3, None, None]
+    dx = (r_params[:, 3:4, None, None] - 0.5) * 0.36
+    dy = (r_params[:, 4:5, None, None] - 0.5) * 0.30
+    t_hue = r_params[:, 5:6, None, None]
+    t_sat = r_params[:, 6:7, None, None]
+    t_gain = 0.55 + 0.65 * r_params[:, 7:8, None, None]
 
-    slats = 0.12 + 0.55 * (torch.sin(yy * 3.14159265 * freq_y) > 0.35).float()
-    ribs = 0.08 + 0.25 * (torch.sin(xx * 3.14159265 * freq_x) > 0.65).float()
+    xx_s = xx + dx
+    yy_s = yy + dy
+
+    # Mode 0: Chrome/black radiator grille slats & ribs
+    slats = 0.12 + 0.55 * (torch.sin(yy_s * 3.14159265 * freq_y) > 0.35).float()
+    ribs = 0.08 + 0.25 * (torch.sin(xx_s * 3.14159265 * freq_x) > 0.65).float()
     grille = (slats + ribs).expand(n_bt, 3, SENSOR_ROI_H, SENSOR_ROI_W)
 
+    # Mode 1: Glossy white / pink / pastel specular vehicle-body blobs
+    bx1 = 0.28 + 0.44 * r_params[:, 0:1, None, None] + dx * 0.5
+    by1 = 0.26 + 0.48 * r_params[:, 1:2, None, None] + dy * 0.5
+    bx2 = 0.68 - 0.36 * r_params[:, 0:1, None, None] + dx * 0.5
+    by2 = 0.62 - 0.34 * r_params[:, 1:2, None, None] + dy * 0.5
+    blob1 = torch.exp(-(((xx - bx1) / 0.22) ** 2 + ((yy - by1) / 0.18) ** 2))
+    blob2 = torch.exp(-(((xx - bx2) / 0.16) ** 2 + ((yy - by2) / 0.14) ** 2))
+    blob_r = torch.where(t_hue < 0.55, 0.94, 0.90 - 0.18 * t_sat)
+    blob_g = torch.where(t_hue < 0.55, 0.72 + 0.22 * (1.0 - t_sat), 0.90)
+    blob_b = torch.where(t_hue < 0.55, 0.80 + 0.16 * (1.0 - t_sat), 0.94)
+    blob_col = torch.cat([blob_r, blob_g, blob_b], dim=1)
+    glossy_blob = (0.14 + 0.24 * yy_s.clamp(0.0, 1.0)) * blob_col + (1.05 * blob1 + 0.75 * blob2) * torch.cat(
+        [torch.ones_like(blob_r), 0.88 + 0.12 * (1.0 - t_sat), 0.92 + 0.08 * (1.0 - t_sat)], dim=1
+    )
+
+    # Mode 2: Yellow-black or red-white diagonal hazard stripes
+    stripe_phase = torch.sin((xx_s * 1.45 + yy_s * (0.75 + 0.65 * r_params[:, 0:1, None, None])) * (3.14159265 * (5.0 + 7.0 * r_params[:, 1:2, None, None])))
+    st_m = (stripe_phase > 0.0).float()
+    yb_r = 0.08 + 0.86 * st_m
+    yb_g = 0.08 + 0.74 * st_m
+    yb_b = 0.08 + 0.06 * st_m
+    rw_r = 0.86 + 0.08 * st_m
+    rw_g = 0.14 + 0.78 * st_m
+    rw_b = 0.14 + 0.78 * st_m
+    haz_yb = torch.cat([yb_r, yb_g, yb_b], dim=1)
+    haz_rw = torch.cat([rw_r, rw_g, rw_b], dim=1)
+    stripes = torch.where(t_hue < 0.60, haz_yb, haz_rw) * t_gain
+
+    # Mode 3: Dual blinding headlights / red brake-lamp halos on dark background
     low_tex = F.interpolate(
-        low_tex_in * 0.35,
+        low_tex_in * 0.28,
         size=(SENSOR_ROI_H, SENSOR_ROI_W),
         mode="bilinear",
         align_corners=False,
     )
-    lamp = 1.6 * torch.exp(-(((xx - 0.32) ** 2 + (yy - 0.48) ** 2) / 0.025))
-    asphalt = low_tex + lamp
+    hl_l = 2.1 * torch.exp(-(((xx - (0.26 + dx * 0.4)) ** 2) / 0.018 + ((yy - (0.48 + dy * 0.4)) ** 2) / 0.026))
+    hl_r = 1.9 * torch.exp(-(((xx - (0.74 + dx * 0.4)) ** 2) / 0.018 + ((yy - (0.48 + dy * 0.4)) ** 2) / 0.026))
+    is_red_lamp = t_hue > 0.58
+    lamp_col = torch.cat(
+        [
+            torch.ones_like(t_hue),
+            torch.where(is_red_lamp, torch.full_like(t_hue, 0.12), torch.full_like(t_hue, 0.95)),
+            torch.where(is_red_lamp, torch.full_like(t_hue, 0.10), torch.full_like(t_hue, 0.86)),
+        ],
+        dim=1,
+    )
+    headlights = low_tex + (hl_l + hl_r) * lamp_col
 
-    out = torch.where(mode < 0.55, grille, asphalt)
-    mono = out.mean(dim=1, keepdim=True).expand_as(out)
-    return torch.where(is_ir[:, None, None, None], mono, out)
+    # Mode 4: Pure blank brushed metal / painted body panel with horizontal seam & two bolts
+    metal_base = (0.48 + 0.36 * t_gain) * (0.86 + 0.18 * (1.0 - yy_s).clamp(0.0, 1.0)) + 0.03 * torch.sin(yy_s * 140.0)
+    seam = 1.0 - 0.55 * torch.exp(-(((yy_s - (0.28 + 0.44 * r_params[:, 0:1, None, None])) / 0.022) ** 2))
+    bolt_l = 1.0 - 0.65 * torch.exp(-(((xx_s - 0.22) ** 2 + (yy_s - 0.18) ** 2) / 0.0012))
+    bolt_r = 1.0 - 0.65 * torch.exp(-(((xx_s - 0.78) ** 2 + (yy_s - 0.18) ** 2) / 0.0012))
+    blank_metal = (metal_base * seam * bolt_l * bolt_r).expand(n_bt, 3, SENSOR_ROI_H, SENSOR_ROI_W)
+
+    # Mode 5: Extreme multi-scale static & block clutter noise
+    extreme_noise = (0.12 + 0.78 * noise_in + 0.35 * low_tex).clamp(0.0, 1.25)
+
+    out = torch.where(
+        mode < 0.18,
+        grille,
+        torch.where(
+            mode < 0.36,
+            glossy_blob,
+            torch.where(
+                mode < 0.54,
+                stripes,
+                torch.where(mode < 0.72, headlights, torch.where(mode < 0.86, blank_metal, extreme_noise)),
+            ),
+        ),
+    )
+    mono = (0.299 * out[:, 0:1] + 0.587 * out[:, 1:2] + 0.114 * out[:, 2:3]).expand_as(out)
+    return torch.where(is_ir[:, None, None, None], mono, out).clamp_min(0.0)
 
 
 def _shader_slot_tail_impl(
@@ -787,6 +904,8 @@ class ReliefPBRShaderGPU:
             )[:, None, None, None]
 
         # 4. Fused Multi-Spectral BRDF & NIR Shader
+        seq_fx = torch.rand((bsz, 7), generator=gen, device=dev)[:, None, :].expand(bsz, seq_len, 7).reshape(n_bt, 7)
+        brdf_rand_u = torch.cat([rand_pack[:, 7:13], seq_fx], dim=1).contiguous()
         hdr_roi, gx_c, gy_c, steep_dropoff = _dispatch_cuda(
             "brdf",
             _brdf_core_impl,
@@ -805,7 +924,7 @@ class ReliefPBRShaderGPU:
             base_pol_bt.reshape(n_bt),
             ir_pow,
             g_amp,
-            rand_pack[:, 7:13].contiguous(),
+            brdf_rand_u,
             c_day,
             c_sky,
             c_sod,
@@ -816,7 +935,7 @@ class ReliefPBRShaderGPU:
         )
         del sampled, x_hit, y_hit, h_hit_flat, h_lblk
 
-        # Sparse CPU-indexed negative_garbage ROI synthesis (68% NonPlateStencilAtlas text-bearing signs/decals + 32% procedural grilles!)
+        # Sparse CPU-indexed negative_garbage ROI synthesis (60% 72-template NonPlateStencilAtlas + 40% 6-mode procedural!)
         garb_seq_idx = [i for i, tag in enumerate(traj.regime_tags) if tag == "negative_garbage"]
         if garb_seq_idx:
             hdr_bt = hdr_roi.reshape(bsz, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W)
@@ -824,8 +943,19 @@ class ReliefPBRShaderGPU:
             n_g_seq = len(garb_seq_idx)
             n_g = n_g_seq * seq_len
             is_ir_g = (traj.sensor_ir_mode.index_select(0, idx_g) > 0).reshape(n_g)
-            r_garb = torch.rand((n_g, 3), generator=gen, device=dev)
+            r_garb_seq = torch.rand((n_g_seq, 8), generator=gen, device=dev)
+            t_lin_g = (
+                torch.linspace(-0.5, 0.5, seq_len, device=dev, dtype=torch.float32)[None, :]
+                if seq_len > 1
+                else torch.zeros((1, 1), device=dev, dtype=torch.float32)
+            )
+            r_garb_bt = r_garb_seq[:, None, :].expand(n_g_seq, seq_len, 8).clone()
+            # Smooth temporal drift in dx/dy channels (3, 4) across frames
+            r_garb_bt[:, :, 3] = (r_garb_bt[:, :, 3] + 0.14 * t_lin_g).clamp(0.0, 1.0)
+            r_garb_bt[:, :, 4] = (r_garb_bt[:, :, 4] + 0.10 * t_lin_g).clamp(0.0, 1.0)
+            r_garb = r_garb_bt.reshape(n_g, 8)
             low_tex_g = torch.rand((n_g, 3, 7, 11), generator=gen, device=dev)
+            noise_g = torch.rand((n_g, 3, SENSOR_ROI_H, SENSOR_ROI_W), generator=gen, device=dev)
             proc_garb = _dispatch_cuda(
                 "garbage",
                 _garbage_roi_impl,
@@ -833,6 +963,7 @@ class ReliefPBRShaderGPU:
                 xx_roi,
                 r_garb,
                 low_tex_g,
+                noise_g,
                 is_ir_g,
             ).reshape(n_g_seq, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W)
 
@@ -841,11 +972,6 @@ class ReliefPBRShaderGPU:
             st_seq = stencil_bank.index_select(0, st_idx)  # (G, 3, 96, 160)
             # Project text-bearing non-plate stencil across T trajectory frames with consistent drift
             st_u = torch.rand((n_g_seq, 6), generator=gen, device=dev)
-            t_lin_g = (
-                torch.linspace(-0.5, 0.5, seq_len, device=dev, dtype=torch.float32)[None, :]
-                if seq_len > 1
-                else torch.zeros((1, 1), device=dev, dtype=torch.float32)
-            )
             sx_g = (0.78 + 0.42 * st_u[:, 0:1]).expand(n_g_seq, seq_len).reshape(n_g, 1)
             sy_g = (0.78 + 0.42 * st_u[:, 1:2]).expand(n_g_seq, seq_len).reshape(n_g, 1)
             sh_g = (-0.12 + 0.24 * st_u[:, 2:3]).expand(n_g_seq, seq_len).reshape(n_g, 1)
@@ -872,7 +998,7 @@ class ReliefPBRShaderGPU:
             st_bt = torch.where(is_ir_g[:, None, None, None], st_mono, st_bt).reshape(
                 n_g_seq, seq_len, 3, SENSOR_ROI_H, SENSOR_ROI_W
             )
-            use_stencil = (torch.rand((n_g_seq, 1, 1, 1, 1), generator=gen, device=dev) < 0.68)
+            use_stencil = (torch.rand((n_g_seq, 1, 1, 1, 1), generator=gen, device=dev) < 0.60)
             hdr_bt[idx_g] = torch.where(use_stencil, st_bt, proc_garb)
             hdr_roi = hdr_bt.reshape(n_bt, 3, SENSOR_ROI_H, SENSOR_ROI_W)
 

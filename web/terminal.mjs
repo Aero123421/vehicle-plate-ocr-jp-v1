@@ -27,9 +27,11 @@ export async function unpackGrammar(table) {
 // Receives one sealed readout, the precision state and calibrated episode support.
 export function terminalDecision(readout, memory, frames, support, table, policy) {
   const cal = policy.terminal, cfg = policy.session;
-  const precision = Array.from({length:12}, (_,s) => mean(Array.from(memory.mem_P.data.slice(s*112,(s+1)*112), x => Number.isFinite(x) ? Math.max(0,x) : 0)));
+  const dModel = memory.mem_P.dims?.[2] ?? Math.max(1, Math.floor(memory.mem_P.data.length / 12));
+  const vocabSize = readout.slot_logits.dims?.[2] ?? Math.max(1, Math.floor(readout.slot_logits.data.length / 12));
+  const precision = Array.from({length:12}, (_,s) => mean(Array.from(memory.mem_P.data.slice(s*dModel,(s+1)*dModel), x => Number.isFinite(x) ? Math.max(0,x) : 0)));
   const lp = Array.from({length:12}, (_,s) => {
-    const row = Array.from(readout.slot_logits.data.slice(s*254,(s+1)*254), x => precision[s] > 0 ? clean(x)/cal.temperature : 0);
+    const row = Array.from(readout.slot_logits.data.slice(s*vocabSize,(s+1)*vocabSize), x => precision[s] > 0 ? clean(x)/cal.temperature : 0);
     const z = lse(row); return row.map(x => x-z);
   });
   const reg = table.regions.map(row => sum(row.map((id,s) => lp[s][id])));

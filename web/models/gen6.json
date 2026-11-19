@@ -7,7 +7,7 @@
   },
   "session": {
     "C_abstain": 0.32,
-    "C_abstain_full": 0.25,
+    "C_abstain_full": 0.3,
     "C_wrong": 1.0,
     "C_wrong_full": 1.0,
     "field_abstain_costs": {
@@ -19,37 +19,37 @@
     "risk_calibrated": false
   },
   "terminal": {
-    "conflict_weight": 3.748158924818186e-45,
+    "conflict_weight": 1.6703921206977137e-06,
     "identity_probability": 1.0,
-    "mixed_bias": -1.569940333356147,
+    "mixed_bias": -1.5031689070678271,
     "mixed_logit_scale": 1.0,
-    "null_bias": -1.1467334450219335,
-    "null_temperature": 0.5,
-    "readability_weight": 19.939472229359833,
+    "null_bias": 0.9796671686227105,
+    "null_temperature": 0.6000000005055048,
+    "readability_weight": 2.3278672970218053,
     "readout_precision_ceiling": 48.0,
-    "support_weight": 0.18030725843169287,
-    "temperature": 0.821096051658762
+    "support_weight": 0.6361972065101109,
+    "temperature": 0.7719298406193449
   },
   "tracker": {
     "acceleration_spectral_density": 100.0,
     "appearance_kappa": 12.0,
     "assignment_node_budget": 20000,
-    "birth_odds": 0.0477034985341786,
+    "birth_odds": 0.05078534920128332,
     "c_false": 19.0,
     "c_retain": 1.0,
     "c_retire": 0.01,
     "c_wait": 1.0,
-    "detection_probability": 0.9056603773584906,
+    "detection_probability": 0.9206349206349206,
     "dormant_after_s": 0.3,
     "innovation_tau_s": 0.5,
     "max_hypotheses": 32,
     "persistent_birth_ratio": 0.25,
     "plate_clutter_density": 1e-20,
     "policy_birth_odds": {
-      "detector_far_zoom": 0.049632738535890376,
-      "detector_full": 0.0477034985341786,
-      "search_measurement": 0.05432898392182847,
-      "standalone_precrop": 0.04833477900810257
+      "detector_far_zoom": 0.051101093723884876,
+      "detector_full": 0.05078534920128332,
+      "search_measurement": 0.04810553899959318,
+      "standalone_precrop": 0.05000801807523865
     },
     "survival_tau_s": 120.0,
     "vehicle_clutter_density": 1e-12

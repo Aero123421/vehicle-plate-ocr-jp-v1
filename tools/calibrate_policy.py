@@ -507,20 +507,45 @@ def fit_terminal(records, runtime):
         return loss
 
     def decode_null_params(u):
-        return (0.5 + 2.5 * torch.sigmoid(u[0]), u[1], F.softplus(u[2]),
-                F.softplus(u[3]), -10.0 * torch.sigmoid(u[4]), F.softplus(u[5]))
+        # Smoothly bounded parameterization prevents L-BFGS divergence to a
+        # step-function cliff when synthetic cal_holdout is linearly separable.
+        return (
+            0.6 + 1.9 * torch.sigmoid(u[0]),
+            -6.0 + 10.0 * torch.sigmoid(u[1]),
+            24.0 * torch.sigmoid(u[2]),
+            6.0 * torch.sigmoid(u[3]),
+            -6.0 * torch.sigmoid(u[4]),
+            6.0 * torch.sigmoid(u[5]),
+        )
+
+    def eval_reg_objective(nt, nb, rw, sw, mb, cw):
+        reg = 3e-3 * (
+            (nb / 3.0) ** 2
+            + (rw / 12.0) ** 2
+            + (sw / 3.0) ** 2
+            + (mb / 3.0) ** 2
+            + (cw / 3.0) ** 2
+        )
+        return eval_weighted_null_nll(nt, nb, rw, sw, mb, cw) + reg
 
     identity = (1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     baseline_loss = float(eval_weighted_null_nll(*identity))
     if not math.isfinite(baseline_loss):
         raise ValueError("Non-finite identity calibration NLL")
-    u_init = [math.log(0.2 / 0.8), 0.0, -4.0, -4.0, -5.0, -3.0]
+    u_init = [
+        math.log(0.4 / 1.5),
+        math.log(6.0 / 4.0),
+        math.log(2.0 / 22.0),
+        math.log(0.5 / 5.5),
+        math.log(0.5 / 5.5),
+        math.log(0.2 / 5.8),
+    ]
     u = torch.tensor(u_init, dtype=torch.float64, requires_grad=True)
     optimizer = torch.optim.LBFGS([u], max_iter=100, line_search_fn="strong_wolfe")
 
     def closure():
         optimizer.zero_grad()
-        loss = eval_weighted_null_nll(*decode_null_params(u))
+        loss = eval_reg_objective(*decode_null_params(u))
         loss.backward()
         return loss
 

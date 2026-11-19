@@ -2,7 +2,15 @@
 // JP7029732B2 design-around: no character projection while COLLECTING.
 import * as ort from './vendor/ort.wasm.min.mjs';
 import { clamp, sigmoid, unpackGrammar, terminalDecision } from './terminal.mjs';
-import { extractPatchFromRgba, createOpticalRef, trackPlateOnRgba, sampleRgbaLumaBilinear, quadBasis } from './optical_tracker.mjs';
+import {
+  extractPatchFromRgba,
+  createOpticalRef,
+  trackPlateOnRgba,
+  sampleRgbaLumaBilinear,
+  quadBasis,
+  extractVehicleAppearanceRgba,
+  trackVehiclePatchNccRgba,
+} from './optical_tracker.mjs';
 
 // Shared by the browser WebWorker and local Node parity checks.
 export async function createPipeline({
@@ -77,8 +85,62 @@ export async function createPipeline({
     return Number.isFinite(q) && q > 0 ? q : 1.65;
   };
 
-  const baseHeartbeat = policy?.pipeline?.heartbeat_interval ?? 6;
-  const maxHeartbeat = policy?.pipeline?.max_heartbeat_interval ?? 12;
+  function discoverModelDims() {
+    let dModel = null;
+    let dColor = null;
+    let poseDim = null;
+    let h3Shape = [1, 36, 56, 96];
+    let h4Shape = [1, 36, 28, 48];
+    const readMetaShape = (metaList, name) => {
+      if (!Array.isArray(metaList)) return null;
+      const entry = metaList.find(m => m && m.name === name);
+      return Array.isArray(entry?.shape) ? entry.shape : null;
+    };
+    const stepIn = sessions.memory_step?.inputMetadata;
+    const encOut = sessions.frame_encoder?.outputMetadata;
+    const detIn = sessions.temporal_det_nano?.inputMetadata;
+    const mhS = readMetaShape(stepIn, 'mem_h');
+    const chS = readMetaShape(stepIn, 'color_h');
+    const peS = readMetaShape(stepIn, 'pose_ema');
+    const zS = readMetaShape(encOut, 'z');
+    const zcS = readMetaShape(encOut, 'z_color');
+    const h3S = readMetaShape(detIn, 'h_p3_in');
+    const h4S = readMetaShape(detIn, 'h_p4_in');
+    if (Number.isInteger(mhS?.[2]) && mhS[2] > 0) dModel = mhS[2];
+    else if (Number.isInteger(zS?.[2]) && zS[2] > 0) dModel = zS[2];
+    if (Number.isInteger(chS?.[1]) && chS[1] > 0) dColor = chS[1];
+    else if (Number.isInteger(zcS?.[1]) && zcS[1] > 0) dColor = zcS[1];
+    if (Number.isInteger(peS?.[1]) && peS[1] > 0) poseDim = peS[1];
+    if (h3S && h3S.length === 4 && h3S.slice(1).every(v => Number.isInteger(v) && v > 0)) {
+      h3Shape = [1, h3S[1], h3S[2], h3S[3]];
+    }
+    if (h4S && h4S.length === 4 && h4S.slice(1).every(v => Number.isInteger(v) && v > 0)) {
+      h4Shape = [1, h4S[1], h4S[2], h4S[3]];
+    }
+    return { dModel, dColor, poseDim, h3Shape, h4Shape };
+  }
+
+  let { dModel: ocrDModel, dColor: ocrDColor, poseDim: ocrPoseDim, h3Shape, h4Shape } = discoverModelDims();
+
+  function makeEmptyMemory(dm = ocrDModel, dc = ocrDColor, pd = ocrPoseDim) {
+    const effDm = Number.isInteger(dm) && dm > 0 ? dm : 112;
+    const effDc = Number.isInteger(dc) && dc > 0 ? dc : 32;
+    const effPd = Number.isInteger(pd) && pd > 0 ? pd : 4 + 3 * (12 * effDm + effDc + 1);
+    return {
+      mem_h: zero([1, 12, effDm]),
+      mem_P: zero([1, 12, effDm]),
+      mem_conflict: zero([1, 12]),
+      color_h: zero([1, effDc]),
+      color_P: zero([1, effDc]),
+      pol_h: zero([1]),
+      pol_P: zero([1]),
+      pose_ema: zero([1, effPd]),
+      last_timestamp_s: float([-1], [1]),
+    };
+  }
+
+  const baseHeartbeat = Math.min(2, policy?.pipeline?.heartbeat_interval ?? 2);
+  const maxHeartbeat = Math.min(3, policy?.pipeline?.max_heartbeat_interval ?? 3);
   const plateThresh = policy?.pipeline?.plate_thresh ?? 0.18;
   const weakPlateThresh = 0.08;
   const vehLowThresh = 0.20;
@@ -93,8 +155,8 @@ export async function createPipeline({
   const fovea1Buf = new Float32Array(3 * 96 * 160);
   const surround1Buf = new Float32Array(3 * 64 * 96);
   const policy1Buf = new BigInt64Array(1);
-  const zeroH3 = zero([1, 36, 56, 96]);
-  const zeroH4 = zero([1, 36, 28, 48]);
+  const zeroH3 = zero(h3Shape);
+  const zeroH4 = zero(h4Shape);
   const cropBuf = new Float32Array(3 * 80 * 160);
   const srOutBuf = new Float32Array(3 * 80 * 160);
   const srWarpLumaBuf = new Float32Array(40 * 80);
@@ -104,6 +166,8 @@ export async function createPipeline({
   const scoutPrev = new Float32Array(SCOUT_W * SCOUT_H);
   const scoutCur = new Float32Array(SCOUT_W * SCOUT_H);
   const scoutMask = new Uint8Array(SCOUT_W * SCOUT_H);
+  const innerHistPrev = new Float32Array(24);
+  const innerHistCur = new Float32Array(24);
 
   let hasScoutPrev = false;
   let emittedResults = [];
@@ -137,18 +201,29 @@ export async function createPipeline({
     }
   }
 
-  function minFieldPrecision(memPData) {
+  function slotPrecisions(memPData) {
+    const dM = Math.max(1, Math.floor(memPData.length / 12));
     const slotMean = s => {
       let sum = 0;
-      const base = s * 112;
-      for (let i = 0; i < 112; i++) sum += Math.max(0, memPData[base + i]);
-      return sum / 112;
+      const base = s * dM;
+      for (let i = 0; i < dM; i++) sum += Math.max(0, memPData[base + i]);
+      return sum / dM;
     };
     const pReg = (slotMean(0) + slotMean(1) + slotMean(2) + slotMean(3)) / 4;
     const pCls = (slotMean(4) + slotMean(5) + slotMean(6)) / 3;
     const pKana = slotMean(7);
     const pSer = (slotMean(8) + slotMean(9) + slotMean(10) + slotMean(11)) / 4;
+    return { pReg, pCls, pKana, pSer };
+  }
+
+  function minFieldPrecision(memPData) {
+    const { pReg, pCls, pKana, pSer } = slotPrecisions(memPData);
     return Math.min(pReg, pCls, pKana, pSer);
+  }
+
+  function minUpperFieldPrecision(memPData) {
+    const { pReg, pCls, pKana } = slotPrecisions(memPData);
+    return Math.min(pReg, pCls, pKana);
   }
 
   function reset(options = {}) {
@@ -165,12 +240,13 @@ export async function createPipeline({
     lastDetIntervalSec = 0.12;
     lastTime = -Infinity;
     hasScoutPrev = false;
+    innerHistPrev.fill(0);
     prevLumaMean = null;
     fullDetections = 0;
     fastFrames = 0;
     zoomCooldown = 0;
-    h3 = zero([1, 36, 56, 96]);
-    h4 = zero([1, 36, 28, 48]);
+    h3 = zero(h3Shape);
+    h4 = zero(h4Shape);
     phase = 'COLLECTING';
   }
 
@@ -1201,17 +1277,9 @@ export async function createPipeline({
   function newTrack(box, corners, cornerCov, time) {
     if (tracks.length >= 256) throw Error('トラック上限です。終了して読み出してください。');
     const initCorners = corners ?? [[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]];
-    const memory = {
-      mem_h: zero([1, 12, 112]),
-      mem_P: zero([1, 12, 112]),
-      mem_conflict: zero([1, 12]),
-      color_h: zero([1, 32]),
-      color_P: zero([1, 32]),
-      pol_h: zero([1]),
-      pol_P: zero([1]),
-      pose_ema: zero([1, 4135]),
-      last_timestamp_s: float([-1], [1]),
-    };
+    const memory = makeEmptyMemory();
+    const initCx = 0.5 * (box[0] + box[2]);
+    const initCy = 0.5 * (box[1] + box[3]);
     const track = {
       id: nextPlateId++,
       box,
@@ -1230,12 +1298,16 @@ export async function createPipeline({
       srEffViews: 0,
       srWidthEma: 0,
       bestSrViews: 0,
+      firstCx: initCx,
+      firstCy: initCy,
+      maxDisp: 0,
       firstTime: time,
       last: time,
       lastFrame: frameIndex,
       state: 'COLLECTING',
       dormant: false,
       dormantSince: Infinity,
+      sceneCutFrozen: false,
       memory,
       frames: 0,
       readouts: 0,
@@ -1270,24 +1342,36 @@ export async function createPipeline({
         for (let gx = gx0; gx <= gx1; gx++) scoutMask[row + gx] = 1;
       }
     }
+    innerHistCur.fill(0);
     let idx = 0;
     let totalLuma = 0;
-    let allDiff = 0;
+    let innerDiff = 0, innerCnt = 0;
     let unmonDiff = 0, unmonCnt = 0, hotCells = 0;
     let borderDiff = 0, borderCnt = 0;
     for (let gy = 0; gy < SCOUT_H; gy++) {
       const sy = Math.min(hOrig - 1, Math.floor(((gy + 0.5) * hOrig) / SCOUT_H));
       const row = sy * wOrig;
+      const ny = (gy + 0.5) / SCOUT_H;
+      const inInnerY = ny >= 0.15 && ny <= 0.85;
       const isBorderY = gy <= 2 || gy >= SCOUT_H - 3;
       for (let gx = 0; gx < SCOUT_W; gx++) {
         const sx = Math.min(wOrig - 1, Math.floor(((gx + 0.5) * wOrig) / SCOUT_W));
         const p = (row + sx) * 4;
-        const val = (0.299 * frame[p] + 0.587 * frame[p + 1] + 0.114 * frame[p + 2]) / 255;
+        const r = frame[p], g = frame[p + 1], b = frame[p + 2];
+        const val = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
         scoutCur[idx] = val;
         totalLuma += val;
+        const nx = (gx + 0.5) / SCOUT_W;
+        const inInner = inInnerY && nx >= 0.15 && nx <= 0.85;
+        if (inInner) {
+          innerHistCur[Math.min(7, r >> 5)] += 1;
+          innerHistCur[8 + Math.min(7, g >> 5)] += 1;
+          innerHistCur[16 + Math.min(7, b >> 5)] += 1;
+          innerCnt++;
+        }
         if (hasScoutPrev) {
           const d = Math.abs(val - scoutPrev[idx]);
-          allDiff += d;
+          if (inInner) innerDiff += d;
           if (isBorderY || gx <= 3 || gx >= SCOUT_W - 4) {
             borderDiff += d;
             borderCnt++;
@@ -1301,6 +1385,16 @@ export async function createPipeline({
         idx++;
       }
     }
+    // Normalize inner 70% 3x8-bin RGB histogram (Bhattacharyya representation: dot product in [0, 1]).
+    const inv3Inner = 1 / Math.max(1, 3 * innerCnt);
+    for (let k = 0; k < 24; k++) innerHistCur[k] = Math.sqrt(innerHistCur[k] * inv3Inner);
+    let innerHistCorr = 1.0;
+    if (hasScoutPrev) {
+      let bc = 0;
+      for (let k = 0; k < 24; k++) bc += innerHistPrev[k] * innerHistCur[k];
+      innerHistCorr = clamp(bc, 0, 1);
+    }
+    innerHistPrev.set(innerHistCur);
     scoutPrev.set(scoutCur);
     const cellTotal = SCOUT_W * SCOUT_H;
     const lumaMean = totalLuma / cellTotal;
@@ -1308,15 +1402,26 @@ export async function createPipeline({
     prevLumaMean = lumaMean;
     if (!hasScoutPrev) {
       hasScoutPrev = true;
-      return { emptyTriggered: true, busyTriggered: false, sceneCut: false, blackout };
+      return {
+        emptyTriggered: true,
+        busyTriggered: false,
+        sceneCut: false,
+        blackout,
+        innerSad: 0,
+        innerHistCorr: 1.0,
+      };
     }
-    const allMean = allDiff / cellTotal;
+    const innerSad = innerCnt > 0 ? innerDiff / innerCnt : 0;
     const unmonMean = unmonCnt > 0 ? unmonDiff / unmonCnt : 0;
     const borderMean = borderCnt > 0 ? borderDiff / borderCnt : 0;
-    const sceneCut = allMean > 0.165 && borderMean > 0.14;
-    const emptyTriggered = unmonMean > 0.04 || hotCells >= 14 || borderMean > 0.06;
-    const busyTriggered = unmonMean > 0.06 || hotCells >= 26 || borderMean > 0.085;
-    return { emptyTriggered, busyTriggered, sceneCut, blackout };
+    // Inner-70% L1 SAD + 3x8 RGB histogram correlation (immune to static broadcast frames/watermarks).
+    const sceneCut =
+      (innerSad > 0.155 && innerHistCorr < 0.84) ||
+      innerSad > 0.235 ||
+      (innerHistCorr < 0.62 && innerSad > 0.085);
+    const emptyTriggered = unmonMean > 0.035 || hotCells >= 12 || borderMean > 0.06;
+    const busyTriggered = unmonMean > 0.055 || hotCells >= 22 || borderMean > 0.085;
+    return { emptyTriggered, busyTriggered, sceneCut, blackout, innerSad, innerHistCorr };
   }
 
   function predictedBox(track, time, useDisplay = false) {
@@ -1351,12 +1456,13 @@ export async function createPipeline({
   }
 
   function predictedVehicleBox(vt, time) {
-    const dt = clamp(time - vt.last, 0, 0.5);
-    const decay = vt.missed > 0 ? Math.exp(-1.8 * dt) : 1;
+    const refTime = vt.lastProp ?? vt.last;
+    const dt = clamp(time - refTime, 0, 0.30);
+    const decay = vt.missed > 0 ? Math.pow(0.45, vt.missed) * Math.exp(-3.0 * dt) : 1;
     const cx = vt.cx + vt.vx * dt * decay;
     const cy = vt.cy + vt.vy * dt * decay;
-    const w = Math.max(12, vt.w + vt.vw * dt * 0.5 * decay);
-    const h = Math.max(12, vt.h + vt.vh * dt * 0.5 * decay);
+    const w = Math.max(12, vt.w + vt.vw * dt * 0.4 * decay);
+    const h = Math.max(12, vt.h + vt.vh * dt * 0.4 * decay);
     return [
       clamp(cx - 0.5 * w, 0, wOrig),
       clamp(cy - 0.5 * h, 0, hOrig),
@@ -1365,24 +1471,91 @@ export async function createPipeline({
     ];
   }
 
+  function matchBipartiteMax(nRows, nCols, scoreFn) {
+    if (nRows === 0 || nCols === 0) return [];
+    const C = nCols + nRows;
+    const INF = 1e9;
+    const u = new Float64Array(nRows + 1);
+    const v = new Float64Array(C + 1);
+    const p = new Int32Array(C + 1);
+    const way = new Int32Array(C + 1);
+    const costAt = (i, j) => {
+      if (j > nCols) return j === nCols + i ? 0 : INF;
+      const sc = scoreFn(i - 1, j - 1);
+      return Number.isFinite(sc) ? -sc : INF;
+    };
+    for (let i = 1; i <= nRows; i++) {
+      p[0] = i;
+      let j0 = 0;
+      const minv = new Float64Array(C + 1).fill(INF);
+      const used = new Uint8Array(C + 1);
+      do {
+        used[j0] = 1;
+        const i0 = p[j0];
+        let delta = INF;
+        let j1 = 0;
+        for (let j = 1; j <= C; j++) {
+          if (used[j]) continue;
+          const cur = costAt(i0, j) - u[i0] - v[j];
+          if (cur < minv[j]) {
+            minv[j] = cur;
+            way[j] = j0;
+          }
+          if (minv[j] < delta) {
+            delta = minv[j];
+            j1 = j;
+          }
+        }
+        for (let j = 0; j <= C; j++) {
+          if (used[j]) {
+            u[p[j]] += delta;
+            v[j] -= delta;
+          } else {
+            minv[j] -= delta;
+          }
+        }
+        j0 = j1;
+      } while (p[j0] !== 0);
+      do {
+        const j1 = way[j0];
+        p[j0] = p[j1];
+        j0 = j1;
+      } while (j0 !== 0);
+    }
+    const pairs = [];
+    for (let j = 1; j <= nCols; j++) {
+      if (p[j] > 0) {
+        const ti = p[j] - 1;
+        const di = j - 1;
+        if (Number.isFinite(scoreFn(ti, di))) pairs.push([ti, di]);
+      }
+    }
+    return pairs;
+  }
+
   function updateVehicleTracks(dets, time) {
+    // Extract lightweight 16x16 template + 24D RGB hist + 32D appearance per detected vehicle.
+    for (const d of dets) {
+      d.vehRef = extractVehicleAppearanceRgba(frame, wOrig, hOrig, d.box);
+    }
+
     const applyVehicleMatch = (vt, d) => {
       const dt = Math.max(0.03, time - vt.last);
       const ncx = 0.5 * (d.box[0] + d.box[2]);
       const ncy = 0.5 * (d.box[1] + d.box[3]);
       const nw = Math.max(10, d.box[2] - d.box[0]);
       const nh = Math.max(10, d.box[3] - d.box[1]);
-      const predCx = vt.cx + vt.vx * dt;
-      const predCy = vt.cy + vt.vy * dt;
-      const predW = Math.max(10, vt.w + vt.vw * dt * 0.5);
-      const predH = Math.max(10, vt.h + vt.vh * dt * 0.5);
-      const alpha = 0.68, beta = 0.44;
+      const predCx = vt.cx + vt.vx * Math.min(dt, 0.30);
+      const predCy = vt.cy + vt.vy * Math.min(dt, 0.30);
+      const predW = Math.max(10, vt.w + vt.vw * Math.min(dt, 0.30) * 0.5);
+      const predH = Math.max(10, vt.h + vt.vh * Math.min(dt, 0.30) * 0.5);
+      const alpha = 0.72, beta = 0.46;
       vt.cx = predCx + alpha * (ncx - predCx);
       vt.cy = predCy + alpha * (ncy - predCy);
       vt.vx = clamp(vt.vx + (beta / dt) * (ncx - predCx), -wOrig * 1.5, wOrig * 1.5);
       vt.vy = clamp(vt.vy + (beta / dt) * (ncy - predCy), -hOrig * 1.5, hOrig * 1.5);
-      vt.w = predW + 0.55 * (nw - predW);
-      vt.h = predH + 0.55 * (nh - predH);
+      vt.w = predW + 0.58 * (nw - predW);
+      vt.h = predH + 0.58 * (nh - predH);
       vt.vw = clamp(vt.vw + (0.28 / dt) * (nw - predW), -wOrig, wOrig);
       vt.vh = clamp(vt.vh + (0.28 / dt) * (nh - predH), -hOrig, hOrig);
       vt.box = [
@@ -1412,74 +1585,142 @@ export async function createPipeline({
       } else if (d.emb && !vt.emb) {
         vt.emb = d.emb;
       }
+      if (d.vehRef) {
+        if (d.vehRef.tpl) vt.vehRef = d.vehRef;
+        if (d.vehRef.colorHist) vt.colorHist = d.vehRef.colorHist;
+        if (d.vehRef.app32) {
+          if (vt.app32) {
+            const b32 = new Float32Array(32);
+            for (let i = 0; i < 32; i++) b32[i] = 0.75 * vt.app32[i] + 0.25 * d.vehRef.app32[i];
+            vt.app32 = normalizeVec(b32);
+          } else {
+            vt.app32 = d.vehRef.app32;
+          }
+        }
+      }
       vt.last = time;
+      vt.lastProp = time;
       vt.lastFrame = frameIndex;
       vt.hits++;
       vt.missed = 0;
+      vt.missedSince = Infinity;
+      vt.patchNcc = 1.0;
+      vt.optOk = true;
       d.vtRef = vt;
     };
 
     const matchedTrack = new Set();
     const matchedDet = new Set();
-    const predBoxes = vtracks.map(vt => predictedVehicleBox(vt, time));
+    const predBoxes = vtracks.map(vt => (vt.curOptVeh?.ok ? vt.curOptVeh.box : predictedVehicleBox(vt, time)));
 
-    // ByteTrack Pass 1: associate high-confidence vehicle detections (score >= 0.36).
-    const pairs1 = [];
+    // ByteTrack Pass 1: Hungarian bipartite matching using 32D appearance + embedding + IoU + geometry.
+    const highDets = [];
+    for (let di = 0; di < dets.length; di++) if (dets[di].score >= vehHighThresh) highDets.push(di);
+    const scoreMat1 = Array.from({ length: vtracks.length }, () => new Float64Array(highDets.length).fill(-Infinity));
     for (let ti = 0; ti < vtracks.length; ti++) {
       const vt = vtracks[ti];
       const pbox = predBoxes[ti];
+      const pw = Math.max(10, pbox[2] - pbox[0]);
+      const ph = Math.max(10, pbox[3] - pbox[1]);
       const pcx = 0.5 * (pbox[0] + pbox[2]);
       const pcy = 0.5 * (pbox[1] + pbox[3]);
-      const diag = Math.max(32, Math.hypot(pbox[2] - pbox[0], pbox[3] - pbox[1]));
-      for (let di = 0; di < dets.length; di++) {
-        const d = dets[di];
-        if (d.score < vehHighThresh) continue;
+      const diag = Math.max(32, Math.hypot(pw, ph));
+      for (let hi = 0; hi < highDets.length; hi++) {
+        const d = dets[highDets[hi]];
+        const dw = Math.max(10, d.box[2] - d.box[0]);
+        const dh = Math.max(10, d.box[3] - d.box[1]);
         const ov = iou(pbox, d.box);
         const dcx = 0.5 * (d.box[0] + d.box[2]);
         const dcy = 0.5 * (d.box[1] + d.box[3]);
         const dist = Math.hypot(dcx - pcx, dcy - pcy) / diag;
+        const geomSim = Math.min(pw / dw, dw / pw) * Math.min(ph / dh, dh / ph);
+        const app32Sim = dotVec(vt.app32, d.vehRef?.app32);
         const embSim = dotVec(vt.emb, d.emb);
-        if (ov >= 0.12 || (dist <= 0.75 && embSim >= 0.45)) {
-          const score = 2.6 * ov + 1.6 * Math.max(0, embSim) - dist;
-          pairs1.push({ ti, di, score });
+        const appScore =
+          vt.emb && d.emb
+            ? 0.50 * Math.max(0, embSim) + 0.50 * Math.max(0, app32Sim)
+            : Math.max(0, app32Sim);
+        if ((ov >= 0.10 && geomSim >= 0.25) || (dist <= 1.10 && appScore >= 0.50 && geomSim >= 0.36)) {
+          const rawScore = 2.4 * ov + 1.8 * appScore + 0.65 * geomSim - 0.9 * dist;
+          scoreMat1[ti][hi] = Math.max(0.05, rawScore + 1.5);
         }
       }
     }
-    pairs1.sort((a, b) => b.score - a.score);
-    for (const { ti, di } of pairs1) {
-      if (matchedTrack.has(ti) || matchedDet.has(di)) continue;
+    for (const [ti, hi] of matchBipartiteMax(vtracks.length, highDets.length, (i, j) => scoreMat1[i][j])) {
+      const di = highDets[hi];
       matchedTrack.add(ti);
       matchedDet.add(di);
       applyVehicleMatch(vtracks[ti], dets[di]);
     }
 
-    // ByteTrack Pass 2: associate low-confidence detections (0.20 <= score < 0.36) to established vtracks (hits >= 2, IoU >= 0.30).
-    const pairs2 = [];
+    // ByteTrack Pass 2: associate low-confidence detections (0.20 <= score < 0.34) to established vtracks.
+    const remTracks = [];
+    const lowDets = [];
     for (let ti = 0; ti < vtracks.length; ti++) {
-      if (matchedTrack.has(ti) || vtracks[ti].hits < 2) continue;
-      const pbox = predBoxes[ti];
-      for (let di = 0; di < dets.length; di++) {
-        if (matchedDet.has(di) || dets[di].score >= vehHighThresh) continue;
-        const ov = iou(pbox, dets[di].box);
-        if (ov >= 0.30) pairs2.push({ ti, di, score: ov });
+      if (!matchedTrack.has(ti) && vtracks[ti].hits >= 2) remTracks.push(ti);
+    }
+    for (let di = 0; di < dets.length; di++) {
+      if (!matchedDet.has(di) && dets[di].score < vehHighThresh) lowDets.push(di);
+    }
+    if (remTracks.length && lowDets.length) {
+      const scoreMat2 = Array.from({ length: remTracks.length }, () => new Float64Array(lowDets.length).fill(-Infinity));
+      for (let ri = 0; ri < remTracks.length; ri++) {
+        const ti = remTracks[ri];
+        const vt = vtracks[ti];
+        const pbox = predBoxes[ti];
+        const pw = Math.max(10, pbox[2] - pbox[0]);
+        const ph = Math.max(10, pbox[3] - pbox[1]);
+        for (let li = 0; li < lowDets.length; li++) {
+          const d = dets[lowDets[li]];
+          const ov = iou(pbox, d.box);
+          const dw = Math.max(10, d.box[2] - d.box[0]);
+          const dh = Math.max(10, d.box[3] - d.box[1]);
+          const geomSim = Math.min(pw / dw, dw / pw) * Math.min(ph / dh, dh / ph);
+          const app32Sim = Math.max(0, dotVec(vt.app32, d.vehRef?.app32));
+          if (ov >= 0.28 && geomSim >= 0.38) {
+            scoreMat2[ri][li] = Math.max(0.05, 2.0 * ov + 0.8 * app32Sim + 0.4 * geomSim);
+          }
+        }
+      }
+      for (const [ri, li] of matchBipartiteMax(remTracks.length, lowDets.length, (i, j) => scoreMat2[i][j])) {
+        const ti = remTracks[ri];
+        const di = lowDets[li];
+        matchedTrack.add(ti);
+        matchedDet.add(di);
+        applyVehicleMatch(vtracks[ti], dets[di]);
       }
     }
-    pairs2.sort((a, b) => b.score - a.score);
-    for (const { ti, di } of pairs2) {
-      if (matchedTrack.has(ti) || matchedDet.has(di)) continue;
-      matchedTrack.add(ti);
-      matchedDet.add(di);
-      applyVehicleMatch(vtracks[ti], dets[di]);
-    }
 
+    // Hard Ghost-Box Kill: exponential velocity damping + patch-NCC gate + max 3 missed frames (0.30s).
     for (let ti = 0; ti < vtracks.length; ti++) {
       if (matchedTrack.has(ti)) continue;
-      vtracks[ti].missed++;
+      const vt = vtracks[ti];
+      vt.missed++;
+      if (!Number.isFinite(vt.missedSince)) vt.missedSince = time;
+      vt.vx *= 0.45;
+      vt.vy *= 0.45;
+      vt.vw *= 0.45;
+      vt.vh *= 0.45;
+      const opt = vt.curOptVeh;
+      if (opt && opt.ok) {
+        vt.box = opt.box;
+        vt.cx = 0.5 * (opt.box[0] + opt.box[2]);
+        vt.cy = 0.5 * (opt.box[1] + opt.box[3]);
+        vt.lastProp = time;
+        vt.patchNcc = opt.ncc;
+        vt.optOk = true;
+      } else {
+        vt.patchNcc = opt ? opt.ncc : 0;
+        vt.optOk = false;
+      }
     }
-    const maxVehAge = Math.max(1.8, 3.5 * lastDetIntervalSec);
-    vtracks = vtracks.filter(vt => vt.missed <= 6 && time - vt.last <= maxVehAge);
+    vtracks = vtracks.filter(
+      vt =>
+        vt.missed === 0 ||
+        (vt.missed <= 3 && time - vt.missedSince <= 0.30 && (vt.patchNcc ?? 0) >= 0.42)
+    );
 
-    // Birth new vtracks ONLY when score >= 0.42.
+    // Birth new vtracks ONLY when score >= vehBirthThresh.
     for (let di = 0; di < dets.length; di++) {
       if (matchedDet.has(di)) continue;
       const d = dets[di];
@@ -1498,6 +1739,12 @@ export async function createPipeline({
         maxScore: d.score,
         mask: d.mask ?? null,
         emb: d.emb ?? null,
+        vehRef: d.vehRef?.tpl ? d.vehRef : null,
+        colorHist: d.vehRef?.colorHist ?? null,
+        app32: d.vehRef?.app32 ?? null,
+        curOptVeh: null,
+        patchNcc: 1.0,
+        optOk: true,
         mountRel: d.mountBox && d.mountProb >= 0.25 ? [
           (d.mountBox[0] - d.box[0]) / w,
           (d.mountBox[1] - d.box[1]) / h,
@@ -1507,9 +1754,11 @@ export async function createPipeline({
         mountProb: d.mountProb ?? 0,
         maxMountProb: d.mountProb ?? 0,
         last: time,
+        lastProp: time,
         lastFrame: frameIndex,
         hits: 1,
         missed: 0,
+        missedSince: Infinity,
         mountCooldown: 0,
       };
       vtracks.push(vt);
@@ -1536,7 +1785,7 @@ export async function createPipeline({
       const bh = box[3] - box[1];
       if (bw < 5 || bh < 2.8 || bw > 0.96 * wOrig || bh > 0.90 * hOrig) continue;
       const aspect = bw / Math.max(1e-3, bh);
-      if (aspect < 0.45 || aspect > 5.0) continue;
+      if (aspect < 0.48 || aspect > 6.2) continue;
       const corners = cornersData ? mapCorners(cornersData, i * 8) : null;
       if (corners) {
         const qxs = [corners[0][0], corners[1][0], corners[2][0], corners[3][0]];
@@ -1552,7 +1801,7 @@ export async function createPipeline({
 
   async function runSmartZoomMosaic(rois, curStrongBoxes) {
     if (!rois.length) return [];
-    // Render zoom ROIs directly into native 768x448 detector resolution (eliminates 384x256 blur bottleneck).
+    // Render zoom ROIs directly into native 768x448 detector resolution (up to 4x magnification).
     const zFloat = zoomFloatBuf;
     zFloat.fill(114 / 255);
     const zStride = LB_W * LB_H;
@@ -1562,7 +1811,7 @@ export async function createPipeline({
       const rh = Math.max(12, ry1 - ry0);
       const sw = qx1 - qx0;
       const sh = qy1 - qy0;
-      const sc = Math.min(sw / rw, sh / rh);
+      const sc = Math.min(sw / rw, sh / rh, 4.0);
       const nw = Math.max(1, Math.round(rw * sc));
       const nh = Math.max(1, Math.round(rh * sc));
       const px = qx0 + Math.floor((sw - nw) / 2);
@@ -1696,7 +1945,8 @@ export async function createPipeline({
           clamp((boxes[i * 4 + 3] - reg.py) * invZ + reg.ry0, 0, hOrig),
         ];
         const bw = box[2] - box[0], bh = box[3] - box[1];
-        if (bw < 4.5 || bh < 2.4 || bw / Math.max(1e-3, bh) < 0.45 || bw / Math.max(1e-3, bh) > 5.0) continue;
+        const aspect = bw / Math.max(1e-3, bh);
+        if (bw < 4.5 || bh < 2.4 || aspect < 0.48 || aspect > 6.2) continue;
         if (curStrongBoxes.some(sb => iou(sb, box) >= 0.35)) continue;
         const corners = cornersData
           ? Array.from({ length: 4 }, (_, k) => [
@@ -1799,19 +2049,48 @@ export async function createPipeline({
       return t.result.status === 'ACCEPTED' ? time - t.last < 2.2 : time - t.last < 0.35;
     });
 
-    const active = tracks.filter(t => t.state === 'COLLECTING' && !t.dormant);
-    const dormant = tracks.filter(t => t.state === 'COLLECTING' && t.dormant);
+    const active = tracks.filter(t => t.state === 'COLLECTING' && !t.dormant && !t.sceneCutFrozen);
+    const dormant = tracks.filter(t => t.state === 'COLLECTING' && t.dormant && !t.sceneCutFrozen);
     const finalizedActive = tracks.filter(
       t => t.state === 'FINALIZED' && t.result.status === 'ACCEPTED' && frameIndex - t.lastFrame <= 2 && time - t.last < 2.2
     );
+    const padScoutBox = b => {
+      const pw = (b[2] - b[0]) * 0.12;
+      const ph = (b[3] - b[1]) * 0.12;
+      return [b[0] - pw, b[1] - ph, b[2] + pw, b[3] + ph];
+    };
     const monitoredBoxes = [
-      ...active.map(t => predictedBox(t, time)),
-      ...finalizedActive.map(t => predictedBox(t, time)),
-      ...vtracks.map(vt => predictedVehicleBox(vt, time)),
+      ...active.map(t => padScoutBox(predictedBox(t, time))),
+      ...finalizedActive.map(t => padScoutBox(predictedBox(t, time))),
+      ...vtracks.map(vt => padScoutBox(predictedVehicleBox(vt, time))),
     ];
     const scout = updateMotionScout(monitoredBoxes);
+
+    // Pre-detection 16x16 Patch-NCC vehicle propagation (+/-24px) & vehicle-consensus scene-cut check.
+    let nVehChecked = 0;
+    let nVehDropped = 0;
+    for (const vt of vtracks) {
+      vt.curOptVeh = null;
+      if (!vt.vehRef?.tpl) continue;
+      const pbox = predictedVehicleBox(vt, time);
+      const optV = trackVehiclePatchNccRgba(vt.vehRef, frame, wOrig, hOrig, pbox, {
+        maxShiftPx: 24,
+        minNcc: 0.42,
+      });
+      vt.curOptVeh = optV;
+      vt.patchNcc = optV.ncc;
+      nVehChecked++;
+      if (optV.ncc < 0.32) {
+        nVehDropped++;
+      }
+    }
+    const vehConsensusCut =
+      (nVehChecked >= 2 && nVehDropped / nVehChecked >= 0.60 && (scout.innerSad > 0.040 || scout.innerHistCorr < 0.92)) ||
+      (nVehChecked === 1 && nVehDropped === 1 && (scout.innerSad > 0.075 || scout.innerHistCorr < 0.86));
+    const sceneCut = scout.sceneCut || vehConsensusCut;
+
     const preSealedOnCut = [];
-    if (scout.sceneCut) {
+    if (sceneCut) {
       if (autoSealFrames > 0) {
         for (const t of tracks) {
           if (t.state !== 'COLLECTING') continue;
@@ -1823,27 +2102,56 @@ export async function createPipeline({
           }
         }
         tracks = [];
+      } else {
+        // Strict batch mode: zero streaming readouts during COLLECTING; freeze pre-cut tracks to prevent cross-cut mixing.
+        for (const t of tracks) {
+          if (t.state === 'COLLECTING') {
+            t.dormant = true;
+            t.sceneCutFrozen = true;
+          }
+        }
       }
       vtracks = [];
-      h3 = zero([1, 36, 56, 96]);
-      h4 = zero([1, 36, 28, 48]);
+      h3 = zero(h3Shape);
+      h4 = zero(h4Shape);
     }
+
+    const activeNow = sceneCut ? [] : active;
+    const dormantNow = sceneCut ? [] : dormant;
+    const finalizedActiveNow = sceneCut ? [] : finalizedActive;
     const singleThread = runtime.env.wasm.numThreads <= 1;
     const isLowRes = wOrig * hOrig <= 235000;
-    const activeConfirmed = !scout.sceneCut && (active.some(t => t.frames >= 2) || finalizedActive.length > 0);
-    const missingConfirmed = !scout.sceneCut && active.some(t => t.frames >= 2 && t.missed > 0);
-    const effHeartbeat = isLowRes
-      ? (!activeConfirmed || missingConfirmed ? 2 : (singleThread ? maxHeartbeat : 4))
-      : (active.length >= 4 ? maxHeartbeat : baseHeartbeat);
+    const activeConfirmed = !sceneCut && (activeNow.some(t => t.frames >= 2) || finalizedActiveNow.length > 0);
+    const missingConfirmed = !sceneCut && activeNow.some(t => t.frames >= 2 && t.missed > 0);
+    const vehOpticalHealthy =
+      vtracks.length > 0 && vtracks.every(vt => vt.missed === 0 && (vt.patchNcc ?? 1) >= 0.42);
+    const hasMovingVeh = vtracks.some(
+      vt => vt.hits <= 2 || Math.hypot(vt.vx, vt.vy) >= 28 || (vt.patchNcc ?? 1) < 0.58
+    );
+    const vehSmoothLocked =
+      vtracks.length > 0 &&
+      vtracks.every(vt => vt.missed === 0 && vt.hits >= 2 && (vt.patchNcc ?? 0) >= 0.55);
+    const vehUnconfirmed = vtracks.some(vt => vt.hits < 2);
+    const vehNeedsRefresh = vtracks.some(vt => vt.missed > 0 || (vt.patchNcc ?? 1) < 0.42);
+    const effHeartbeat = singleThread
+      ? (isLowRes
+          ? (!activeConfirmed || missingConfirmed ? 1 : 3)
+          : (activeConfirmed && !missingConfirmed
+              ? (vehSmoothLocked ? 5 : 4)
+              : 2))
+      : (activeNow.length >= 4 ? maxHeartbeat : baseHeartbeat);
     const framesSinceFull = frameIndex - lastFull;
+    const everyFrameTrigger = !singleThread;
 
     const full =
       frameIndex === 0 ||
-      scout.sceneCut ||
+      sceneCut ||
       framesSinceFull >= effHeartbeat ||
-      (!activeConfirmed && (isLowRes ? framesSinceFull >= 1 : framesSinceFull >= 2)) ||
-      (scout.busyTriggered && framesSinceFull >= (isLowRes ? 2 : 3)) ||
-      (missingConfirmed && framesSinceFull >= (isLowRes ? 1 : 2));
+      everyFrameTrigger ||
+      (!activeConfirmed && framesSinceFull >= (singleThread && !isLowRes ? 2 : 1)) ||
+      (scout.busyTriggered && framesSinceFull >= (singleThread ? (activeConfirmed && vtracks.length < 2 ? 4 : 2) : 1)) ||
+      (missingConfirmed && framesSinceFull >= 1) ||
+      ((vehNeedsRefresh || vehUnconfirmed) && framesSinceFull >= (singleThread ? (activeConfirmed ? 3 : 2) : 1));
 
     const proposals = [];
     let lbInfo = null;
@@ -1894,8 +2202,8 @@ export async function createPipeline({
         const aspect = bw / bh;
         if (aspect < 0.36 || aspect > 3.5) continue;
         const score = sigmoid(vLogit);
-        if (bw * bh > 0.78 * frameArea && score < 0.55) continue;
-        if (bw * bh > 0.45 * frameArea && score < 0.48) continue;
+        if (bw * bh > 0.78 * frameArea && score < 0.36) continue;
+        if (bw * bh > 0.45 * frameArea && score < 0.34) continue;
         const mountBox = output.pred_q_mount_boxes
           ? nativeBox(output.pred_q_mount_boxes.data, q * 4)
           : null;
@@ -1921,7 +2229,7 @@ export async function createPipeline({
           vtRef: null,
         });
       }
-      const nmsVehs = nms(rawVehCandidates, 16, 0.52);
+      const nmsVehs = nms(rawVehCandidates, 16, 0.55);
       // Step 1: Drop giant scene-spanning multi-object wrapper hallucinations before sub-part pruning.
       const nonWrapperVehs = nmsVehs.filter((a, i) => {
         const bwA = a.box[2] - a.box[0], bhA = a.box[3] - a.box[1];
@@ -1950,29 +2258,47 @@ export async function createPipeline({
         if (enclosedStrong >= 2) return false;
         return true;
       });
-      // Step 2: Drop interior window/cab/door sub-boxes inside a larger vehicle.
-      const keptVehs = nonWrapperVehs.filter((a, i) => {
-        const areaA = Math.max(1, (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]));
-        for (let j = 0; j < nonWrapperVehs.length; j++) {
-          if (i === j) continue;
-          const b = nonWrapperVehs[j];
-          if (b.score < vehHighThresh) continue;
-          const ix = Math.max(0, Math.min(a.box[2], b.box[2]) - Math.max(a.box[0], b.box[0]));
-          const iy = Math.max(0, Math.min(a.box[3], b.box[3]) - Math.max(a.box[1], b.box[1]));
-          const inter = ix * iy;
-          if (inter <= 0) continue;
-          const areaB = Math.max(1, (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]));
-          if (
-            areaB >= 1.50 * areaA &&
-            inter / areaA >= 0.80 &&
-            (a.box[3] < b.box[1] + 0.82 * (b.box[3] - b.box[1]) || b.score >= 0.88 * a.score)
-          ) {
-            return false;
+      // Step 2: Vehicle Containment NMS — suppress lower-score cab/door/bed sub-boxes inside a whole vehicle.
+      const sortedVehs = nonWrapperVehs.slice().sort((a, b) => b.score - a.score);
+      const keptVehs = [];
+      for (const cand of sortedVehs) {
+        const cArea = Math.max(1, (cand.box[2] - cand.box[0]) * (cand.box[3] - cand.box[1]));
+        let suppressed = false;
+        for (const keeper of keptVehs) {
+          if (iou(cand.box, keeper.box) >= 0.55) {
+            suppressed = true;
+            break;
           }
-          if (b.score >= a.score && b.score >= 0.72 && inter / areaA >= 0.72 && areaA <= 0.55 * areaB) return false;
+          const kw = Math.max(1, keeper.box[2] - keeper.box[0]);
+          const kh = Math.max(1, keeper.box[3] - keeper.box[1]);
+          const kArea = Math.max(1, kw * kh);
+          const ovMin = iomin(cand.box, keeper.box);
+          if (ovMin >= 0.82 && cArea < 0.55 * kArea && cand.score < keeper.score * 0.90) {
+            const sharesBottom = Math.abs(cand.box[3] - keeper.box[3]) <= 0.14 * kh;
+            const sharesLeft = Math.abs(cand.box[0] - keeper.box[0]) <= 0.14 * kw;
+            const sharesRight = Math.abs(cand.box[2] - keeper.box[2]) <= 0.14 * kw;
+            const interiorUpper = cand.box[3] < keeper.box[1] + 0.82 * kh;
+            if (sharesBottom || sharesLeft || sharesRight || interiorUpper) {
+              suppressed = true;
+              break;
+            }
+          }
+          if (
+            keeper.score >= vehHighThresh &&
+            kArea >= 1.50 * cArea &&
+            ovMin >= 0.80 &&
+            (cand.box[3] < keeper.box[1] + 0.82 * kh || keeper.score >= 0.88 * cand.score)
+          ) {
+            suppressed = true;
+            break;
+          }
+          if (keeper.score >= cand.score && keeper.score >= 0.72 && ovMin >= 0.72 && cArea <= 0.55 * kArea) {
+            suppressed = true;
+            break;
+          }
         }
-        return true;
-      });
+        if (!suppressed) keptVehs.push(cand);
+      }
       updateVehicleTracks(keptVehs, time);
       const cutoutVehs = keptVehs.filter(v => v.vtRef !== null);
       if (cutoutVehs.length) {
@@ -1996,13 +2322,14 @@ export async function createPipeline({
       const pass1Plates = decodePlatesFromOutput(output, nativeBox, nativeCorners, 0, plateThresh);
       proposals.push(...pass1Plates);
 
-      // 3. Pass-2 Smart-Zoom (all resolutions, Catmull-Rom bicubic) for unplated vehicles & weak plate peaks.
-      const pass1CoveredBoxes = pass1Plates.filter(p => p.score >= 0.26).map(p => p.box);
+      // 3. Pass-2 Full-Face Multi-Scale Vehicle Smart-Zoom for unplated vehicles & weak plate peaks.
+      const pass1CoveredBoxes = pass1Plates.filter(p => p.score >= 0.55).map(p => p.box);
       const alreadyLockedVehIds = new Set(
         tracks
           .filter(
             t =>
               (t.state === 'COLLECTING' &&
+                !t.sceneCutFrozen &&
                 t.frames >= 3 &&
                 t.missed === 0 &&
                 mean(t.memory.mem_P.data) >= 0.16 &&
@@ -2014,7 +2341,8 @@ export async function createPipeline({
       );
       const zoomableVehs = vtracks.filter(vt => {
         if (alreadyLockedVehIds.has(vt.id)) return false;
-        if (vt.hits < 2 && vt.score < 0.62 && pass1Plates.length > 0) return false;
+        if (vt.missed > 0) return false;
+        if (vt.hits < 2 && vt.score < 0.58 && pass1Plates.length > 0) return false;
         if ((vt.zoomSkip ?? 0) > 0) {
           vt.zoomSkip--;
           return false;
@@ -2042,32 +2370,32 @@ export async function createPipeline({
           const win = [x0, y0, x1, y1];
           if (zoomRois.some(prev => iou(prev, win) >= 0.6)) return;
           zoomRois.push(win);
-          if (vtOwner) zoomedVts.push(vtOwner);
+          if (vtOwner && !zoomedVts.includes(vtOwner)) zoomedVts.push(vtOwner);
         };
+        // Full-face vehicle Smart-Zoom (10% padded full vehicle crop covers bumpers, mid-doors, and side/hood mounts).
         for (const vt of zoomableVehs) {
           if (zoomRois.length >= 4) break;
           const vb = predictedVehicleBox(vt, time);
           const vw = vb[2] - vb[0], vh = vb[3] - vb[1];
-          if (vt.mountRel && vt.mountProb >= 0.32 && (vw * scale < 380 || scale < 0.88 || isLowRes)) {
+          enqBox(vb[0] - 0.10 * vw, vb[1] - 0.10 * vh, vb[2] + 0.10 * vw, vb[3] + 0.10 * vh, vt);
+        }
+        // Optional secondary mount close-up for very large unplated vehicles if tile slots remain.
+        for (const vt of zoomableVehs) {
+          if (zoomRois.length >= 4) break;
+          const vb = predictedVehicleBox(vt, time);
+          const vw = vb[2] - vb[0], vh = vb[3] - vb[1];
+          if (vw * scale >= 240 && vt.mountRel && vt.mountProb >= 0.32) {
             const mx0 = vb[0] + vt.mountRel[0] * vw, my0 = vb[1] + vt.mountRel[1] * vh;
             const mx1 = vb[0] + vt.mountRel[2] * vw, my1 = vb[1] + vt.mountRel[3] * vh;
             const mcx = 0.5 * (mx0 + mx1), mcy = 0.5 * (my0 + my1);
-            const zw = Math.max(0.58 * vw, 3.2 * (mx1 - mx0), 72);
-            const zh = Math.max(0.48 * vh, 3.6 * (my1 - my0), 48);
-            enqBox(
-              Math.max(vb[0] - 0.08 * vw, mcx - 0.5 * zw),
-              Math.max(vb[1] - 0.02 * vh, mcy - 0.5 * zh),
-              Math.min(vb[2] + 0.08 * vw, mcx + 0.5 * zw),
-              Math.min(vb[3] + 0.12 * vh, mcy + 0.5 * zh),
-              vt
-            );
-          } else if (vw * scale < 280 || (scale < 0.88 && vw * scale <= 540)) {
-            enqBox(vb[0] - 0.08 * vw, vb[1] - 0.02 * vh, vb[2] + 0.08 * vw, vb[3] + 0.10 * vh, vt);
+            const zw = Math.max(0.48 * vw, 3.2 * (mx1 - mx0), 72);
+            const zh = Math.max(0.44 * vh, 3.6 * (my1 - my0), 48);
+            enqBox(mcx - 0.5 * zw, mcy - 0.5 * zh, mcx + 0.5 * zw, mcy + 0.5 * zh, vt);
           }
         }
         if (
           zoomRois.length < 4 &&
-          (zoomRois.length > 0 || scale < 0.88 || isLowRes || (vtracks.length === 0 && pass1StrongBoxes.length === 0))
+          (zoomRois.length > 0 || (!singleThread && scale < 0.88) || isLowRes || (vtracks.length === 0 && pass1StrongBoxes.length === 0))
         ) {
           const minWeak = zoomableVehs.length > 0 ? weakPlateThresh : (isLowRes || scale < 0.88 ? 0.16 : 0.28);
           const weakPeaks = nms(
@@ -2114,19 +2442,63 @@ export async function createPipeline({
       }
     } else {
       fastFrames++;
+      // Propagate tracked vehicles on non-full frames via 16x16 Patch-NCC (+/-24px); kill failed ghosts.
+      for (const vt of vtracks) {
+        const opt = vt.curOptVeh;
+        if (opt && opt.ok) {
+          const dtP = clamp(time - (vt.lastProp ?? vt.last), 0.02, 0.25);
+          const newCx = 0.5 * (opt.box[0] + opt.box[2]);
+          const newCy = 0.5 * (opt.box[1] + opt.box[3]);
+          const instVx = clamp((newCx - vt.cx) / dtP, -wOrig * 1.5, wOrig * 1.5);
+          const instVy = clamp((newCy - vt.cy) / dtP, -hOrig * 1.5, hOrig * 1.5);
+          vt.cx = newCx;
+          vt.cy = newCy;
+          vt.w = Math.max(12, opt.box[2] - opt.box[0]);
+          vt.h = Math.max(12, opt.box[3] - opt.box[1]);
+          vt.vx = 0.65 * vt.vx + 0.35 * instVx;
+          vt.vy = 0.65 * vt.vy + 0.35 * instVy;
+          vt.box = opt.box;
+          vt.lastProp = time;
+          vt.patchNcc = opt.ncc;
+          vt.optOk = true;
+          vt.maxDisp = Math.max(vt.maxDisp ?? 0, Math.hypot(vt.cx - vt.firstCx, vt.cy - vt.firstCy));
+          if (vt.missed > 0) {
+            vt.missed++;
+            vt.vx *= 0.45;
+            vt.vy *= 0.45;
+            vt.vw *= 0.45;
+            vt.vh *= 0.45;
+          }
+        } else {
+          vt.vx *= 0.45;
+          vt.vy *= 0.45;
+          vt.vw *= 0.45;
+          vt.vh *= 0.45;
+          vt.patchNcc = opt ? opt.ncc : 0;
+          vt.optOk = false;
+          vt.missed++;
+          if (!Number.isFinite(vt.missedSince)) vt.missedSince = time;
+        }
+      }
+      vtracks = vtracks.filter(
+        vt =>
+          vt.missed === 0 ||
+          (vt.missed <= 3 && time - vt.missedSince <= 0.30 && (vt.patchNcc ?? 0) >= 0.42) ||
+          (vt.missed === 1 && time - vt.missedSince <= 0.16 && (vt.patchNcc ?? 0) >= 0.32)
+      );
     }
 
     const platedVehicleIds = new Set(
       tracks
         .filter(t =>
-          (t.state === 'COLLECTING' && t.frames >= 2 && mean(t.memory.mem_P.data) >= 0.12 && sigmoid(t.odds) >= 0.60) ||
+          (t.state === 'COLLECTING' && !t.sceneCutFrozen && t.frames >= 2 && mean(t.memory.mem_P.data) >= 0.12 && sigmoid(t.odds) >= 0.60) ||
           (t.state === 'FINALIZED' && t.result?.status === 'ACCEPTED')
         )
         .map(t => t.vehicleId)
         .filter(v => v !== null && v !== undefined)
     );
     const allVtracks = vtracks.map(vt => {
-      const box = predictedVehicleBox(vt, time);
+      const box = vt.optOk && vt.box ? vt.box : predictedVehicleBox(vt, time);
       const vw = box[2] - box[0], vh = box[3] - box[1];
       const mountBox = vt.mountRel
         ? [
@@ -2143,6 +2515,8 @@ export async function createPipeline({
         velocity: [vt.vx, vt.vy, vt.vw, vt.vh],
         mask: vt.mask,
         score: vt.score,
+        coasted: vt.missed > 0,
+        patchNcc: vt.patchNcc ?? 1,
         mountBox,
         mountProb: vt.mountProb,
       };
@@ -2153,10 +2527,11 @@ export async function createPipeline({
       const cx = 0.5 * (box[0] + box[2]), cy = 0.5 * (box[1] + box[3]);
       let best = null, bestArea = Infinity;
       for (const v of allVtracks) {
+        if ((v.vt.patchNcc ?? 1) < 0.40 && v.vt.missed > 0) continue;
         if (
           v.vt.hits >= 2 &&
           v.vt.maxDisp < Math.max(8, 0.015 * wOrig) &&
-          v.vt.maxScore < 0.56 &&
+          v.vt.maxScore < 0.40 &&
           !platedVehicleIds.has(v.id)
         ) {
           continue;
@@ -2179,14 +2554,17 @@ export async function createPipeline({
       return best;
     };
 
+    // Never render a coasted or unverified vehicle box whose patch NCC < 0.40.
+    // Uncorrupted frozen COCO D-FINE allows fast 1-frame confirmation for strong moving vehicles (>=0.54).
     const predictedVehicles = allVtracks
       .filter(({ vt }) => {
+        if ((vt.missed > 0 || !vt.optOk) && (vt.patchNcc ?? 0) < 0.40) return false;
         if (platedVehicleIds.has(vt.id)) return true;
-        if (vt.hits < 3 && vt.maxScore < 0.78) return false;
+        if (vt.hits < 2 && vt.maxScore < 0.54) return false;
         if (
-          vt.hits >= 3 &&
+          vt.hits >= 2 &&
           vt.maxDisp < Math.max(8, 0.015 * wOrig) &&
-          vt.maxScore < 0.78
+          vt.maxScore < 0.56
         ) {
           return false;
         }
@@ -2195,9 +2573,9 @@ export async function createPipeline({
       .map(({ vt, ...pub }) => pub);
 
     // Sub-pixel optical pre-alignment on current frame before Stage-2 search window generation.
-    for (const track of [...active, ...finalizedActive, ...dormant]) {
+    for (const track of [...activeNow, ...finalizedActiveNow, ...dormantNow]) {
       track.curOpt = null;
-      if (!scout.sceneCut && track.optRef && time - track.last <= 1.20) {
+      if (!sceneCut && track.optRef && time - track.last <= 1.20) {
         const dtOpt = clamp(time - track.last, 0.01, 0.5);
         const kinCorners = predictedCorners(track, time);
         const minZ = track.optRef.basis.width < 36 ? 0.50 : 0.58;
@@ -2223,7 +2601,7 @@ export async function createPipeline({
         0.5 * (kin[3] + opt.box[3]),
       ];
     };
-    for (const track of active) {
+    for (const track of activeNow) {
       proposals.push({
         box: proposalBoxFor(track),
         score: full ? 0.45 : 1.0,
@@ -2231,7 +2609,7 @@ export async function createPipeline({
         provenance: 2,
       });
     }
-    for (const track of finalizedActive) {
+    for (const track of finalizedActiveNow) {
       const box = proposalBoxFor(track);
       if (!full || ownerOf(box) !== null || Boolean(track.curOpt && track.curOpt.zncc >= 0.70)) {
         proposals.push({
@@ -2242,8 +2620,8 @@ export async function createPipeline({
         });
       }
     }
-    for (const track of dormant) {
-      const maxDormantSec = track.frames >= 2 ? 1.20 : 0.22;
+    for (const track of dormantNow) {
+      const maxDormantSec = track.frames >= 2 ? (isLowRes ? 1.80 : 1.20) : 0.22;
       const allowDormantProbe = track.missed <= 2 || full || Boolean(track.curOpt && track.curOpt.zncc >= 0.56);
       if (time - track.dormantSince <= maxDormantSec && allowDormantProbe) {
         proposals.push({
@@ -2288,7 +2666,7 @@ export async function createPipeline({
       }
     }
 
-    // Keep track-backed proposals, vehicle-contained proposals, or standalone plate candidates (score >= 0.36).
+    // Keep track-backed proposals, vehicle-contained proposals, or standalone plate candidates.
     const contained = proposals.filter(({ box, score, track, provenance }) =>
       track || (
         (box[2] - box[0] >= 5.5 && box[3] - box[1] >= 2.8) && (
@@ -2304,7 +2682,7 @@ export async function createPipeline({
       if (c.track) continue;
       let bestTrack = null, bestIou = 0.25;
       for (const t of tracks) {
-        if (t.state !== 'COLLECTING') continue;
+        if (t.state !== 'COLLECTING' || t.sceneCutFrozen) continue;
         const ov = Math.max(iou(predictedBox(t, time), c.box), t.curOpt ? iou(t.curOpt.box, c.box) : 0);
         if (ov >= bestIou) {
           bestIou = ov;
@@ -2318,7 +2696,7 @@ export async function createPipeline({
     // Notice UNREADABLE premature exits do NOT lock out future readable sightings!
     const used = new Set();
     const acceptedOwners = new Set();
-    for (const ft of finalizedActive) {
+    for (const ft of finalizedActiveNow) {
       const ow = ownerOf(ft.curOpt ? ft.curOpt.box : predictedBox(ft, time));
       if (ow) acceptedOwners.add(ow.id);
     }
@@ -2385,21 +2763,33 @@ export async function createPipeline({
       remaining.push(candidate);
     }
 
-    // Prioritize track-backed proposals, then detector proposals; allow up to 2 candidates per unaccepted vehicle
+    // Prioritize track-backed proposals, then detector proposals; allow up to 3 candidates per unaccepted vehicle
     // into Stage-2 so a taillight never blocks the real plate before Stage-2 scores both!
     remaining.sort((a, b) => Number(Boolean(b.track)) - Number(Boolean(a.track)) || b.score - a.score);
-    const confirmedPlatedVehicles = new Set(
-      tracks
-        .filter(
-          t =>
-            t.state === 'COLLECTING' &&
-            t.frames >= 3 &&
-            t.vehicleId !== null &&
-            mean(t.memory.mem_P.data) >= 0.16 &&
-            sigmoid(t.odds) >= 0.72
-        )
-        .map(t => t.vehicleId)
-    );
+    const confirmedPlatedVehicles = new Set();
+    for (const t of tracks) {
+      if (
+        t.state !== 'COLLECTING' ||
+        t.sceneCutFrozen ||
+        t.frames < 3 ||
+        mean(t.memory.mem_P.data) < 0.16 ||
+        sigmoid(t.odds) < 0.72
+      ) {
+        continue;
+      }
+      const tb = t.measBox ?? t.box;
+      const tw = tb[2] - tb[0];
+      const curOwner = ownerOf(tb);
+      const vidCand = curOwner?.id ?? t.vehicleId;
+      if (vidCand === null || vidCand === undefined) continue;
+      const v = curOwner ?? allVtracks.find(av => av.id === vidCand);
+      if (v) {
+        const vw = v.box[2] - v.box[0];
+        if (vw >= 160 && tw < 0.055 * vw) continue;
+      }
+      confirmedPlatedVehicles.add(vidCand);
+      if (t.vehicleId !== null) confirmedPlatedVehicles.add(t.vehicleId);
+    }
     const vehCandCounts = new Map();
     const claimedTrackIds = new Set();
     const selected = [];
@@ -2421,38 +2811,110 @@ export async function createPipeline({
       const vid = candidate.track?.vehicleId ?? owner?.id;
       if (vid !== undefined && vid !== null) {
         if (acceptedOwners.has(vid)) continue;
-        const maxPerVeh = !confirmedPlatedVehicles.has(vid) ? 3 : 2;
+        const maxPerVeh = !confirmedPlatedVehicles.has(vid) ? 3 : 1;
         const cnt = vehCandCounts.get(vid) ?? 0;
         if (cnt >= maxPerVeh) continue;
         vehCandCounts.set(vid, cnt + 1);
       }
+      const candW = candidate.box[2] - candidate.box[0];
+      if (
+        singleThread &&
+        activeConfirmed &&
+        selected.length >= 1 &&
+        !candidate.track &&
+        !owner &&
+        ((!isLowRes && candidate.score < 0.36) || (candW < 22 && candidate.score < 0.34))
+      ) {
+        continue;
+      }
       if (candidate.track) claimedTrackIds.add(candidate.track.id);
       selected.push(candidate);
-      if (selected.length >= (singleThread ? (activeConfirmed ? 2 : 4) : 10)) break;
+      if (selected.length >= (singleThread ? 4 : 10)) break;
     }
 
-    // Run batched Stage-2 refinement (NEVER reuse stale corners across frames!).
-    const stage2Results = await runStage2Batch(selected);
-    const recropIndices = [];
-    for (let i = 0; i < stage2Results.length; i++) {
-      if (stage2Results[i].needsRecrop) recropIndices.push(i);
+    // Run batched Stage-2 refinement (NEVER reuse stale pixels/corners across frames!).
+    // On single-threaded WASM fast frames with a crisp current-frame optical ZNCC lock (>=0.74)
+    // and positive Stage-2 support, alternate with sub-pixel optical corners while still feeding
+    // fresh crops to OCR (and marking isOptReuse so stale Stage-2 LLR is never re-accumulated).
+    const stage2Results = new Array(selected.length);
+    const stage2Todo = [];
+    for (let i = 0; i < selected.length; i++) {
+      const cand = selected[i];
+      const tr = cand.track;
+      const opt = tr?.curOpt;
+      if (
+        !full &&
+        singleThread &&
+        tr &&
+        tr.frames >= 2 &&
+        tr.missed === 0 &&
+        tr.lastStage2Loc &&
+        tr.lastStage2Loc.llr >= 0.0 &&
+        (tr.optOnlyStreak ?? 0) < 3 &&
+        opt &&
+        opt.ok &&
+        opt.zncc >= 0.74 &&
+        validCorners(opt.corners) &&
+        opt.corners.every(([x, y]) => x >= 2 && x <= wOrig - 2 && y >= 2 && y <= hOrig - 2)
+      ) {
+        tr.optOnlyStreak = (tr.optOnlyStreak ?? 0) + 1;
+        stage2Results[i] = {
+          ...tr.lastStage2Loc,
+          corners: opt.corners,
+          needsRecrop: false,
+          isOptReuse: true,
+        };
+      } else {
+        stage2Todo.push(i);
+      }
     }
-    if (recropIndices.length) {
-      const recropItems = recropIndices.map(i => ({
-        box: cornersToBox(stage2Results[i].corners),
-        provenance: selected[i].provenance ?? 0,
-        gamma: 1.45,
-      }));
-      const recropped = await runStage2Batch(recropItems);
-      recropIndices.forEach((idx, j) => {
-        if (recropped[j].valid && validCorners(recropped[j].corners)) stage2Results[idx] = recropped[j];
-      });
+    if (stage2Todo.length) {
+      const batchRes = await runStage2Batch(stage2Todo.map(i => selected[i]));
+      const recropIndices = [];
+      for (let j = 0; j < stage2Todo.length; j++) {
+        const idx = stage2Todo[j];
+        stage2Results[idx] = batchRes[j];
+        if (batchRes[j].needsRecrop) recropIndices.push(idx);
+      }
+      if (recropIndices.length) {
+        const recropItems = recropIndices.map(i => ({
+          box: cornersToBox(stage2Results[i].corners),
+          provenance: selected[i].provenance ?? 0,
+          gamma: 1.45,
+        }));
+        const recropped = await runStage2Batch(recropItems);
+        recropIndices.forEach((idx, j) => {
+          if (recropped[j].valid && validCorners(recropped[j].corners)) stage2Results[idx] = recropped[j];
+        });
+      }
+      for (const idx of stage2Todo) {
+        const tr = selected[idx].track;
+        if (tr && stage2Results[idx].valid) {
+          tr.lastStage2Loc = stage2Results[idx];
+          tr.optOnlyStreak = 0;
+        }
+      }
     }
 
-    // Process highest Stage-2 plate support first, keeping at most 1 verified plate per vehicle.
+    // Process highest Stage-2 plate support first (deprioritizing tiny emblem specks on large vehicles),
+    // keeping at most 1 verified plate per vehicle.
+    const stage2RankScore = i => {
+      const loc = stage2Results[i];
+      let sc = loc.support;
+      if (loc.valid && validCorners(loc.corners)) {
+        const rb = cornersToBox(loc.corners);
+        const rw = rb[2] - rb[0];
+        const ow = ownerOf(rb);
+        if (ow) {
+          const vw = ow.box[2] - ow.box[0];
+          if (vw >= 160 && rw < Math.min(18, 0.055 * vw)) sc -= 0.35;
+        }
+      }
+      return sc;
+    };
     const stage2Order = selected
       .map((_, i) => i)
-      .sort((a, b) => stage2Results[b].support - stage2Results[a].support);
+      .sort((a, b) => stage2RankScore(b) - stage2RankScore(a));
     const postStage2Owners = new Set(acceptedOwners);
 
     for (const idx of stage2Order) {
@@ -2466,7 +2928,7 @@ export async function createPipeline({
       const rawBox = cornersToBox(rawCorners);
       const boxW = rawBox[2] - rawBox[0], boxH = rawBox[3] - rawBox[1];
       const aspect = boxW / Math.max(1e-3, boxH);
-      if (boxW < 5.5 || boxH < 2.8 || aspect < 0.48 || aspect > 5.0) continue;
+      if (boxW < 5.5 || boxH < 2.8 || aspect < 0.48 || aspect > 6.2) continue;
       if (
         tracks.some(t => {
           if (!used.has(t.id)) return false;
@@ -2481,12 +2943,12 @@ export async function createPipeline({
 
       // Associate with tracked collectors (active OR dormant) using IoU + cosine ReID + distance gate.
       let track = prior;
-      if (!track || used.has(track.id) || track.state !== 'COLLECTING') {
+      if (!track || used.has(track.id) || track.state !== 'COLLECTING' || track.sceneCutFrozen) {
         track = null;
         let bestAssocScore = -Infinity;
         const pcx = 0.5 * (rawBox[0] + rawBox[2]), pcy = 0.5 * (rawBox[1] + rawBox[3]);
         for (const t of tracks) {
-          if (t.state !== 'COLLECTING' || used.has(t.id)) continue;
+          if (t.state !== 'COLLECTING' || t.sceneCutFrozen || used.has(t.id)) continue;
           const kinBox = predictedBox(t, time);
           const pBox = t.curOpt && iou(t.curOpt.box, rawBox) > iou(kinBox, rawBox) ? t.curOpt.box : kinBox;
           const ov = iou(pBox, rawBox);
@@ -2519,13 +2981,18 @@ export async function createPipeline({
       let srActive = false;
 
       if (!track) {
-        const hasVehOwner = ownerOf(rawBox) !== null;
-        const minBirth = hasVehOwner ? 0.36 : (candidate.provenance === 1 ? 0.80 : 0.66);
-        const maxBirthNc = hasVehOwner ? tauNc + 1.8 : tauNc + 0.55;
-        if (loc.support < minBirth || loc.llr < (hasVehOwner ? -0.35 : 0.25) || loc.nc > maxBirthNc) continue;
+        const ownerVeh = ownerOf(rawBox);
+        const ownerW = ownerVeh ? (ownerVeh.box[2] - ownerVeh.box[0]) : 0;
+        const tinyOnGiantVeh = ownerW >= 260 && boxW < Math.min(22, 0.036 * ownerW);
+        const hasVehOwner = ownerVeh !== null && !tinyOnGiantVeh;
+        const minBirth = hasVehOwner ? 0.36 : (candidate.provenance === 1 ? 0.88 : 0.80);
+        const minBirthLlr = hasVehOwner ? -0.35 : (candidate.provenance === 1 ? 1.85 : 1.10);
+        const maxBirthNc = hasVehOwner ? tauNc + 1.8 : tauNc + 0.40;
+        if (!hasVehOwner && (boxW < 16 || boxH < 7)) continue;
+        if (loc.support < minBirth || loc.llr < minBirthLlr || loc.nc > maxBirthNc) continue;
         crop = projective(measCorners);
         if (isRedLampCrop(crop)) continue;
-        if (!hasVehOwner) {
+        {
           const cd = crop.data;
           let lSum = 0, lSq = 0;
           for (let k = 0; k < 12800; k += 4) {
@@ -2534,9 +3001,12 @@ export async function createPipeline({
             lSq += lv * lv;
           }
           const lMean = lSum / 3200;
-          if (Math.sqrt(Math.max(0, lSq / 3200 - lMean * lMean)) < 0.032) continue;
+          const minStd = hasVehOwner ? 0.026 : 0.032;
+          if (Math.sqrt(Math.max(0, lSq / 3200 - lMean * lMean)) < minStd) continue;
         }
         track = newTrack(measBox, measCorners, loc.cornerCov, time);
+        track.lastStage2Loc = loc;
+        track.optOnlyStreak = 0;
         const drz0 = stepTrackDrizzle(track, measCorners);
         measCorners = drz0.corners;
         measBox = cornersToBox(measCorners);
@@ -2594,32 +3064,59 @@ export async function createPipeline({
       }
 
       const geom = geometry(measCorners, crop, track.frames ? track.measCorners : null);
-      const encoded = await sessions.frame_encoder.run({
-        crops: crop,
-        plate_sides: integer(2),
-        geom_meta: geom,
-      });
-      const ncExcess = Math.max(0, loc.nc - tauNc);
-      const negLlr = Math.max(0, -loc.llr - 0.25);
-      const damping = Math.exp(-Math.min(20, 0.55 * ncExcess + 0.75 * negLlr)) * (0.15 + 0.85 * loc.visibility);
-      for (const key of ['lambda_prec', 'lambda_color', 'pol_prec']) {
-        const src = encoded[key].data;
-        const scaled = new Float32Array(src.length);
-        for (let k = 0; k < src.length; k++) scaled[k] = src[k] * damping;
-        encoded[key] = float(scaled, encoded[key].dims);
+      const skipRedundantEncode =
+        singleThread &&
+        track.frames >= 8 &&
+        track.memory &&
+        Boolean(loc.isOptReuse) &&
+        mean(track.memory.mem_P.data) >= 16.0;
+      if (!skipRedundantEncode) {
+        const encoded = await sessions.frame_encoder.run({
+          crops: crop,
+          plate_sides: integer(2),
+          geom_meta: geom,
+        });
+        // Auto-discover Stage-3 latent dimensions (d_model, d_color, pose_ema) from frame_encoder output.
+        const encDm = encoded.z?.dims?.[2];
+        const encDc = encoded.z_color?.dims?.[1];
+        if (Number.isInteger(encDm) && encDm > 0 && Number.isInteger(encDc) && encDc > 0) {
+          const expectedPose =
+            ocrDModel === encDm && ocrDColor === encDc && ocrPoseDim
+              ? ocrPoseDim
+              : 4 + 3 * (12 * encDm + encDc + 1);
+          ocrDModel = encDm;
+          ocrDColor = encDc;
+          ocrPoseDim = expectedPose;
+          if (
+            !track.memory ||
+            track.memory.mem_h.dims[2] !== encDm ||
+            track.memory.color_h.dims[1] !== encDc ||
+            track.memory.pose_ema.dims[1] !== expectedPose
+          ) {
+            track.memory = makeEmptyMemory(encDm, encDc, expectedPose);
+          }
+        }
+        const ncExcess = Math.max(0, loc.nc - tauNc);
+        const negLlr = Math.max(0, -loc.llr - 0.25);
+        const damping = Math.exp(-Math.min(20, 0.55 * ncExcess + 0.75 * negLlr)) * (0.15 + 0.85 * loc.visibility);
+        for (const key of ['lambda_prec', 'lambda_color', 'pol_prec']) {
+          const src = encoded[key].data;
+          const scaled = new Float32Array(src.length);
+          for (let k = 0; k < src.length; k++) scaled[k] = src[k] * damping;
+          encoded[key] = float(scaled, encoded[key].dims);
+        }
+        const next = await sessions.memory_step.run({
+          ...track.memory,
+          ...encoded,
+          geom_meta: geom,
+          timestamp_s: float([time], [1]),
+        });
+        for (const name of Object.keys(track.memory)) track.memory[name] = next[`new_${name}`];
       }
-      const next = await sessions.memory_step.run({
-        ...track.memory,
-        ...encoded,
-        geom_meta: geom,
-        timestamp_s: float([time], [1]),
-      });
-      for (const name of Object.keys(track.memory)) track.memory[name] = next[`new_${name}`];
 
       const qc = clamp(loc.support, 1e-6, 1 - 1e-6);
       const increment = Math.log(qc) - Math.log1p(-qc);
-      const wasConfirmed = track.maxLlr >= 1.1;
-      track.maxLlr = Math.max(track.maxLlr, increment);
+      if (!loc.isOptReuse) track.maxLlr = Math.max(track.maxLlr, increment);
       if (!track.frames) {
         track.firstSupport = loc.support;
         const posBoost = increment > 1.5 ? 1 + 0.60 * Math.min(1.6, increment - 1.5) : 1;
@@ -2628,12 +3125,23 @@ export async function createPipeline({
         track.measBox = measBox;
         track.corners = measCorners;
         track.box = measBox;
+        track.firstCx = 0.5 * (measBox[0] + measBox[2]);
+        track.firstCy = 0.5 * (measBox[1] + measBox[3]);
       } else {
         const dt = Math.max(0.03, time - track.last);
-        const wt = Math.min(0.85, Math.max(0.26, dt / 0.20)) * (0.20 + 0.80 * loc.visibility);
-        const hasCharEvidence = mean(track.memory.mem_P.data) >= 0.18;
-        const effInc = hasCharEvidence ? Math.max(-0.90, increment) : increment;
-        track.odds = clamp(track.odds + wt * effInc, -30, 30);
+        if (!loc.isOptReuse) {
+          const wt = Math.min(0.85, Math.max(0.26, dt / 0.20)) * (0.20 + 0.80 * loc.visibility);
+          const memPMean = mean(track.memory.mem_P.data);
+          const hasCharEvidence = memPMean >= 0.18;
+          const strongConfirmed = track.maxLlr >= 1.4 && memPMean >= 1.2;
+          let effInc = increment;
+          if (strongConfirmed && increment < 0 && increment >= -1.0) {
+            effInc = 0.12 * increment;
+          } else if (hasCharEvidence) {
+            effInc = Math.max(-0.90, increment);
+          }
+          track.odds = clamp(track.odds + wt * effInc, -30, 30);
+        }
 
         // Zero-lag instantaneous measurement state vs display-smoothed state.
         const oldMeasBox = track.measBox ?? track.box;
@@ -2658,6 +3166,10 @@ export async function createPipeline({
           clamp(track.sizeVelocity[0] + (0.28 / dt) * (measW - oldW), -wOrig, wOrig),
           clamp(track.sizeVelocity[1] + (0.28 / dt) * (measH - oldH), -hOrig, hOrig),
         ];
+        track.maxDisp = Math.max(
+          track.maxDisp ?? 0,
+          Math.hypot(measCx - track.firstCx, measCy - track.firstCy)
+        );
         track.prevMeasCorners = track.measCorners;
         track.measCorners = measCorners;
         track.measBox = measBox;
@@ -2697,7 +3209,9 @@ export async function createPipeline({
       const owner = postOwner;
       if (owner) {
         track.vehicleId = owner.id;
-        if (loc.llr >= 1.4 || mean(track.memory.mem_P.data) >= 0.12) {
+        const ownerW = owner.box[2] - owner.box[0];
+        const plausibleSize = ownerW < 160 || boxW >= Math.min(18, 0.055 * ownerW);
+        if (plausibleSize && (loc.llr >= 1.4 || mean(track.memory.mem_P.data) >= 0.12)) {
           postStage2Owners.add(owner.id);
         }
       }
@@ -2709,7 +3223,22 @@ export async function createPipeline({
       track.frames++;
       track.last = time;
       track.lastFrame = frameIndex;
+
+      // Stationary Corner Overlay / Watermark Suppression (unowned outer-corner static overlays).
+      const tCx = 0.5 * (track.measBox[0] + track.measBox[2]);
+      const tCy = 0.5 * (track.measBox[1] + track.measBox[3]);
+      const inOuterCorner =
+        (tCx < 0.16 * wOrig || tCx > 0.84 * wOrig) &&
+        (tCy < 0.16 * hOrig || tCy > 0.84 * hOrig);
       if (
+        track.vehicleId === null &&
+        inOuterCorner &&
+        track.frames >= 6 &&
+        (track.maxDisp ?? 0) < 1.5 &&
+        track.maxLlr < 2.0
+      ) {
+        track.state = 'DISCARDED';
+      } else if (
         discardShortUnreadable &&
         track.frames >= 5 &&
         mean(track.memory.mem_P.data) < 0.045 &&
@@ -2721,7 +3250,7 @@ export async function createPipeline({
 
     // Move missed collectors cleanly into DORMANT instead of dropping identity immediately.
     for (const t of tracks) {
-      if (t.state === 'COLLECTING' && !used.has(t.id)) {
+      if (t.state === 'COLLECTING' && !t.sceneCutFrozen && !used.has(t.id)) {
         t.missed++;
         if (!t.dormant) {
           t.dormant = true;
@@ -2732,9 +3261,15 @@ export async function createPipeline({
 
     const newlyFinalized = [...preSealedOnCut];
     for (const t of tracks) {
-      if (t.state !== 'COLLECTING') continue;
+      if (t.state !== 'COLLECTING' || t.sceneCutFrozen) continue;
       if (autoSealFrames > 0) {
-        const exited = autoExitSec > 0 && time - t.last >= autoExitSec;
+        const pw = (t.measBox ?? t.box)[2] - (t.measBox ?? t.box)[0];
+        const lowResPlate = isLowRes || pw < 44;
+        const parentVehActive =
+          t.vehicleId !== null &&
+          vtracks.some(v => v.id === t.vehicleId && v.missed === 0 && (v.patchNcc ?? 1) >= 0.45);
+        const effExitSec = autoExitSec > 0 ? autoExitSec * (parentVehActive && lowResPlate ? 1.45 : 1.0) : 0;
+        const exited = effExitSec > 0 && time - t.last >= effExitSec;
         if (
           exited &&
           discardShortUnreadable &&
@@ -2746,21 +3281,44 @@ export async function createPipeline({
         }
         let readyToSeal = false;
         if (requireFullFieldsForEarlySeal) {
-          const pw = (t.measBox ?? t.box)[2] - (t.measBox ?? t.box)[0];
           const growing = (t.sizeVelocity?.[0] ?? 0) > 3.5;
-          const allFieldsCrisp =
-            t.frames >= autoSealFrames &&
-            time - t.firstTime >= autoSealMinSec &&
-            !growing &&
-            pw >= 48 &&
-            minFieldPrecision(t.memory.mem_P.data) >= 1.1;
-          const longDwell =
-            t.frames >= 42 &&
-            time - t.firstTime >= 3.2 &&
-            mean(t.memory.mem_P.data) >= autoSealMinPrecision;
-          readyToSeal = allFieldsCrisp || longDwell;
+          const minAll = minFieldPrecision(t.memory.mem_P.data);
+          const minUpper = minUpperFieldPrecision(t.memory.mem_P.data);
+          if (lowResPlate) {
+            const lowResCrisp =
+              t.frames >= Math.max(autoSealFrames, 24) &&
+              time - t.firstTime >= Math.max(autoSealMinSec, 1.8) &&
+              !growing &&
+              minAll >= 1.35 &&
+              minUpper >= 1.15;
+            const lowResLongDwell =
+              t.frames >= (growing && t.missed === 0 ? 48 : 38) &&
+              time - t.firstTime >= 3.2 &&
+              mean(t.memory.mem_P.data) >= autoSealMinPrecision;
+            readyToSeal = lowResCrisp || lowResLongDwell;
+          } else {
+            const allFieldsCrisp =
+              t.frames >= autoSealFrames &&
+              time - t.firstTime >= autoSealMinSec &&
+              !growing &&
+              pw >= 48 &&
+              minAll >= 1.15 &&
+              minUpper >= 1.0;
+            const longDwell =
+              t.frames >= (growing && pw < 64 && t.missed === 0 ? 48 : 42) &&
+              time - t.firstTime >= 3.2 &&
+              mean(t.memory.mem_P.data) >= autoSealMinPrecision;
+            readyToSeal = allFieldsCrisp || longDwell;
+          }
         } else {
+          const holdLowRes =
+            isLowRes &&
+            !exited &&
+            t.missed === 0 &&
+            t.frames < 24 &&
+            minUpperFieldPrecision(t.memory.mem_P.data) < 1.15;
           readyToSeal =
+            !holdLowRes &&
             t.frames >= autoSealFrames &&
             time - t.firstTime >= autoSealMinSec &&
             mean(t.memory.mem_P.data) >= autoSealMinPrecision;
@@ -2781,6 +3339,7 @@ export async function createPipeline({
       frameIndex,
       fullDetections,
       fastFrames,
+      sceneCut: Boolean(sceneCut),
       latencyMs: performance.now() - started,
       newlyFinalized,
       finalizedTracks: tracks
@@ -2807,6 +3366,7 @@ export async function createPipeline({
         .filter(
           t =>
             t.state === 'COLLECTING' &&
+            !t.sceneCutFrozen &&
             (used.has(t.id) || t.missed <= 2) &&
             (!discardShortUnreadable || t.frames >= 2)
         )
@@ -2899,12 +3459,13 @@ export async function createPipeline({
     }
     tracks = [];
     vtracks = [];
-    h3 = zero([1, 36, 56, 96]);
-    h4 = zero([1, 36, 28, 48]);
+    h3 = zero(h3Shape);
+    h4 = zero(h4Shape);
     lastFull = -Infinity;
     lastFullTime = -Infinity;
     lastDetIntervalSec = 0.12;
     hasScoutPrev = false;
+    innerHistPrev.fill(0);
     prevLumaMean = null;
     lastTime = -Infinity;
     zoomCooldown = 0;

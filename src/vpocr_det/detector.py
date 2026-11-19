@@ -1070,8 +1070,8 @@ class TemporalDetModelConfig:
                 c4=112,
                 neck_ch=36,
                 head_ch=56,
-                veh_roi_ch=56,
-                cutout_ch=32,
+                veh_roi_ch=40,
+                cutout_ch=28,
                 depth_mult=2,
                 strides=(4, 8, 16),
                 num_classes=int(num_classes),
@@ -1104,8 +1104,8 @@ class TemporalDetModelConfig:
     def from_dict(cls, d: dict[str, Any]) -> TemporalDetModelConfig:
         preset_s = str(d.get("preset", "base"))
         default_variant = "nano" if preset_s == "nano" else "small"
-        default_roi_ch = 56 if preset_s == "nano" else 64
-        default_cut_ch = 32
+        default_roi_ch = 40 if preset_s == "nano" else 64
+        default_cut_ch = 28 if preset_s == "nano" else 32
         return cls(
             arch=str(d.get("arch", "TemporalPlateDetNet")),
             preset=preset_s,
@@ -1303,23 +1303,23 @@ class PlateTemporalScaleHead(nn.Module):
         super().__init__()
         if head_ch <= 48:
             self.cls_stem = nn.Sequential(
-                ConvBNAct(in_ch, head_ch, k=3, s=1, g=math.gcd(in_ch, head_ch)),
-                ConvBNAct(head_ch, head_ch, k=1, s=1),
+                ConvBNAct(in_ch, in_ch, k=3, s=1, g=in_ch),
+                ConvBNAct(in_ch, head_ch, k=1, s=1),
             )
             self.reg_stem = nn.Sequential(
-                ConvBNAct(in_ch, head_ch, k=3, s=1, g=math.gcd(in_ch, head_ch)),
-                ConvBNAct(head_ch, head_ch, k=1, s=1),
+                ConvBNAct(in_ch, in_ch, k=3, s=1, g=in_ch),
+                ConvBNAct(in_ch, head_ch, k=1, s=1),
             )
         else:
             self.cls_stem = nn.Sequential(
-                ConvBNAct(in_ch, head_ch, k=3, s=1, g=math.gcd(in_ch, head_ch)),
-                ConvBNAct(head_ch, head_ch, k=1, s=1),
+                ConvBNAct(in_ch, in_ch, k=3, s=1, g=in_ch),
+                ConvBNAct(in_ch, head_ch, k=1, s=1),
                 ConvBNAct(head_ch, head_ch, k=3, s=1, g=head_ch),
                 ConvBNAct(head_ch, head_ch, k=1, s=1),
             )
             self.reg_stem = nn.Sequential(
-                ConvBNAct(in_ch, head_ch, k=3, s=1, g=math.gcd(in_ch, head_ch)),
-                ConvBNAct(head_ch, head_ch, k=1, s=1),
+                ConvBNAct(in_ch, in_ch, k=3, s=1, g=in_ch),
+                ConvBNAct(in_ch, head_ch, k=1, s=1),
                 ConvBNAct(head_ch, head_ch, k=3, s=1, g=head_ch),
                 ConvBNAct(head_ch, head_ch, k=1, s=1),
             )
@@ -1345,55 +1345,49 @@ class PlateTemporalScaleHead(nn.Module):
         return cls_2ch, ltrb_norm, quad_norm
 
 
-class _QuerySelfAttnBlock(nn.Module):
-    """ONNX Opset-17 static-clean 4-head scaled dot-product self-attention across the `300` object queries."""
+class _QueryContextMLP(nn.Module):
+    """Compact O(Q) per-query residual MLP with pooled scene context (replaces quadratic 300x300 self-attention)."""
 
-    def __init__(self, dim: int, num_heads: int = 4) -> None:
+    def __init__(self, dim: int) -> None:
         super().__init__()
-        assert dim % num_heads == 0
         self.dim = int(dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = dim // num_heads
-        self.scale = float(self.head_dim) ** -0.5
-        self.norm1 = nn.LayerNorm(dim)
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim)
+        self.ctx_proj = nn.Linear(dim, dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 2),
             nn.SiLU(inplace=True),
             nn.Linear(dim * 2, dim),
         )
-        nn.init.zeros_(self.proj.bias)
-        nn.init.normal_(self.proj.weight, std=0.01)
+        nn.init.zeros_(self.ctx_proj.bias)
+        nn.init.normal_(self.ctx_proj.weight, std=0.01)
+        nn.init.zeros_(self.ffn[2].bias)
+        nn.init.normal_(self.ffn[2].weight, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, n_q, _ = x.shape
-        h = self.norm1(x)
-        qkv = self.qkv(h).reshape(bsz, n_q, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = torch.softmax((q @ k.transpose(-2, -1)) * self.scale, dim=-1)
-        ctx = (attn @ v).transpose(1, 2).reshape(bsz, n_q, self.dim)
-        x = x + self.proj(ctx)
-        x = x + self.ffn(self.norm2(x))
-        return x
+        h = self.norm(x)
+        scene_ctx = h.mean(dim=1, keepdim=True)
+        return x + self.ffn(h + self.ctx_proj(scene_ctx))
 
 
 class VehicleQueryHead(nn.Module):
-    """Single learned vehicle observation authority over multiscale/query features."""
+    """Frozen COCO vehicle probability & boxes + synthetic-trained Re-ID/attribute/mount/cutout query head.
+
+    `veh_logit_q` and `pred_boxes_px` are derived strictly from the frozen Apache-2.0 `DFineCore`
+    COCO logits & boxes with zero synthetic-trained residual overrides or box warping.
+    """
 
     def __init__(
         self,
         roi_feat_ch: int,
         dfine_d_model: int,
         hidden_dim: int = 96,
-        spatial_ch: int = 20,
+        spatial_ch: int = 16,
         num_subtypes: int = NUM_VEHICLE_SUBTYPES,
         use_v5_heads: bool = True,
     ) -> None:
         super().__init__()
         self.use_v5_heads = bool(use_v5_heads)
-        self.grid_s = 7 if self.use_v5_heads else 5
+        self.grid_s = 5
         self.roi_spatial_conv = ConvBNAct(roi_feat_ch, spatial_ch, k=3, s=1)
         roi_flat_dim = spatial_ch * self.grid_s * self.grid_s
         self.roi_proj = nn.Sequential(
@@ -1401,7 +1395,7 @@ class VehicleQueryHead(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.SiLU(inplace=True),
         )
-        # Fuse query embeddings, multiscale ROI features, geometry and all class logits.
+        # Fuse query embeddings, multiscale ROI features, geometry and all class logits for attribute/Re-ID heads.
         q_in_dim = int(dfine_d_model) + hidden_dim + 5 + 80
         attn_dim = hidden_dim if hidden_dim % 4 == 0 else ((hidden_dim + 3) // 4) * 4
         self.query_in_proj = nn.Sequential(
@@ -1409,9 +1403,7 @@ class VehicleQueryHead(nn.Module):
             nn.LayerNorm(attn_dim),
             nn.SiLU(inplace=True),
         )
-        self.query_self_attn = _QuerySelfAttnBlock(attn_dim, num_heads=4)
-        self.synth_cls_pred = nn.Linear(attn_dim, 1)
-        self.box_polish_pred = nn.Linear(attn_dim, 4)
+        self.query_ctx_mlp = _QueryContextMLP(attn_dim)
 
         # All observation attributes share one learned query representation.
         self.attr_mlp = nn.Sequential(nn.Linear(attn_dim, hidden_dim), nn.SiLU())
@@ -1436,10 +1428,6 @@ class VehicleQueryHead(nn.Module):
         self.footprint_pred = nn.Linear(hidden_dim, 9)  # [valid_logit, 4*(dx, dy)]
         self.plate_mount_pred = nn.Linear(hidden_dim, 5)  # [mcx, mcy, mw, mh, mount_vis_logit]
 
-        nn.init.constant_(self.synth_cls_pred.bias, -1.25)
-        nn.init.zeros_(self.synth_cls_pred.weight)
-        nn.init.zeros_(self.box_polish_pred.bias)
-        nn.init.zeros_(self.box_polish_pred.weight)
         nn.init.zeros_(self.subtype_pred.bias)
         nn.init.normal_(self.subtype_pred.weight, std=0.02)
         nn.init.zeros_(self.cabin_pred.bias)
@@ -1504,13 +1492,17 @@ class VehicleQueryHead(nn.Module):
         scale_xyxy = raw_xyxy_norm.new_tensor([img_w, img_h, img_w, img_h])
         raw_boxes_px = raw_xyxy_norm * scale_xyxy
 
-        # Anchor classification to exact COCO vehicle ([2, 3, 5, 7]) vs non-vehicle log-odds
-        # with bounded learned residual + ROI feature dropout so synthetic PBR textures cannot suppress real vehicles.
-        coco_veh_llr = (
-            torch.logsumexp(logits_80.index_select(-1, self.coco_veh_idx), dim=-1, keepdim=True)
-            - torch.logsumexp(logits_80.index_select(-1, self.coco_non_veh_idx), dim=-1, keepdim=True)
-        )
-        dfine_veh_logit = coco_veh_llr.squeeze(-1)
+        # Pure, uncorrupted frozen COCO vehicle vs non-vehicle probability directly from `dfine_core`.
+        # Non-vehicle suppression ensures persons, mascots, signs, bicycles, etc. suppress weak vehicle logits.
+        probs_80 = logits_80.sigmoid()
+        coco_veh_p = probs_80.index_select(-1, self.coco_veh_idx).amax(dim=-1)
+        coco_non_p = probs_80.index_select(-1, self.coco_non_veh_idx).amax(dim=-1)
+        eff_p = (coco_veh_p * torch.sigmoid((coco_veh_p - 0.85 * coco_non_p) * 12.0)).clamp(1e-5, 1.0 - 1e-5)
+        dfine_veh_logit = torch.log(eff_p / (1.0 - eff_p))
+        veh_logit_q = dfine_veh_logit / self.cal_temp + self.cal_bias
+        # Zero synthetic box warping: preserve exact frozen D-FINE COCO vehicle boxes.
+        pred_boxes_px = raw_boxes_px
+
         roi_emb = self._pool_rois(veh_feat_s8, raw_xyxy_norm)  # (B, Q, D_h)
         roi_emb = F.dropout(roi_emb, p=0.20, training=self.training)
         cx_n, cy_n, bw_n, bh_n = boxes_cxcywh.clamp(1e-3, 1.0).unbind(-1)
@@ -1518,16 +1510,7 @@ class VehicleQueryHead(nn.Module):
         geom_5 = torch.stack([cx_n, cy_n, bw_n, bh_n, log_ar], dim=-1)
 
         q_in = torch.cat([q_embeds, roi_emb, geom_5, logits_80], dim=-1)
-        q_ctx = self.query_self_attn(self.query_in_proj(q_in))
-        learned_residual = self.synth_cls_pred(q_ctx)
-        raw_log_odds = (0.85 * coco_veh_llr + 3.5 * torch.tanh(learned_residual / 3.5)).squeeze(-1)
-        veh_logit_q = raw_log_odds / self.cal_temp + self.cal_bias
-
-        # Zero-init box residual, independent of classification confidence.
-        delta_norm = self.box_polish_pred(q_ctx)
-        center = boxes_cxcywh[..., :2] + delta_norm[..., :2].clamp(-0.5, 0.5)
-        size = boxes_cxcywh[..., 2:].clamp_min(1e-6) * torch.exp(delta_norm[..., 2:].clamp(-1.5, 1.5))
-        pred_boxes_px = center_to_corners_format_torch(torch.cat([center, size], dim=-1)) * scale_xyxy
+        q_ctx = self.query_ctx_mlp(self.query_in_proj(q_in))
         chol_raw = self.cov_pred(q_ctx)
         # Preserve the positive diagonal and Gram matrix precision under AMP.
         with torch.amp.autocast(device_type=q_ctx.device.type, enabled=False):
@@ -1755,6 +1738,7 @@ class TemporalPlateDetNet(nn.Module):
 
         # Fuse photometric multi-scale features with detached D-FINE semantic features
         self.lat4 = ConvBNAct(cfg.c4 + df_pan_ch, nc, k=1, s=1)
+        self.p4_ctx = DWConvBlock(nc, k=5)
         self.lat3 = ConvBNAct(cfg.c3 + df_c3_ch, nc, k=1, s=1)
         self.lat2 = ConvBNAct(cfg.c2 + df_c2_ch, nc, k=1, s=1)
 
@@ -1858,7 +1842,7 @@ class TemporalPlateDetNet(nn.Module):
         c3 = self.stage3(c2)  # H/8
         c4 = self.stage4(c3)  # H/16
 
-        p4_td = self.lat4(torch.cat([c4, df_s16.to(dtype=c4.dtype)], dim=1))
+        p4_td = self.p4_ctx(self.lat4(torch.cat([c4, df_s16.to(dtype=c4.dtype)], dim=1)))
         l3 = self.lat3(torch.cat([c3, df_c3.to(dtype=c3.dtype)], dim=1))
         p3_td = self.td3(torch.cat([l3, F.interpolate(p4_td, size=c3.shape[-2:], mode="nearest")], dim=1))
 
@@ -1950,13 +1934,12 @@ class TemporalPlateDetNet(nn.Module):
                 dim=-1,
             ).reshape(bsz, n_l, 4, 2)
 
-            gy, gx = torch.meshgrid(
-                (torch.arange(hl, device=device, dtype=torch.float32) + 0.5) * st_f,
-                (torch.arange(wl, device=device, dtype=torch.float32) + 0.5) * st_f,
-                indexing="ij",
-            )
+            # Runtime-dependent zero grid avoids constant-folding ~332 KiB of FP32 anchors into ONNX.
+            zero_hw = cls_2ch[0, 0].float().detach() * 0.0
+            gx = zero_hw + cx_1d[0]
+            gy = zero_hw + cy_1d[0]
             pts = torch.stack([gx, gy], dim=-1).reshape(-1, 2)
-            st = torch.full((pts.shape[0],), st_f, device=device, dtype=torch.float32)
+            st = zero_hw.reshape(-1) + st_f
             pts_all.append(pts)
             str_all.append(st)
 
@@ -1997,7 +1980,7 @@ class TemporalPlateDetNet(nn.Module):
         q_cx = 0.5 * (q_out["raw_q_boxes_px"][0, :, 0] + q_out["raw_q_boxes_px"][0, :, 2])
         q_cy = 0.5 * (q_out["raw_q_boxes_px"][0, :, 1] + q_out["raw_q_boxes_px"][0, :, 3])
         pts_all.append(torch.stack([q_cx, q_cy], dim=-1).detach())
-        str_all.append(torch.full((num_q,), -1.0, device=device, dtype=torch.float32))
+        str_all.append(q_cx.detach() * 0.0 - 1.0)
 
         out_d: dict[str, Any] = {
             "cls_logits": torch.cat(cls_all, dim=1),
@@ -2467,27 +2450,37 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                     & (ay[None, :] >= gy0[:, None])
                     & (ay[None, :] <= gy1[:, None])
                 )
-                # Boost negative focal penalty on CLS_PLATE inside any hard-negative stencil/badge/sign box!
+                gt_max_dim = torch.maximum(gx1 - gx0, gy1 - gy0)[:, None]
+                st_row = st_pyr[None, :]
+                rad = torch.where(
+                    (gt_max_dim < 44.0) | ((gt_max_dim >= 60.0) & (st_row >= 16.0)),
+                    3.0 * st_row,
+                    2.5 * st_row,
+                )
+                in_center = (torch.abs(ax[None, :] - gcx[:, None]) <= rad) & (
+                    torch.abs(ay[None, :] - gcy[:, None]) <= rad
+                )
+                # Balanced negative focal suppression strictly inside hard-negative boxes (high-recall Stage-1; Stage-2 verifies).
                 hn_rows = ps_labels == CLS_SIGNBOARD_HARDNEG
+                in_any_hn = torch.zeros((a_pyr,), device=device, dtype=torch.bool)
                 if hn_rows.any():
                     in_any_hn = in_box[hn_rows].any(dim=0)
                     pyr_hardneg_boost[b] = torch.where(
                         in_any_hn,
-                        torch.full_like(pyr_hardneg_boost[b], 2.5),
+                        torch.full_like(pyr_hardneg_boost[b], 2.0),
                         pyr_hardneg_boost[b],
                     )
 
-                gt_max_dim = torch.maximum(gx1 - gx0, gy1 - gy0)[:, None]
-                rad = torch.where(gt_max_dim < 44.0, 3.0 * st_pyr[None, :], 2.5 * st_pyr[None, :])
-                in_center = (torch.abs(ax[None, :] - gcx[:, None]) <= rad) & (
-                    torch.abs(ay[None, :] - gcy[:, None]) <= rad
-                )
-                st_row = st_pyr[None, :]
                 is_pl = (ps_labels == CLS_PLATE)[:, None]
+                # Cover tiny 8-26px plates on P2/P3, medium 26-76px across P2/P3/P4, and close-up 76-220px on P3/P4.
                 pl_ok = torch.where(
-                    gt_max_dim < 52.0,
+                    gt_max_dim < 26.0,
                     st_row <= 8.0,
-                    torch.where(gt_max_dim < 116.0, st_row <= 16.0, st_row >= 8.0),
+                    torch.where(
+                        gt_max_dim < 76.0,
+                        st_row <= 16.0,
+                        torch.where(gt_max_dim < 128.0, st_row >= 8.0, st_row >= 16.0),
+                    ),
                 )
                 sign_ok = torch.where(gt_max_dim < 56.0, st_row <= 8.0, st_row >= 8.0)
                 stride_ok = torch.where(is_pl, pl_ok, sign_ok)
@@ -2499,7 +2492,7 @@ class TemporalTaskAlignedDetLoss(nn.Module):
 
                 ious = pairwise_box_iou(ps_boxes, pred_boxes[b, :a_pyr].detach())
                 nwds = pairwise_box_nwd(ps_boxes, pred_boxes[b, :a_pyr].detach())
-                sim_quality = torch.where(is_pl, 0.65 * ious + 0.35 * nwds, ious)
+                sim_quality = torch.where(is_pl, 0.60 * ious + 0.40 * nwds, ious)
                 gt_cls_probs = probs_pyr[b, :, ps_labels].transpose(0, 1)
                 align_metric = (gt_cls_probs.clamp_min(1e-6) ** self.alpha) * (sim_quality.clamp_min(1e-6) ** self.beta)
                 align_metric = torch.where(cand_mask, align_metric, torch.zeros_like(align_metric))
@@ -2508,6 +2501,15 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                 topk_vals, topk_idx = torch.topk(align_metric, k=k_sel, dim=1)
                 pos_mask = torch.zeros_like(cand_mask)
                 pos_mask.scatter_(1, topk_idx, topk_vals > 0.0)
+                # Ensure close-up large plates (>= 56px) always supervise P4 (stride=16) so P3 density never starves P4.
+                large_pl_p4 = (is_pl & (gt_max_dim >= 56.0)) & (st_row >= 16.0) & cand_mask
+                if large_pl_p4.any():
+                    p4_metric = torch.where(large_pl_p4, align_metric, torch.zeros_like(align_metric))
+                    k_p4 = min(4, a_pyr)
+                    p4_vals, p4_idx = torch.topk(p4_metric, k=k_p4, dim=1)
+                    p4_pos = torch.zeros_like(cand_mask)
+                    p4_pos.scatter_(1, p4_idx, p4_vals > 0.0)
+                    pos_mask = pos_mask | (p4_pos & large_pl_p4)
                 pos_mask = pos_mask & cand_mask
 
                 anchor_pos_count = pos_mask.sum(dim=0)
@@ -2538,6 +2540,9 @@ class TemporalTaskAlignedDetLoss(nn.Module):
                     rows = ps_labels == cls_id
                     if rows.any():
                         pyr_ignore_2ch[b, :, channel] |= ambig[rows].any(dim=0)
+                if hn_rows.any():
+                    # Never ignore plate negatives inside hard-negative boxes unless matched to an actual plate.
+                    pyr_ignore_2ch[b, :, 0] &= ~in_any_hn
                 pyr_fg_mask[b] = fg_b
                 pyr_gt_cls[b, fg_idx] = cls_sel
                 pyr_gt_boxes[b, fg_idx] = ps_boxes[gt_sel]
@@ -2545,33 +2550,39 @@ class TemporalTaskAlignedDetLoss(nn.Module):
 
                 gt_w = (ps_boxes[gt_sel, 2] - ps_boxes[gt_sel, 0]).clamp_min(4.0)
                 gt_h = (ps_boxes[gt_sel, 3] - ps_boxes[gt_sel, 1]).clamp_min(2.0)
+                gt_ar = gt_w / gt_h
                 is_small_or_shadow_pl = (cls_sel == CLS_PLATE) & (
-                    (gt_w < 18.0) | (torch.sqrt(gt_w * gt_h) < 18.0) | (ps_shadow[gt_sel] > 0.60)
+                    (gt_w < 20.0) | (torch.sqrt(gt_w * gt_h) < 18.0) | (ps_shadow[gt_sel] > 0.60)
                 )
+                is_any_pl = cls_sel == CLS_PLATE
                 pyr_pos_boost[b, fg_idx] = torch.where(
                     is_small_or_shadow_pl,
-                    torch.full_like(qual_sel, 2.0),
-                    torch.ones_like(qual_sel),
-                )
-                small_boost = torch.where(
-                    is_small_or_shadow_pl,
-                    torch.full_like(qual_sel, 2.0),
+                    torch.full_like(qual_sel, 2.20),
                     torch.where(
-                        (cls_sel == CLS_PLATE) & (gt_w < 38.0),
-                        torch.full_like(qual_sel, 1.6),
+                        is_any_pl,
+                        torch.full_like(qual_sel, 2.00),
                         torch.ones_like(qual_sel),
                     ),
                 )
-                pyr_weights[b, fg_idx] = qual_sel * small_boost
+                scale_boost = torch.where(
+                    is_small_or_shadow_pl,
+                    torch.full_like(qual_sel, 2.20),
+                    torch.where(
+                        is_any_pl,
+                        torch.full_like(qual_sel, 2.00),
+                        torch.ones_like(qual_sel),
+                    ),
+                )
+                pyr_weights[b, fg_idx] = qual_sel * scale_boost
 
-        # 1. Pyramid Classification Loss (`CLS_PLATE` + `CLS_SIGNBOARD_HARDNEG` + explicit margin)
+        # 1. Pyramid Classification Loss (`CLS_PLATE` high-recall + balanced hardneg margin)
         pyr_logits_2ch = torch.stack(
             [cls_logits[:, :a_pyr, CLS_PLATE], cls_logits[:, :a_pyr, CLS_SIGNBOARD_HARDNEG]],
             dim=-1,
         )
         pyr_prob_2ch = torch.sigmoid(pyr_logits_2ch)
-        neg_w_2ch = 1.35 * (pyr_prob_2ch.detach() ** 2.0)
-        neg_w_2ch[:, :, 0] = neg_w_2ch[:, :, 0] * pyr_hardneg_boost
+        neg_w_2ch = 1.20 * (pyr_prob_2ch.detach() ** 2.0)
+        neg_w_2ch[:, :, 0] = 0.90 * (pyr_prob_2ch[:, :, 0].detach() ** 2.0) * pyr_hardneg_boost
         pos_w_2ch = pyr_qual_2ch * pyr_pos_boost.unsqueeze(-1)
         focal_pyr = torch.where(pyr_pos_2ch > 0.0, pos_w_2ch, neg_w_2ch)
         if pyr_ignore_2ch.any():
@@ -2582,31 +2593,17 @@ class TemporalTaskAlignedDetLoss(nn.Module):
         hn_pos_mask = pyr_pos_2ch[:, :, 1] > 0.0
         if hn_pos_mask.any():
             pyr_cls_f = cls_logits[:, :a_pyr].float()
-            loss_hn_margin = 0.5 * F.softplus(
+            loss_hn_margin = 0.18 * F.softplus(
                 pyr_cls_f[:, :, CLS_PLATE][hn_pos_mask]
                 - pyr_cls_f[:, :, CLS_SIGNBOARD_HARDNEG][hn_pos_mask]
-                + 1.5
+                + 0.75
             ).mean()
             loss_cls_pyr = loss_cls_pyr + loss_hn_margin
 
-        # Bernoulli vehicle/background NLL (with 2.5x interior sub-box penalty and sliver ignore mask).
-        if num_q > 0 and synth_veh_logits is not None:
-            bce_q = F.binary_cross_entropy_with_logits(
-                synth_veh_logits.float(), q_fg_mask.float(), reduction="none"
-            )
-            loss_cls_q = (bce_q * q_cls_weight).sum() / float(max(1, bsz) * 6.0)
-        else:
-            loss_cls_q = cls_logits.sum() * 0.0
+        # Frozen COCO vehicle logits are untouched by synthetic training; no vehicle cls/box gradient needed.
+        loss_cls_q = cls_logits.sum() * 0.0
         loss_teacher_kl = cls_logits.sum() * 0.0
-        if self.teacher_kl_weight and "teacher_veh_log_odds" in step_out:
-            teacher_p = torch.sigmoid(step_out["teacher_veh_log_odds"].detach().float())
-            student_l = synth_veh_logits.float()
-            # Stable Bernoulli KL, with teacher entropy retained for proper reporting.
-            loss_teacher_kl = (F.binary_cross_entropy_with_logits(student_l, teacher_p, reduction="none")
-                               + torch.special.xlogy(teacher_p, teacher_p)
-                               + torch.special.xlogy(1 - teacher_p, 1 - teacher_p)).mean()
-
-        loss_cls = loss_cls_pyr + 3.0 * loss_cls_q
+        loss_cls = loss_cls_pyr
 
         zero = pred_boxes.sum() * 0.0
         loss_box_pyr = zero
@@ -2651,10 +2648,6 @@ class TemporalTaskAlignedDetLoss(nn.Module):
             vw_sum = vw_fg.sum().clamp_min(1e-6)
             cov_fg = step_out["bbox_cov_4x4"][q_fg_mask].double()
             chol = torch.linalg.cholesky(cov_fg)
-            _, q_ciou = compute_box_iou_ciou(q_pred_boxes_fg, q_gt_boxes_fg)
-            gt_wh_scale = (q_gt_boxes_fg[:, 2:] - q_gt_boxes_fg[:, :2]).clamp_min(16.0).repeat(1, 2)
-            loss_box_q_reg = (1.0 - q_ciou).mean() + 0.5 * F.smooth_l1_loss(
-                q_pred_boxes_fg / gt_wh_scale, q_gt_boxes_fg / gt_wh_scale, beta=0.10)
             error_det = (q_pred_boxes_fg.detach() - q_gt_boxes_fg).double().unsqueeze(-1)
             white = torch.linalg.solve_triangular(chol, error_det, upper=False).squeeze(-1)
             loss_box_nll = (0.5 * white.square().sum(-1)
@@ -3045,19 +3038,7 @@ def compute_temporal_det_kd_loss(
             if fp_q.any():
                 neg_s_vlogit.append(s_vb[fp_q])
 
-        if matched_s_vlogit:
-            sv_cat = torch.cat(matched_s_vlogit, dim=0)
-            tv_cat = torch.cat(matched_t_vlogit, dim=0)
-            tv_soft = torch.sigmoid(tv_cat / temperature)
-            loss_kd = loss_kd + 0.55 * F.binary_cross_entropy_with_logits(
-                sv_cat / temperature, tv_soft, reduction="mean"
-            ) * (temperature * temperature)
-        if matched_s_box:
-            sb_cat = torch.cat(matched_s_box, dim=0)
-            tb_cat = torch.cat(matched_t_box, dim=0)
-            v_giou = compute_box_giou(sb_cat, tb_cat)
-            v_l1 = F.l1_loss(sb_cat / img_whwh, tb_cat / img_whwh, reduction="mean")
-            loss_kd = loss_kd + 0.65 * (1.0 - v_giou).mean() + 2.5 * v_l1
+        # Distill trainable attribute/mount heads (frozen COCO vehicle logits/boxes need no synthetic KD).
         if matched_s_mvis:
             smv_cat = torch.cat(matched_s_mvis, dim=0)
             tmv_cat = torch.cat(matched_t_mvis, dim=0)
@@ -3076,11 +3057,6 @@ def compute_temporal_det_kd_loss(
             t_sub_cat = F.softmax(torch.cat(matched_t_sub, dim=0) / temperature, dim=-1)
             loss_kd = loss_kd + 0.25 * F.kl_div(s_sub_cat, t_sub_cat, reduction="batchmean") * (
                 temperature * temperature
-            )
-        if neg_s_vlogit:
-            s_neg_cat = torch.cat(neg_s_vlogit, dim=0)
-            loss_kd = loss_kd + 0.25 * F.binary_cross_entropy_with_logits(
-                s_neg_cat, torch.full_like(s_neg_cat, 0.01), reduction="mean"
             )
 
     return loss_kd
@@ -3308,8 +3284,8 @@ def decode_temporal_det_predictions(
         & (vh_all >= 2.8)
         & (vw_all <= 0.96 * w_orig)
         & (vh_all <= 0.90 * h_orig)
-        & (aspect_all >= 0.50)
-        & (aspect_all <= 4.80)
+        & (aspect_all >= 0.45)
+        & (aspect_all <= 5.50)
         & (qw_all >= 0.34 * vw_all)
         & (qw_all <= 1.90 * vw_all)
         & (qh_all >= 0.34 * vh_all)
@@ -3687,8 +3663,8 @@ def decode_temporal_det_predictions(
                         (zbw >= 5.0)
                         & (zbh >= 2.8)
                         & (zbw <= min(0.40 * w_orig, 0.70 * sub_w))
-                        & ((zbw / np.maximum(1e-3, zbh)) >= 0.52)
-                        & ((zbw / np.maximum(1e-3, zbh)) <= 4.70)
+                        & ((zbw / np.maximum(1e-3, zbh)) >= 0.45)
+                        & ((zbw / np.maximum(1e-3, zbh)) <= 5.50)
                         & (zqw >= 0.35 * zbw)
                         & (zqw <= 1.90 * zbw)
                         & (zqh >= 0.35 * zbh)
@@ -3846,8 +3822,8 @@ def export_unified_temporal_det_onnx(
         paths[f"{name}_int8_path"] = str(int8)
         total_bytes += int8.stat().st_size
     paths["combined_int8_bytes"] = total_bytes
-    if model.config.preset == "nano" and total_bytes > 8_388_608:
-        raise ValueError(f"Stage-1 Nano INT8 {total_bytes} bytes exceeds 8,388,608 byte cap")
+    if model.config.preset == "nano" and total_bytes > 5_662_310:
+        raise ValueError(f"Stage-1 Nano INT8 {total_bytes} bytes exceeds 5,662,310 byte (5.4 MiB) cap")
     return paths
 
 

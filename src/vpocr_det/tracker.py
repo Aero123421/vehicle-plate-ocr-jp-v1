@@ -16,6 +16,11 @@ import math
 from typing import Any
 import numpy as np
 
+from vpocr_det.optical_tracker import (
+    VehicleAppearanceRef,
+    extract_vehicle_appearance,
+    track_vehicle_patch_ncc,
+)
 from vpocr_det.quad_cropper import (
     is_valid_plate_quad,
     select_containment_crop_window,
@@ -1116,9 +1121,32 @@ class _KalmanVehicleTrack(_ExistenceState):
         self.P[4:,4:] = np.eye(4)*max(z[2], z[3])**2
         self.last_state_ts = self.last_obs_ts = ts
         self.hits, self.missed = 1, 0
+        self.stage1_missed = 0
+        self.opt_missed = 0
+        self.missed_since_ts: float | None = None
+        self.veh_ref: VehicleAppearanceRef | None = None
+        self.app32: np.ndarray | None = None
+        self.patch_ncc: float = 1.0
+        self.opt_ok: bool = True
         self.bound_plate_track_ids: list[int] = []
         self.subtype_log_post = np.zeros(9, dtype=np.float64)
         self._update_subtype(veh)
+
+    def update_appearance(self, ref: VehicleAppearanceRef | None) -> None:
+        self.stage1_missed = 0
+        self.opt_missed = 0
+        self.missed_since_ts = None
+        self.patch_ncc = 1.0
+        self.opt_ok = True
+        if ref is None:
+            return
+        self.veh_ref = ref
+        if self.app32 is None or self.app32.shape != ref.app32.shape:
+            self.app32 = ref.app32.copy()
+        else:
+            blended = 0.72 * self.app32 + 0.28 * ref.app32
+            nrm = float(np.linalg.norm(blended))
+            self.app32 = (blended / nrm).astype(np.float32) if nrm > 1e-6 else ref.app32.copy()
 
     def _update_subtype(self, veh: VehicleDetection) -> None:
         k = int(getattr(veh, "vehicle_subtype", 0))
@@ -1224,9 +1252,24 @@ class _PMBMTrackerBase:
         self.last_assignment_posterior = AssignmentPosterior((),0.0)
         self.camera_motion_estimator = BackgroundCameraMotionEstimator()
         self._seen_measurements: set[tuple[Any,...]] = set()
+        self._step_obs_app32: dict[int, np.ndarray] = {}
 
     def reset(self) -> None:
         self._initialize(self.calibration,self.default_dt_s)
+
+    def flush_for_scene_cut(self) -> list[int]:
+        """Flush all active/dormant states on a hard scene cut without resetting monotonic IDs."""
+        expired = [self._id(t) for t in (*self._tracks, *self._dormant_tracks) if t.confirmed]
+        self._tracks.clear()
+        self._dormant_tracks.clear()
+        self._seen_measurements.clear()
+        self._step_obs_app32.clear()
+        self.last_expired_track_ids = expired
+        self.last_relinked_pairs = []
+        self.last_stale_rejected = False
+        self.last_assignment_posterior = AssignmentPosterior((), 0.0)
+        self.camera_motion_estimator.reset()
+        return expired
 
     def _id(self, t: Any) -> int:
         return t.track_id if self.plate_mode else t.vehicle_track_id
@@ -1262,6 +1305,14 @@ class _PMBMTrackerBase:
         innovation = 0.0 if key is not None and key in t.evidence_keys else min(
             1.0,max(0.0,ts-t.last_mark_ts)/self.calibration.innovation_tau_s)
         app = _vmf_log_ratio(t.last_embedding,t._embedding(obs),self.calibration.appearance_kappa)
+        if not self.plate_mode:
+            obs_app32 = self._step_obs_app32.get(id(obs))
+            t_app32 = getattr(t, "app32", None)
+            if obs_app32 is not None and t_app32 is not None:
+                a_c = t_app32 - float(np.mean(t_app32))
+                b_c = obs_app32 - float(np.mean(obs_app32))
+                app32_ll = _vmf_log_ratio(a_c, b_c, min(6.0, 0.50 * self.calibration.appearance_kappa))
+                app = (0.75 * app + 0.25 * app32_ll) if (t.last_embedding is not None and t._embedding(obs) is not None) else app32_ll
         return geometry-math.log(density)+innovation*app
 
     def _birth_weight(self, obs: Any) -> float:
@@ -1297,7 +1348,8 @@ class _PMBMTrackerBase:
     def _advance(self, observations: list[Any], timestamp_s: float | None,
                  action_meta: ObservationActionMeta | None,
                  camera_motion: CameraMotionEstimate | None,
-                 frame_rgb: np.ndarray | None) -> dict[int,Any]:
+                 frame_rgb: np.ndarray | None,
+                 precomputed_veh_ncc: dict[int, tuple[bool, float, tuple[float, float, float, float], float, float]] | None = None) -> dict[int,Any]:
         ts = (0.0 if self._current_ts is None else self._current_ts+self.default_dt_s) if timestamp_s is None else float(timestamp_s)
         if not math.isfinite(ts):
             raise ValueError('timestamp_s must be finite')
@@ -1322,88 +1374,167 @@ class _PMBMTrackerBase:
                     _compensate_plate(t,camera_motion)
                 else:
                     t.compensate(camera_motion)
-        c = self.calibration
-        pD = np.array([detection_availability(t.bbox_xyxy,action,c.detection_probability) for t in self._tracks])
-        obs_pD = np.array([detection_availability(z.bbox_xyxy,action,c.detection_probability) for z in obs])
-        pair = np.full((len(self._tracks),len(obs)),-math.inf)
-        missed = np.array([math.log1p(-t.r*p) for t,p in zip(self._tracks,pD)])
-        for i,t in enumerate(self._tracks):
+
+        veh_textured = (
+            not self.plate_mode
+            and frame_rgb is not None
+            and frame_rgb.ndim == 3
+            and frame_rgb.size > 0
+            and float(frame_rgb[::8, ::8].std()) > 2.0
+        )
+        obs_refs: dict[int, VehicleAppearanceRef | None] = {}
+        self._step_obs_app32.clear()
+        if veh_textured and obs:
+            for j, z in enumerate(obs):
+                ref = extract_vehicle_appearance(frame_rgb, z.bbox_xyxy)
+                obs_refs[j] = ref
+                if ref is not None:
+                    self._step_obs_app32[id(z)] = ref.app32
+
+        try:
+            c = self.calibration
+            pD = np.array([detection_availability(t.bbox_xyxy,action,c.detection_probability) for t in self._tracks])
+            obs_pD = np.array([detection_availability(z.bbox_xyxy,action,c.detection_probability) for z in obs])
+            pair = np.full((len(self._tracks),len(obs)),-math.inf)
+            missed = np.array([math.log1p(-t.r*p) for t,p in zip(self._tracks,pD)])
+            for i,t in enumerate(self._tracks):
+                for j,z in enumerate(obs):
+                    p_ij = float(pD[i]) if pD[i] > 0 else float(obs_pD[j])
+                    if p_ij > 0:
+                        pair[i,j] = math.log(t.r*p_ij)+self._pair_likelihood(t,z,ts)
+            birth = np.array([self._birth_weight(z) for z in obs])
+            posterior = feasible_assignment_posterior(pair,missed,birth,c.max_hypotheses,c.assignment_node_budget)
+            self.last_assignment_posterior = posterior
+            marginals = np.zeros_like(pair)
+            for hypothesis in posterior.hypotheses:
+                for i,j in hypothesis.pairs:
+                    marginals[i,j] += hypothesis.probability
+            assigned_obs: set[int] = set()
+            updates: dict[int,Any] = {}
+            best_pairs = posterior.hypotheses[0].pairs if posterior.hypotheses else ()
+            assigned_tracks = set()
+            for i,j in best_pairs:
+                # Ambiguous geometry remains separate; pruning mass reduces certainty.
+                if marginals[i,j] <= .5:
+                    continue
+                t = self._tracks[i]
+                if not t.update(obs[j],ts):
+                    continue
+                pD_pair = float(pD[i]) if pD[i] > 0 else float(obs_pD[j])
+                t.detected(obs[j],ts,float(marginals[i,j]),pD_pair)
+                if veh_textured:
+                    t.update_appearance(obs_refs.get(j))
+                assigned_obs.add(j)
+                assigned_tracks.add(i)
+                updates[self._id(t)] = obs[j]
+            for i,t in enumerate(self._tracks):
+                if i not in assigned_tracks:
+                    # If assignment is uncertain, null evidence only carries its posterior mass.
+                    r0 = missed_existence_probability(t.r,float(pD[i]))
+                    assigned_mass = float(marginals[i].sum())
+                    t.r = _prob((1-assigned_mass)*r0+assigned_mass*t.r)
+                    if veh_textured:
+                        probe = precomputed_veh_ncc.get(t.vehicle_track_id) if precomputed_veh_ncc is not None else None
+                        if probe is None and t.veh_ref is not None:
+                            probe = track_vehicle_patch_ncc(
+                                t.veh_ref, frame_rgb, t.bbox_xyxy, max_shift_px=24.0, min_ncc=0.42
+                            )
+                        if probe is not None:
+                            ok_opt, ncc, mbox, mdx, mdy = probe
+                            t.patch_ncc = float(ncc)
+                            t.opt_ok = bool(ok_opt)
+                        else:
+                            ok_opt, ncc, mbox, mdx, mdy = False, 0.0, t.bbox_xyxy, 0.0, 0.0
+                            t.patch_ncc = 0.0
+                            t.opt_ok = False
+
+                        if action.detector_ran_full:
+                            t.stage1_missed += 1
+                            t.x[4:8] *= 0.45
+                            if t.missed_since_ts is None:
+                                t.missed_since_ts = ts
+                            if ok_opt:
+                                t.opt_missed = 0
+                                mcx = 0.5 * (mbox[0] + mbox[2])
+                                mcy = 0.5 * (mbox[1] + mbox[3])
+                                t.x[0] = 0.45 * t.x[0] + 0.55 * mcx
+                                t.x[1] = 0.45 * t.x[1] + 0.55 * mcy
+                            else:
+                                t.opt_missed += 1
+                            if (
+                                t.stage1_missed >= 3
+                                or (ts - t.missed_since_ts) > 0.30
+                                or (t.veh_ref is not None and not ok_opt and t.stage1_missed >= 2)
+                            ):
+                                t.r = 1e-6
+                        else:
+                            if ok_opt:
+                                t.opt_missed = 0
+                                t.missed_since_ts = None
+                                mcx = 0.5 * (mbox[0] + mbox[2])
+                                mcy = 0.5 * (mbox[1] + mbox[3])
+                                prev_cx, prev_cy = float(t.x[0]), float(t.x[1])
+                                t.x[0] = 0.45 * prev_cx + 0.55 * mcx
+                                t.x[1] = 0.45 * prev_cy + 0.55 * mcy
+                                if dt > 1e-3:
+                                    t.x[4] = 0.70 * t.x[4] + 0.30 * float(np.clip((mcx - prev_cx) / dt, -900.0, 900.0))
+                                    t.x[5] = 0.70 * t.x[5] + 0.30 * float(np.clip((mcy - prev_cy) / dt, -900.0, 900.0))
+                            else:
+                                t.opt_missed += 1
+                                if ncc < 0.30:
+                                    t.x[4:8] *= 0.65
+                                if t.missed_since_ts is None:
+                                    t.missed_since_ts = ts
+                                # Only expire on non-full frames if completely lost on asphalt (`ncc < 0.28`) for >= 3 frames
+                                if ncc < 0.28 and (t.opt_missed >= 3 or (ts - t.missed_since_ts) > 0.35):
+                                    t.r = 1e-6
+            for t in self._dormant_tracks:
+                t.missed_detection(detection_availability(t.bbox_xyxy,action,c.detection_probability))
             for j,z in enumerate(obs):
-                p_ij = float(pD[i]) if pD[i] > 0 else float(obs_pD[j])
-                if p_ij > 0:
-                    pair[i,j] = math.log(t.r*p_ij)+self._pair_likelihood(t,z,ts)
-        birth = np.array([self._birth_weight(z) for z in obs])
-        posterior = feasible_assignment_posterior(pair,missed,birth,c.max_hypotheses,c.assignment_node_budget)
-        self.last_assignment_posterior = posterior
-        marginals = np.zeros_like(pair)
-        for hypothesis in posterior.hypotheses:
-            for i,j in hypothesis.pairs:
-                marginals[i,j] += hypothesis.probability
-        assigned_obs: set[int] = set()
-        updates: dict[int,Any] = {}
-        best_pairs = posterior.hypotheses[0].pairs if posterior.hypotheses else ()
-        assigned_tracks = set()
-        for i,j in best_pairs:
-            # Ambiguous geometry remains separate; pruning mass reduces certainty.
-            if marginals[i,j] <= .5:
-                continue
-            t = self._tracks[i]
-            if not t.update(obs[j],ts):
-                continue
-            pD_pair = float(pD[i]) if pD[i] > 0 else float(obs_pD[j])
-            t.detected(obs[j],ts,float(marginals[i,j]),pD_pair)
-            assigned_obs.add(j)
-            assigned_tracks.add(i)
-            updates[self._id(t)] = obs[j]
-        for i,t in enumerate(self._tracks):
-            if i not in assigned_tracks:
-                # If assignment is uncertain, null evidence only carries its posterior mass.
-                r0 = missed_existence_probability(t.r,float(pD[i]))
-                assigned_mass = float(marginals[i].sum())
-                t.r = _prob((1-assigned_mass)*r0+assigned_mass*t.r)
-        for t in self._dormant_tracks:
-            t.missed_detection(detection_availability(t.bbox_xyxy,action,c.detection_probability))
-        for j,z in enumerate(obs):
-            if j in assigned_obs:
-                continue
-            entity = self._new_track(self._next_id,z,ts)
+                if j in assigned_obs:
+                    continue
+                entity = self._new_track(self._next_id,z,ts)
+                if self.plate_mode:
+                    # Inhomogeneous Poisson birth intensity: observations already
+                    # explained by this frame's associated plate measurements leave
+                    # only their uncovered spatial fraction available for a birth.
+                    # Use fresh measurements, not a predicted/coasted track box.
+                    box = np.asarray(z.bbox_xyxy, dtype=float)
+                    area = float(np.prod(np.maximum(0., box[2:]-box[:2])))
+                    overlap = 0.0
+                    for k in assigned_obs:
+                        other = np.asarray(obs[k].bbox_xyxy, dtype=float)
+                        intersection = float(np.prod(np.maximum(0., np.minimum(box[2:],other[2:])-np.maximum(box[:2],other[:2]))))
+                        overlap = max(overlap, intersection / max(area, np.finfo(float).tiny))
+                    scale = max(0.0, 1.0-overlap)
+                    entity.r = _sigmoid(_logit(entity.r)+math.log(scale)) if scale > 0 else 0.0
+                elif veh_textured:
+                    entity.update_appearance(obs_refs.get(j))
+                self._next_id += 1
+                self._tracks.append(entity)
+                updates[self._id(entity)] = z
             if self.plate_mode:
-                # Inhomogeneous Poisson birth intensity: observations already
-                # explained by this frame's associated plate measurements leave
-                # only their uncovered spatial fraction available for a birth.
-                # Use fresh measurements, not a predicted/coasted track box.
-                box = np.asarray(z.bbox_xyxy, dtype=float)
-                area = float(np.prod(np.maximum(0., box[2:]-box[:2])))
-                overlap = 0.0
-                for k in assigned_obs:
-                    other = np.asarray(obs[k].bbox_xyxy, dtype=float)
-                    intersection = float(np.prod(np.maximum(0., np.minimum(box[2:],other[2:])-np.maximum(box[:2],other[:2]))))
-                    overlap = max(overlap, intersection / max(area, np.finfo(float).tiny))
-                scale = max(0.0, 1.0-overlap)
-                entity.r = _sigmoid(_logit(entity.r)+math.log(scale)) if scale > 0 else 0.0
-            self._next_id += 1
-            self._tracks.append(entity)
-            updates[self._id(entity)] = z
-        if self.plate_mode:
-            self._resolve_disjoint_merges(ts,updates)
-        retained = []
-        for t in self._tracks:
-            if not t.retain:
-                if t.confirmed:
+                self._resolve_disjoint_merges(ts,updates)
+            retained = []
+            for t in self._tracks:
+                if not t.retain:
+                    if t.confirmed:
+                        self.last_expired_track_ids.append(self._id(t))
+                elif self.plate_mode and t.confirmed and ts-t.last_obs_ts >= c.dormant_after_s:
+                    self._dormant_tracks.append(t)
+                else:
+                    retained.append(t)
+            self._tracks = retained
+            dormant = []
+            for t in self._dormant_tracks:
+                if t.retain:
+                    dormant.append(t)
+                elif t.confirmed:
                     self.last_expired_track_ids.append(self._id(t))
-            elif self.plate_mode and t.confirmed and ts-t.last_obs_ts >= c.dormant_after_s:
-                self._dormant_tracks.append(t)
-            else:
-                retained.append(t)
-        self._tracks = retained
-        dormant = []
-        for t in self._dormant_tracks:
-            if t.retain:
-                dormant.append(t)
-            elif t.confirmed:
-                self.last_expired_track_ids.append(self._id(t))
-        self._dormant_tracks = dormant
-        return updates
+            self._dormant_tracks = dormant
+            return updates
+        finally:
+            self._step_obs_app32.clear()
 
 
 class PlateTrackStabilizer(_PMBMTrackerBase):
@@ -1586,6 +1717,41 @@ class MultiVehicleKalmanTracker(_PMBMTrackerBase):
         self.attachment_posteriors = {}
         self._anonymous_attachment_posteriors = []
 
+    def flush_for_scene_cut(self) -> list[int]:
+        expired = super().flush_for_scene_cut()
+        self.attachment_posteriors.clear()
+        self._anonymous_attachment_posteriors.clear()
+        return expired
+
+    def probe_vehicle_ncc(
+        self,
+        frame_rgb: np.ndarray | None,
+        timestamp_s: float,
+    ) -> tuple[int, int, dict[int, tuple[bool, float, tuple[float, float, float, float], float, float]]]:
+        """Pre-detection 16x16 Patch-NCC probe across active vehicle tracks for instant scene-cut consensus."""
+        if frame_rgb is None or frame_rgb.ndim != 3 or frame_rgb.size == 0:
+            return 0, 0, {}
+        if float(frame_rgb[::8, ::8].std()) <= 2.0:
+            return 0, 0, {}
+        probed = 0
+        low_ncc = 0
+        results: dict[int, tuple[bool, float, tuple[float, float, float, float], float, float]] = {}
+        for t in self._tracks:
+            if not t.confirmed or t.veh_ref is None:
+                continue
+            dt_p = max(0.0, min(0.30, float(timestamp_s) - t.last_state_ts))
+            cx = float(t.x[0]) + float(t.x[4]) * dt_p
+            cy = float(t.x[1]) + float(t.x[5]) * dt_p
+            bw = max(10.0, float(t.x[2]))
+            bh = max(10.0, float(t.x[3]))
+            pred_box = (cx - 0.5 * bw, cy - 0.5 * bh, cx + 0.5 * bw, cy + 0.5 * bh)
+            res = track_vehicle_patch_ncc(t.veh_ref, frame_rgb, pred_box, max_shift_px=24.0, min_ncc=0.42)
+            results[t.vehicle_track_id] = res
+            probed += 1
+            if res[1] < 0.32:
+                low_ncc += 1
+        return probed, low_ncc, results
+
     @property
     def active_vehicle_track_ids(self) -> list[int]:
         return [t.vehicle_track_id for t in self._tracks if t.confirmed]
@@ -1601,8 +1767,9 @@ class MultiVehicleKalmanTracker(_PMBMTrackerBase):
              img_hw: tuple[int,int] | None = None, *,
              action_meta: ObservationActionMeta | None = None,
              camera_motion: CameraMotionEstimate | None = None,
-             frame_rgb: np.ndarray | None = None) -> list[VehicleDetection]:
-        updates = self._advance(vehicles,timestamp_s,action_meta,camera_motion,frame_rgb)
+             frame_rgb: np.ndarray | None = None,
+             precomputed_veh_ncc: dict[int, tuple[bool, float, tuple[float, float, float, float], float, float]] | None = None) -> list[VehicleDetection]:
+        updates = self._advance(vehicles,timestamp_s,action_meta,camera_motion,frame_rgb,precomputed_veh_ncc=precomputed_veh_ncc)
         return [replace(updates[t.vehicle_track_id],bbox_xyxy=t.bbox_xyxy,
                         vehicle_track_id=t.vehicle_track_id if t.confirmed else None,
                         vehicle_subtype=int(np.argmax(t.subtype_log_post)),
