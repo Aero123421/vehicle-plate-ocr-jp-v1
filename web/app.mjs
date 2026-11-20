@@ -99,7 +99,11 @@ async function init() {
     loading = (async () => {
       setStat('stat-phase', 'LOADING');
       tell('ローカルモデルを準備しています…');
-      worker = new Worker(new URL('./worker.mjs', import.meta.url), { type: 'module' });
+      const workerUrl = new URL(
+        location.protocol.startsWith('http') ? './worker.mjs?v=gen7' : './worker.mjs',
+        import.meta.url
+      );
+      worker = new Worker(workerUrl, { type: 'module' });
       worker.onmessage = ({ data }) => {
         if (data.type === 'progress') {
           if (typeof data.message === 'string') tell(data.message);

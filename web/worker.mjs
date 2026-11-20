@@ -24,8 +24,12 @@ export async function createPipeline({
   requireFullFieldsForEarlySeal = false,
   discardShortUnreadable = false,
 } = {}) {
+  const cacheBust =
+    typeof location !== 'undefined' && typeof location.protocol === 'string' && location.protocol.startsWith('http')
+      ? '?v=gen7'
+      : '';
   const json = readJSON ?? (async path => {
-    const response = await fetch(new URL(path, import.meta.url));
+    const response = await fetch(new URL(`${path}${cacheBust}`, import.meta.url));
     if (!response.ok) throw Error(`${path}: HTTP ${response.status}`);
     return response.json();
   });
@@ -55,7 +59,7 @@ export async function createPipeline({
       for (const name of names) {
         progress(`INT8 グラフを準備中: ${name}`);
         sessions[name] = await runtime.InferenceSession.create(
-          new URL(`models/${name}.int8.onnx`, import.meta.url).href,
+          new URL(`models/${name}.int8.onnx${cacheBust}`, import.meta.url).href,
           { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }
         );
       }
