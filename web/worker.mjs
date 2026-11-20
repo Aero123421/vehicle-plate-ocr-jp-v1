@@ -26,7 +26,7 @@ export async function createPipeline({
 } = {}) {
   const cacheBust =
     typeof location !== 'undefined' && typeof location.protocol === 'string' && location.protocol.startsWith('http')
-      ? '?v=gen7'
+      ? '?v=gen7b'
       : '';
   const json = readJSON ?? (async path => {
     const response = await fetch(new URL(`${path}${cacheBust}`, import.meta.url));
@@ -673,7 +673,7 @@ export async function createPipeline({
   }
 
   function isRedLampCrop(crop) {
-    // Reject pure red brake-light / reflector false positives (valid JP plates are white, yellow, green, or black).
+    // Reject pure red brake-light / reflector false positives while preserving warm sunlit yellow kei plates.
     const stride = 12800;
     let sumR = 0, sumG = 0, sumB = 0, redPixels = 0, count = 0;
     for (let y = 16; y < 64; y += 2) {
@@ -684,12 +684,18 @@ export async function createPipeline({
         sumR += r;
         sumG += g;
         sumB += b;
-        if (r > 0.30 && r - Math.max(g, b) > 0.17) redPixels++;
+        if (r > 0.30 && r - Math.max(g, b) > 0.24 && g < 0.58 * r && g - b < 0.16) redPixels++;
         count++;
       }
     }
     const meanR = sumR / count, meanG = sumG / count, meanB = sumB / count;
-    return meanR > 0.30 && meanR - Math.max(meanG, meanB) > 0.16 && redPixels > 0.42 * count;
+    return (
+      meanR > 0.30 &&
+      meanR - Math.max(meanG, meanB) > 0.24 &&
+      meanG < 0.58 * meanR &&
+      meanG - meanB < 0.16 &&
+      redPixels > 0.48 * count
+    );
   }
 
   function thumbnail(crop) {
@@ -1461,7 +1467,7 @@ export async function createPipeline({
 
   function predictedVehicleBox(vt, time) {
     const refTime = vt.lastProp ?? vt.last;
-    const dt = clamp(time - refTime, 0, 0.30);
+    const dt = clamp(time - refTime, 0, 0.55);
     const decay = vt.missed > 0 ? Math.pow(0.45, vt.missed) * Math.exp(-3.0 * dt) : 1;
     const cx = vt.cx + vt.vx * dt * decay;
     const cy = vt.cy + vt.vy * dt * decay;
@@ -2070,15 +2076,17 @@ export async function createPipeline({
     ];
     const scout = updateMotionScout(monitoredBoxes);
 
-    // Pre-detection 16x16 Patch-NCC vehicle propagation (+/-24px) & vehicle-consensus scene-cut check.
+    // Pre-detection 16x16 Patch-NCC vehicle propagation (dt-scaled search radius) & scene-cut check.
     let nVehChecked = 0;
     let nVehDropped = 0;
     for (const vt of vtracks) {
       vt.curOptVeh = null;
       if (!vt.vehRef?.tpl) continue;
       const pbox = predictedVehicleBox(vt, time);
+      const dtV = clamp(time - (vt.lastProp ?? vt.last), 0.03, 0.55);
+      const maxShiftPx = Math.round(clamp(24 + 90 * dtV, 24, 56));
       const optV = trackVehiclePatchNccRgba(vt.vehRef, frame, wOrig, hOrig, pbox, {
-        maxShiftPx: 24,
+        maxShiftPx,
         minNcc: 0.42,
       });
       vt.curOptVeh = optV;
@@ -2124,6 +2132,8 @@ export async function createPipeline({
     const dormantNow = sceneCut ? [] : dormant;
     const finalizedActiveNow = sceneCut ? [] : finalizedActive;
     const singleThread = runtime.env.wasm.numThreads <= 1;
+    const liveMode = autoSealFrames > 0;
+    const fastTrackMode = singleThread || liveMode;
     const isLowRes = wOrig * hOrig <= 235000;
     const activeConfirmed = !sceneCut && (activeNow.some(t => t.frames >= 2) || finalizedActiveNow.length > 0);
     const missingConfirmed = !sceneCut && activeNow.some(t => t.frames >= 2 && t.missed > 0);
@@ -2143,19 +2153,25 @@ export async function createPipeline({
           : (activeConfirmed && !missingConfirmed
               ? (vehSmoothLocked ? 5 : 4)
               : 2))
-      : (activeNow.length >= 4 ? maxHeartbeat : baseHeartbeat);
+      : liveMode
+        ? (isLowRes
+            ? (!activeConfirmed || missingConfirmed ? 1 : 2)
+            : (activeConfirmed && !missingConfirmed
+                ? (vehSmoothLocked ? 4 : 3)
+                : 2))
+        : (activeNow.length >= 4 ? maxHeartbeat : baseHeartbeat);
     const framesSinceFull = frameIndex - lastFull;
-    const everyFrameTrigger = !singleThread;
+    const everyFrameTrigger = !singleThread && !liveMode;
 
     const full =
       frameIndex === 0 ||
       sceneCut ||
       framesSinceFull >= effHeartbeat ||
       everyFrameTrigger ||
-      (!activeConfirmed && framesSinceFull >= (singleThread && !isLowRes ? 2 : 1)) ||
-      (scout.busyTriggered && framesSinceFull >= (singleThread ? (activeConfirmed && vtracks.length < 2 ? 4 : 2) : 1)) ||
+      (!activeConfirmed && framesSinceFull >= (fastTrackMode && !isLowRes ? 2 : 1)) ||
+      (scout.busyTriggered && framesSinceFull >= (fastTrackMode ? (activeConfirmed && vtracks.length < 2 ? 4 : 2) : 1)) ||
       (missingConfirmed && framesSinceFull >= 1) ||
-      ((vehNeedsRefresh || vehUnconfirmed) && framesSinceFull >= (singleThread ? (activeConfirmed ? 3 : 2) : 1));
+      ((vehNeedsRefresh || vehUnconfirmed) && framesSinceFull >= (fastTrackMode ? (activeConfirmed ? 3 : 2) : 1));
 
     const proposals = [];
     let lbInfo = null;
@@ -2359,10 +2375,15 @@ export async function createPipeline({
         });
         return !coveredByPass1;
       });
-      if (zoomableVehs.length > 0) zoomCooldown = 0;
+      if (zoomableVehs.length > 0 && (!liveMode || zoomableVehs.some(vt => vt.hits <= 1))) zoomCooldown = 0;
       else if (zoomCooldown > 0) zoomCooldown--;
 
-      if (zoomCooldown === 0 && !(singleThread && scale >= 0.92 && !isLowRes && pass1Plates.length > 0)) {
+      const skipRedundantZoom =
+        fastTrackMode &&
+        scale >= 0.85 &&
+        !isLowRes &&
+        (pass1Plates.length > 0 || (liveMode && (activeNow.length > 0 || finalizedActiveNow.length > 0)));
+      if (zoomCooldown === 0 && !skipRedundantZoom) {
         const pass1StrongBoxes = pass1Plates.filter(p => p.score >= 0.50).map(p => p.box);
         const zoomRois = [];
         const zoomedVts = [];
@@ -2441,16 +2462,19 @@ export async function createPipeline({
             }
           }
           if (!zoomPlates.length && !zoomableVehs.length) zoomCooldown = 2;
+          else if (liveMode && (activeNow.length > 0 || finalizedActiveNow.length > 0 || !zoomPlates.length)) {
+            zoomCooldown = Math.max(zoomCooldown, 1);
+          }
           proposals.push(...zoomPlates);
         }
       }
     } else {
       fastFrames++;
-      // Propagate tracked vehicles on non-full frames via 16x16 Patch-NCC (+/-24px); kill failed ghosts.
+      // Propagate tracked vehicles on non-full frames via 16x16 Patch-NCC; kill failed ghosts.
       for (const vt of vtracks) {
         const opt = vt.curOptVeh;
         if (opt && opt.ok) {
-          const dtP = clamp(time - (vt.lastProp ?? vt.last), 0.02, 0.25);
+          const dtP = clamp(time - (vt.lastProp ?? vt.last), 0.02, 0.55);
           const newCx = 0.5 * (opt.box[0] + opt.box[2]);
           const newCy = 0.5 * (opt.box[1] + opt.box[3]);
           const instVx = clamp((newCx - vt.cx) / dtP, -wOrig * 1.5, wOrig * 1.5);
@@ -2484,11 +2508,13 @@ export async function createPipeline({
           if (!Number.isFinite(vt.missedSince)) vt.missedSince = time;
         }
       }
+      const coastMaxSec = Math.max(0.30, 1.35 * lastDetIntervalSec);
+      const miss1MaxSec = Math.max(0.16, 0.75 * lastDetIntervalSec);
       vtracks = vtracks.filter(
         vt =>
           vt.missed === 0 ||
-          (vt.missed <= 3 && time - vt.missedSince <= 0.30 && (vt.patchNcc ?? 0) >= 0.42) ||
-          (vt.missed === 1 && time - vt.missedSince <= 0.16 && (vt.patchNcc ?? 0) >= 0.32)
+          (vt.missed <= 3 && time - vt.missedSince <= coastMaxSec && (vt.patchNcc ?? 0) >= 0.42) ||
+          (vt.missed === 1 && time - vt.missedSince <= miss1MaxSec && (vt.patchNcc ?? 0) >= 0.32)
       );
     }
 
@@ -2559,12 +2585,12 @@ export async function createPipeline({
     };
 
     // Never render a coasted or unverified vehicle box whose patch NCC < 0.40.
-    // Uncorrupted frozen COCO D-FINE allows fast 1-frame confirmation for strong moving vehicles (>=0.54).
+    // Fast 1-frame confirmation for strong moving vehicles (>=0.46) + expose compact 16x16 optical ref for 60 FPS live tracking.
     const predictedVehicles = allVtracks
       .filter(({ vt }) => {
         if ((vt.missed > 0 || !vt.optOk) && (vt.patchNcc ?? 0) < 0.40) return false;
         if (platedVehicleIds.has(vt.id)) return true;
-        if (vt.hits < 2 && vt.maxScore < 0.54) return false;
+        if (vt.hits < 2 && vt.maxScore < 0.46) return false;
         if (
           vt.hits >= 2 &&
           vt.maxDisp < Math.max(8, 0.015 * wOrig) &&
@@ -2574,7 +2600,12 @@ export async function createPipeline({
         }
         return true;
       })
-      .map(({ vt, ...pub }) => pub);
+      .map(({ vt, ...pub }) => ({
+        ...pub,
+        vehRef: vt.vehRef?.tpl
+          ? { tpl: vt.vehRef.tpl, coarse: vt.vehRef.coarse, tplStd: vt.vehRef.tplStd }
+          : null,
+      }));
 
     // Sub-pixel optical pre-alignment on current frame before Stage-2 search window generation.
     for (const track of [...activeNow, ...finalizedActiveNow, ...dormantNow]) {
@@ -2822,7 +2853,7 @@ export async function createPipeline({
       }
       const candW = candidate.box[2] - candidate.box[0];
       if (
-        singleThread &&
+        fastTrackMode &&
         activeConfirmed &&
         selected.length >= 1 &&
         !candidate.track &&
@@ -2833,13 +2864,16 @@ export async function createPipeline({
       }
       if (candidate.track) claimedTrackIds.add(candidate.track.id);
       selected.push(candidate);
-      if (selected.length >= (singleThread ? 4 : 10)) break;
+      const maxStage2Batch = liveMode
+        ? (full ? 2 : 3)
+        : (singleThread ? 4 : 10);
+      if (selected.length >= maxStage2Batch) break;
     }
 
     // Run batched Stage-2 refinement (NEVER reuse stale pixels/corners across frames!).
-    // On single-threaded WASM fast frames with a crisp current-frame optical ZNCC lock (>=0.74)
-    // and positive Stage-2 support, alternate with sub-pixel optical corners while still feeding
-    // fresh crops to OCR (and marking isOptReuse so stale Stage-2 LLR is never re-accumulated).
+    // On fast frames with a crisp current-frame optical ZNCC lock (>=0.74) and positive Stage-2 support,
+    // alternate with sub-pixel optical corners while still feeding fresh crops to OCR
+    // (marking isOptReuse so stale Stage-2 LLR is never re-accumulated).
     const stage2Results = new Array(selected.length);
     const stage2Todo = [];
     for (let i = 0; i < selected.length; i++) {
@@ -2848,7 +2882,7 @@ export async function createPipeline({
       const opt = tr?.curOpt;
       if (
         !full &&
-        singleThread &&
+        fastTrackMode &&
         tr &&
         tr.frames >= 2 &&
         tr.missed === 0 &&
@@ -3069,7 +3103,7 @@ export async function createPipeline({
 
       const geom = geometry(measCorners, crop, track.frames ? track.measCorners : null);
       const skipRedundantEncode =
-        singleThread &&
+        fastTrackMode &&
         track.frames >= 8 &&
         track.memory &&
         Boolean(loc.isOptReuse) &&
@@ -3289,12 +3323,13 @@ export async function createPipeline({
           const minAll = minFieldPrecision(t.memory.mem_P.data);
           const minUpper = minUpperFieldPrecision(t.memory.mem_P.data);
           if (lowResPlate) {
+            const tinyPlate = pw < 34;
             const lowResCrisp =
-              t.frames >= Math.max(autoSealFrames, 24) &&
+              t.frames >= Math.max(autoSealFrames, tinyPlate ? 28 : 24) &&
               time - t.firstTime >= Math.max(autoSealMinSec, 1.8) &&
               !growing &&
-              minAll >= 1.35 &&
-              minUpper >= 1.15;
+              minAll >= (tinyPlate ? 1.80 : 1.35) &&
+              minUpper >= (tinyPlate ? 1.35 : 1.15);
             const lowResLongDwell =
               t.frames >= (growing && t.missed === 0 ? 48 : 38) &&
               time - t.firstTime >= 3.2 &&
@@ -3439,10 +3474,15 @@ export async function createPipeline({
       state: 'FINALIZED',
       thumbnail: track.thumbnail,
     };
+    const fc = track.result.field_confidences;
+    const pureNoiseUnreadable =
+      Boolean(fc) &&
+      (fc.serial ?? 0) < 0.045 &&
+      Math.max(fc.region ?? 0, fc.classification ?? 0, fc.hiragana ?? 0) < 0.28;
     if (
       discardShortUnreadable &&
       track.result.status !== 'ACCEPTED' &&
-      (track.frames <= 5 || mean(track.memory.mem_P.data) < 0.10 || track.maxLlr < 1.6)
+      (track.frames <= 5 || mean(track.memory.mem_P.data) < 0.10 || track.maxLlr < 1.6 || pureNoiseUnreadable)
     ) {
       track.suppressedUnreadable = true;
     } else {

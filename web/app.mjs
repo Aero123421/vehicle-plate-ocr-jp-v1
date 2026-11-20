@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Media stays local; only same-origin models, runtime and sample are fetched.
-import { createOpticalRef, sampleGrayBilinear, trackPlateOpticalCore } from './optical_tracker.mjs';
+import {
+  createOpticalRef,
+  sampleGrayBilinear,
+  trackPlateOpticalCore,
+  trackVehiclePatchNccSample,
+} from './optical_tracker.mjs?v=gen7b';
 
 const $ = id => document.getElementById(id);
 const video = $('video');
@@ -100,7 +105,7 @@ async function init() {
       setStat('stat-phase', 'LOADING');
       tell('ローカルモデルを準備しています…');
       const workerUrl = new URL(
-        location.protocol.startsWith('http') ? './worker.mjs?v=gen7' : './worker.mjs',
+        location.protocol.startsWith('http') ? './worker.mjs?v=gen7b' : './worker.mjs',
         import.meta.url
       );
       worker = new Worker(workerUrl, { type: 'module' });
@@ -269,6 +274,16 @@ function updateSmoothingTargets(payload, wallNow) {
       time: payloadTime,
       wall: wallNow,
       offset,
+      vehRef: v.vehRef?.tpl ? v.vehRef : prev?.vehRef ?? null,
+      dirty: true,
+      optLocked: prev?.optLocked ?? false,
+      liveBox: prev?.liveBox ?? null,
+      liveVel: prev?.liveVel ?? [v.velocity?.[0] ?? 0, v.velocity?.[1] ?? 0],
+      lastLiveKey: prev?.lastLiveKey ?? -1,
+      lastDt: prev?.lastDt ?? 0,
+      lastLiveWall: prev?.lastLiveWall ?? wallNow,
+      skewOffset: prev?.skewOffset ?? [0, 0, 0, 0],
+      skewWall: prev?.skewWall ?? wallNow,
     });
   }
   for (const key of smoothVehicles.keys()) if (!activeV.has(key)) smoothVehicles.delete(key);
@@ -696,6 +711,142 @@ function alignPlateToLiveVideo(sm, liveKey, dt, w, h, wallNow) {
   ]);
 }
 
+function alignVehicleToLiveVideo(sm, liveKey, dt, w, h, wallNow) {
+  if (!sm?.vehRef?.tpl || video.readyState < 2 || !video.videoWidth || !video.videoHeight || video.seeking) {
+    return null;
+  }
+  if (!sm.dirty && sm.lastLiveKey === liveKey && sm.optLocked && sm.liveBox) {
+    const skewDecay = Math.exp(-(wallNow - sm.skewWall) / 48);
+    return [
+      clamp(sm.liveBox[0] + sm.skewOffset[0] * skewDecay, 0, w),
+      clamp(sm.liveBox[1] + sm.skewOffset[1] * skewDecay, 0, h),
+      clamp(sm.liveBox[2] + sm.skewOffset[2] * skewDecay, 0, w),
+      clamp(sm.liveBox[3] + sm.skewOffset[3] * skewDecay, 0, h),
+    ];
+  }
+
+  const [vx, vy, vw, vh] = sm.vel;
+  const kinDt = clamp(dt, -0.05, 0.55) * (sm.coasted ? 0.55 : 0.88);
+  const kinBox = [
+    clamp(sm.box[0] + vx * kinDt - 0.5 * vw * kinDt * 0.35, 0, w),
+    clamp(sm.box[1] + vy * kinDt - 0.5 * vh * kinDt * 0.35, 0, h),
+    clamp(sm.box[2] + vx * kinDt + 0.5 * vw * kinDt * 0.35, 0, w),
+    clamp(sm.box[3] + vy * kinDt + 0.5 * vh * kinDt * 0.35, 0, h),
+  ];
+  const kbW = kinBox[2] - kinBox[0];
+  const kbH = kinBox[3] - kinBox[1];
+  if (kbW < 14 || kbH < 14) return null;
+  const kinCx = 0.5 * (kinBox[0] + kinBox[2]);
+  const kinCy = 0.5 * (kinBox[1] + kinBox[3]);
+
+  let guessBox;
+  let maxShiftPx;
+  let reuseLive = false;
+  if (sm.liveBox && sm.optLocked && Math.abs(dt - sm.lastDt) < 0.25) {
+    const liveCx = 0.5 * (sm.liveBox[0] + sm.liveBox[2]);
+    const liveCy = 0.5 * (sm.liveBox[1] + sm.liveBox[3]);
+    if (Math.abs(liveCx - kinCx) <= Math.max(40, 0.85 * kbW) && Math.abs(liveCy - kinCy) <= Math.max(30, 0.85 * kbH)) {
+      reuseLive = true;
+    }
+  }
+  if (reuseLive) {
+    const stepDt = clamp(dt - sm.lastDt, -0.04, 0.08);
+    const lcx = 0.5 * (sm.liveBox[0] + sm.liveBox[2]) + sm.liveVel[0] * stepDt;
+    const lcy = 0.5 * (sm.liveBox[1] + sm.liveBox[3]) + sm.liveVel[1] * stepDt;
+    const bw = 0.5 * (sm.liveBox[2] - sm.liveBox[0]) + 0.5 * kbW;
+    const bh = 0.5 * (sm.liveBox[3] - sm.liveBox[1]) + 0.5 * kbH;
+    guessBox = [
+      clamp(lcx - 0.5 * bw, 0, w),
+      clamp(lcy - 0.5 * bh, 0, h),
+      clamp(lcx + 0.5 * bw, 0, w),
+      clamp(lcy + 0.5 * bh, 0, h),
+    ];
+    maxShiftPx = sm.dirty ? 26 : 16;
+  } else {
+    guessBox = kinBox;
+    maxShiftPx = Math.round(clamp(20 + 95 * Math.abs(dt), 20, 52));
+  }
+
+  const pad = maxShiftPx + 8;
+  const rx0 = clamp(Math.floor(guessBox[0] - pad), 0, w - 16);
+  const ry0 = clamp(Math.floor(guessBox[1] - pad), 0, h - 16);
+  const rx1 = clamp(Math.ceil(guessBox[2] + pad), rx0 + 16, w);
+  const ry1 = clamp(Math.ceil(guessBox[3] + pad), ry0 + 16, h);
+  const rw = rx1 - rx0;
+  const rh = ry1 - ry0;
+
+  const roiScale = Math.min(1, OPT_ROI_MAX_W / rw, OPT_ROI_MAX_H / rh);
+  const bufW = clamp(Math.round(rw * roiScale), 24, OPT_ROI_MAX_W);
+  const bufH = clamp(Math.round(rh * roiScale), 24, OPT_ROI_MAX_H);
+  const vScaleX = video.videoWidth / w;
+  const vScaleY = video.videoHeight / h;
+
+  let rgba;
+  try {
+    optCtx.drawImage(video, rx0 * vScaleX, ry0 * vScaleY, rw * vScaleX, rh * vScaleY, 0, 0, bufW, bufH);
+    rgba = optCtx.getImageData(0, 0, bufW, bufH).data;
+  } catch {
+    return null;
+  }
+
+  const pixels = bufW * bufH;
+  for (let i = 0, p = 0; i < pixels; i++, p += 4) {
+    optGrayBuf[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+  }
+
+  const sxRoi = bufW / rw;
+  const syRoi = bufH / rh;
+  const sampleRoi = (nx, ny) => sampleGrayBilinear(optGrayBuf, bufW, bufH, (nx - rx0) * sxRoi, (ny - ry0) * syRoi);
+  const res = trackVehiclePatchNccSample(sm.vehRef, sampleRoi, w, h, guessBox, {
+    maxShiftPx,
+    minNcc: 0.46,
+  });
+
+  sm.lastLiveKey = liveKey;
+  if (!res.ok) {
+    sm.optLocked = false;
+    sm.dirty = false;
+    return null;
+  }
+
+  if (sm.liveBox && sm.optLocked) {
+    if (sm.dirty) {
+      const prevDecay = Math.exp(-(wallNow - sm.skewWall) / 48);
+      sm.skewOffset = res.box.map((val, i) =>
+        clamp(sm.liveBox[i] + sm.skewOffset[i] * prevDecay - val, -24, 24)
+      );
+      sm.skewWall = wallNow;
+    } else {
+      const stepSec = Math.max(0.012, (wallNow - sm.lastLiveWall) / 1000);
+      const oldCx = 0.5 * (sm.liveBox[0] + sm.liveBox[2]);
+      const oldCy = 0.5 * (sm.liveBox[1] + sm.liveBox[3]);
+      const newCx = 0.5 * (res.box[0] + res.box[2]);
+      const newCy = 0.5 * (res.box[1] + res.box[3]);
+      sm.liveVel = [
+        clamp(0.55 * sm.liveVel[0] + 0.45 * ((newCx - oldCx) / stepSec), -w * 1.5, w * 1.5),
+        clamp(0.55 * sm.liveVel[1] + 0.45 * ((newCy - oldCy) / stepSec), -h * 1.5, h * 1.5),
+      ];
+    }
+  } else {
+    sm.skewOffset = [0, 0, 0, 0];
+    sm.skewWall = wallNow;
+  }
+
+  sm.liveBox = res.box;
+  sm.optLocked = true;
+  sm.dirty = false;
+  sm.lastDt = dt;
+  sm.lastLiveWall = wallNow;
+
+  const skewDecay = Math.exp(-(wallNow - sm.skewWall) / 48);
+  return [
+    clamp(res.box[0] + sm.skewOffset[0] * skewDecay, 0, w),
+    clamp(res.box[1] + sm.skewOffset[1] * skewDecay, 0, h),
+    clamp(res.box[2] + sm.skewOffset[2] * skewDecay, 0, w),
+    clamp(res.box[3] + sm.skewOffset[3] * skewDecay, 0, h),
+  ];
+}
+
 function paintSmooth(wallNow) {
   if (!lastPayload) return;
   const payload = lastPayload;
@@ -712,8 +863,8 @@ function paintSmooth(wallNow) {
   if (!video.seeking && collecting) {
     dt =
       mode === 'camera'
-        ? clamp(wallNow / 1000 - payload.timestamp, 0, 0.25)
-        : clamp(video.currentTime - payload.timestamp, -0.05, 0.42);
+        ? clamp(wallNow / 1000 - payload.timestamp, 0, 0.35)
+        : clamp(video.currentTime - payload.timestamp, -0.05, 0.85);
   }
   const liveKey = mode === 'camera' ? Math.floor(wallNow / 16) : Math.round(video.currentTime * 1000);
 
@@ -761,7 +912,14 @@ function paintSmooth(wallNow) {
     resolvedPlates.push({ track, corners });
   }
 
-  // 2. Render vehicles (coupled to live optical plate delta when available; never render low-NCC ghosts).
+  // 2. Render vehicles (coupled to live plate delta or direct 60 FPS Patch-NCC optical lock; never render low-NCC ghosts).
+  const vehOptCandidates = payload.vehicles
+    .filter(v => !(v.coasted && (v.patchNcc ?? 1) < 0.40) && !vehicleLiveDelta.has(v.id))
+    .slice()
+    .sort((a, b) => (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]) - (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]))
+    .slice(0, 6);
+  const vehOptAllowed = new Set(vehOptCandidates.map(v => v.id));
+
   for (const v of payload.vehicles) {
     if (v.coasted && (v.patchNcc ?? 1) < 0.40) continue;
     const sm = smoothVehicles.get(v.id);
@@ -777,15 +935,20 @@ function paintSmooth(wallNow) {
         clamp(anchorCy + (sm.box[3] - anchorCy) * scale + dy + sm.offset[3] * decay, 0, h),
       ];
     } else if (sm) {
-      const decay = Math.exp(-(wallNow - sm.wall) / 75);
-      const [vx, vy, vw, vh] = sm.vel;
-      const posDt = Math.min(Math.max(0, dt), 0.20) * (v.coasted ? 0.35 : 0.78);
-      box = [
-        clamp(sm.box[0] + vx * posDt - 0.5 * vw * posDt * 0.35 + sm.offset[0] * decay, 0, w),
-        clamp(sm.box[1] + vy * posDt - 0.5 * vh * posDt * 0.35 + sm.offset[1] * decay, 0, h),
-        clamp(sm.box[2] + vx * posDt + 0.5 * vw * posDt * 0.35 + sm.offset[2] * decay, 0, w),
-        clamp(sm.box[3] + vy * posDt + 0.5 * vh * posDt * 0.35 + sm.offset[3] * decay, 0, h),
-      ];
+      const optBox = vehOptAllowed.has(v.id) ? alignVehicleToLiveVideo(sm, liveKey, dt, w, h, wallNow) : null;
+      if (optBox) {
+        box = optBox;
+      } else {
+        const decay = Math.exp(-(wallNow - sm.wall) / 75);
+        const [vx, vy, vw, vh] = sm.vel;
+        const posDt = Math.min(Math.max(0, dt), 0.45) * (v.coasted ? 0.45 : 0.85);
+        box = [
+          clamp(sm.box[0] + vx * posDt - 0.5 * vw * posDt * 0.35 + sm.offset[0] * decay, 0, w),
+          clamp(sm.box[1] + vy * posDt - 0.5 * vh * posDt * 0.35 + sm.offset[1] * decay, 0, h),
+          clamp(sm.box[2] + vx * posDt + 0.5 * vw * posDt * 0.35 + sm.offset[2] * decay, 0, w),
+          clamp(sm.box[3] + vy * posDt + 0.5 * vh * posDt * 0.35 + sm.offset[3] * decay, 0, h),
+        ];
+      }
     }
     const [a, b, c, d] = box;
     const bw = c - a, bh = d - b;

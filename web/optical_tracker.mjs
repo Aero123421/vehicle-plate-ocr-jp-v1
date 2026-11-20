@@ -643,9 +643,26 @@ export function extractVehicleAppearanceRgba(rgba, w, h, box) {
   return { tpl, coarse, tplStd, colorHist, app32 };
 }
 
-export function trackVehiclePatchNccRgba(
+function sampleVehicleGridSample(sampleFn, ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf) {
+  const stepX = iw / gw;
+  const stepY = ih / gh;
+  let sum = 0;
+  let idx = 0;
+  for (let j = 0; j < gh; j++) {
+    const py = iy0 + dy + (j + 0.5) * stepY;
+    for (let i = 0; i < gw; i++) {
+      const px = ix0 + dx + (i + 0.5) * stepX;
+      const val = sampleFn(px, py);
+      outBuf[idx++] = val;
+      sum += val;
+    }
+  }
+  return sum / (gw * gh);
+}
+
+function trackVehiclePatchNccCore(
   vehRef,
-  rgba,
+  sampleGrid,
   w,
   h,
   predBox,
@@ -671,7 +688,7 @@ export function trackVehiclePatchNccRgba(
     const cx = predBox[0] + 0.5 * bw + dx;
     const cy = predBox[1] + 0.5 * bh + dy;
     if (cx < -0.35 * bw || cx > w + 0.35 * bw || cy < -0.35 * bh || cy > h + 0.35 * bh) return -1;
-    const mu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, VEH_CW, VEH_CH, vehCoarseBuf);
+    const mu = sampleGrid(ix0, iy0, iw, ih, dx, dy, VEH_CW, VEH_CH, vehCoarseBuf);
     let sq = 0, dot = 0;
     for (let k = 0; k < VEH_CN; k++) {
       const d = vehCoarseBuf[k] - mu;
@@ -686,7 +703,7 @@ export function trackVehiclePatchNccRgba(
     const cx = predBox[0] + 0.5 * bw + dx;
     const cy = predBox[1] + 0.5 * bh + dy;
     if (cx < -0.35 * bw || cx > w + 0.35 * bw || cy < -0.35 * bh || cy > h + 0.35 * bh) return 0;
-    const mu = sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, VEH_TPL_W, VEH_TPL_H, vehFineBuf);
+    const mu = sampleGrid(ix0, iy0, iw, ih, dx, dy, VEH_TPL_W, VEH_TPL_H, vehFineBuf);
     let sq = 0, dot = 0;
     for (let k = 0; k < VEH_N; k++) {
       const d = vehFineBuf[k] - mu;
@@ -706,7 +723,7 @@ export function trackVehiclePatchNccRgba(
   const rad = Math.max(4, Math.round(maxShiftPx));
   const invRadSq = 1 / (rad * rad);
 
-  // Stage 1: Coarse 8px grid across [-rad, +rad] on 8x8 pooled template.
+  // Stage 1: Coarse grid across [-rad, +rad] on 8x8 pooled template.
   let bestDx = 0, bestDy = 0;
   let bestPen = evalCoarse(0, 0);
   const step1 = Math.max(4, Math.round(rad / 3));
@@ -723,7 +740,7 @@ export function trackVehiclePatchNccRgba(
     }
   }
 
-  // Stage 2: Medium 3px refinement on 8x8 pooled template around coarse peak.
+  // Stage 2: Medium refinement on 8x8 pooled template around coarse peak.
   const b1x = bestDx, b1y = bestDy;
   const step2 = Math.max(2, Math.round(step1 / 2.5));
   for (let iy = -2; iy <= 2; iy++) {
@@ -776,4 +793,42 @@ export function trackVehiclePatchNccRgba(
     dy: bestDy,
     box: shiftedBox,
   };
+}
+
+export function trackVehiclePatchNccRgba(
+  vehRef,
+  rgba,
+  w,
+  h,
+  predBox,
+  opts = {}
+) {
+  return trackVehiclePatchNccCore(
+    vehRef,
+    (ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf) =>
+      sampleVehicleGridLuma(rgba, w, h, ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf),
+    w,
+    h,
+    predBox,
+    opts
+  );
+}
+
+export function trackVehiclePatchNccSample(
+  vehRef,
+  sampleFn,
+  w,
+  h,
+  predBox,
+  opts = {}
+) {
+  return trackVehiclePatchNccCore(
+    vehRef,
+    (ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf) =>
+      sampleVehicleGridSample(sampleFn, ix0, iy0, iw, ih, dx, dy, gw, gh, outBuf),
+    w,
+    h,
+    predBox,
+    opts
+  );
 }
